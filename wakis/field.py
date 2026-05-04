@@ -571,8 +571,14 @@ class Field:
 
     def inspect(
         self,
-        plane="YZ",
+        plane="ZY",
         cmap="bwr",
+        backend="matplotlib",
+        component="z",
+        grid=None,
+        position=None,
+        bounding_box=False,
+        show_grid=False,
         dpi=100,
         figsize=[8, 6],
         x=None,
@@ -583,34 +589,241 @@ class Field:
         **kwargs,
     ):
         """
-        Visualize 2D slices of the field components using matplotlib.
+        Visualize 2D slices of the field components.
+
+        Supports two backends: ``'matplotlib'`` (default, static 2D imshow of
+        all three components) and ``'pyvista'`` (interactive 3D slice with a
+        position slider for a single selected component).
 
         Parameters
         ----------
-        plane : {'XY', 'XZ', 'YZ'}, optional
+        plane : {'XY', 'XZ', 'YZ', 'ZX', 'ZY'}, optional
             Plane to visualize. Default is 'YZ'.
         cmap : str, optional
             Colormap for the plot. Default is 'bwr'.
+        backend : {'matplotlib', 'pyvista'}, optional
+            Visualization backend. Default is 'matplotlib'.
+        component : {'x', 'y', 'z', 'abs'}, optional
+            Field component to display in PyVista mode. Ignored by the
+            matplotlib backend (which always shows all three). Default 'z'.
+        grid : GridFIT3D or None, optional
+            Structured grid object providing real-space coordinates and STL
+            solids. When provided the PyVista backend uses physical units and
+            can overlay STL surface outlines. Falls back to cell-index
+            coordinates when ``None``. Ignored by the matplotlib backend.
+        position : float or None, optional
+            Initial slice position along the axis normal to ``plane``.
+            Defaults to the domain centre. PyVista backend only.
+        bounding_box : bool, optional
+            If True, add a wireframe bounding box of the domain. PyVista
+            backend only. Default False.
+        show_grid : bool, optional
+            If True, overlay a wireframe grid slice at each slider update.
+            PyVista backend only. Default False.
         dpi : int, optional
-            Figure DPI. Default is 100.
+            Figure DPI (matplotlib backend only). Default is 100.
         figsize : list, optional
-            Figure size. Default is [8, 6].
+            Figure size (matplotlib backend only). Default is [8, 6].
         x, y, z : int, slice, or None, optional
-            Custom slice indices. If all are not None, use as custom slice.
+            Custom slice indices (matplotlib backend only). If all are not
+            None, use as custom slice.
         off_screen : bool, optional
-            If True, display the plot off-screen. Default is False.
+            Matplotlib: if True, return ``(fig, axs)`` instead of showing.
+            PyVista: if True, return the ``pyvista.Plotter`` instead of
+            opening an interactive window. Default is False.
         handles : bool, optional
-            If True, return (fig, axs) instead of showing. Default is False.
+            If True, return (fig, axs) instead of showing (matplotlib only).
+            Default is False.
         **kwargs
-            Additional keyword arguments for imshow.
+            Additional keyword arguments forwarded to ``imshow`` (matplotlib
+            backend only).
 
         Returns
         -------
         fig, axs : tuple, optional
-            Returned if handles=True.
+            Returned when ``backend='matplotlib'`` and ``handles=True`` or
+            ``off_screen=True``.
+        pyvista.Plotter, optional
+            Returned when ``backend='pyvista'`` and ``off_screen=True``.
         None
             Otherwise.
         """
+        # ------------------------------------------------------------------ #
+        # PyVista backend                                                      #
+        # ------------------------------------------------------------------ #
+        if backend.lower() == "pyvista":
+            import pyvista as pv
+
+            component = component.lower()
+
+            # --- Build / retrieve the structured grid ---
+            if grid is not None and hasattr(grid, "grid"):
+                pv_grid = grid.grid
+                xlo, xhi = grid.xmin, grid.xmax
+                ylo, yhi = grid.ymin, grid.ymax
+                zlo, zhi = grid.zmin, grid.zmax
+            else:
+                _x = xp.linspace(0, self.Nx, self.Nx + 1)
+                _y = xp.linspace(0, self.Ny, self.Ny + 1)
+                _z = xp.linspace(0, self.Nz, self.Nz + 1)
+                xlo, xhi = 0, self.Nx
+                ylo, yhi = 0, self.Ny
+                zlo, zhi = 0, self.Nz
+                X, Y, Z = xp.meshgrid(_x, _y, _z, indexing="ij")
+                pv_grid = pv.StructuredGrid(
+                    X.transpose(), Y.transpose(), Z.transpose()
+                )
+
+            # --- Assign scalar data ---
+            if component == "abs":
+                scalars = "Field Abs"
+                _arr = self.get_abs(as_matrix=True)
+                if self.on_gpu and hasattr(_arr, "get"):
+                    _arr = _arr.get()
+                pv_grid[scalars] = _arr.reshape(self.N)
+            else:
+                scalars = f"Field {component}"
+                _arr = self.to_matrix(component)
+                if self.on_gpu and hasattr(_arr, "get"):
+                    _arr = _arr.get()
+                pv_grid[scalars] = _arr.reshape(self.N)
+
+            pv_grid.set_active_scalars(scalars)
+
+            # --- Plane → normal mapping ---
+            plane_up = plane.upper()
+            plane_to_normal = {"XY": "z", "YZ": "x", "ZY": "x", "XZ": "y", "ZX": "y"}
+            if plane_up not in plane_to_normal:
+                raise ValueError(
+                    f"plane must be one of 'XY', 'XZ', 'YZ', 'ZX', 'ZY'; got '{plane}'"
+                )
+            normal = plane_to_normal[plane_up]
+
+            if normal == "x":
+                axis_min, axis_max = xlo, xhi
+                slider_title = "X Position"
+                cy = (ylo + yhi) / 2
+                cz = (zlo + zhi) / 2
+
+                def origin_fn(v):
+                    return (v, cy, cz)
+
+            elif normal == "y":
+                axis_min, axis_max = ylo, yhi
+                slider_title = "Y Position"
+                cx = (xlo + xhi) / 2
+                cz = (zlo + zhi) / 2
+
+                def origin_fn(v):
+                    return (cx, v, cz)
+
+            else:  # z
+                axis_min, axis_max = zlo, zhi
+                slider_title = "Z Position"
+                cx = (xlo + xhi) / 2
+                cy = (ylo + yhi) / 2
+
+                def origin_fn(v):
+                    return (cx, cy, v)
+
+            if position is None:
+                position = (axis_min + axis_max) / 2
+
+            # --- Build plotter ---
+            pv.global_theme.allow_empty_mesh = True
+            pl = pv.Plotter()
+
+            # Initial slice
+            initial_slice = pv_grid.slice(normal=normal, origin=origin_fn(position))
+            slice_actor = pl.add_mesh(initial_slice, cmap=cmap, name="slice")
+
+            # Optional STL solid outlines (only when grid is a GridFIT3D)
+            outline_actors = {}
+            if grid is not None and hasattr(grid, "stl_solids") and hasattr(grid, "read_stl"):
+                stl_colors_map = getattr(grid, "stl_colors", {})
+                for key in grid.stl_solids:
+                    surf = grid.read_stl(key)
+                    if surf is not None:
+                        init_outline = surf.slice(
+                            normal=normal, origin=origin_fn(position)
+                        )
+                        color = (
+                            stl_colors_map[key]
+                            if isinstance(stl_colors_map, dict) and key in stl_colors_map
+                            else "white"
+                        )
+                        outline_actors[key] = (
+                            pl.add_mesh(init_outline, color=color, name=f"outline_{key}"),
+                            surf,
+                        )
+
+            # --- Update function ---
+            def update_slice(val):
+                new_slice = pv_grid.slice(normal=normal, origin=origin_fn(val))
+                slice_actor.mapper.SetInputData(new_slice)
+
+                for key, (actor, surf) in outline_actors.items():
+                    new_outline = surf.slice(normal=normal, origin=origin_fn(val))
+                    actor.mapper.SetInputData(new_outline)
+
+                if show_grid:
+                    pl.add_mesh(
+                        new_slice,
+                        style="wireframe",
+                        color="grey",
+                        opacity=0.3,
+                        name="grid_wire",
+                    )
+
+                pl.render()
+
+            # --- Slider ---
+            pl.add_slider_widget(
+                update_slice,
+                [axis_min, axis_max],
+                value=position,
+                title=slider_title,
+                pointa=(0.8, 0.6),
+                pointb=(0.95, 0.6),
+                style="modern",
+            )
+
+            # --- Optional bounding box ---
+            if bounding_box:
+                pl.add_mesh(
+                    pv.Box(bounds=(xlo, xhi, ylo, yhi, zlo, zhi)),
+                    style="wireframe",
+                    color="black",
+                    line_width=2,
+                    name="domain_box",
+                )
+
+            # --- Camera / aesthetics ---
+            # Use view_*() methods to explicitly set both position and viewup
+            # so that the first letter of the plane is horizontal and the
+            # second letter is vertical (e.g. 'YZ' → Y horizontal, Z vertical).
+            _view_fns = {
+                "XY": pl.view_xy,
+                "XZ": pl.view_xz,
+                "YZ": pl.view_yz,
+                "ZX": pl.view_zx,
+                "ZY": pl.view_zy,
+            }
+            _view_fns.get(plane_up, pl.view_yz)()
+            pl.set_background("mistyrose", top="white")
+            pl.add_axes()
+            pl.enable_anti_aliasing()
+
+            if off_screen:
+                pl.off_screen = True
+                return pl
+            else:
+                pl.show()
+                return None
+
+        # ------------------------------------------------------------------ #
+        # Matplotlib backend (original implementation)                        #
+        # ------------------------------------------------------------------ #
         import matplotlib.pyplot as plt
         from mpl_toolkits.axes_grid1 import make_axes_locatable
 
