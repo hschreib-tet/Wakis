@@ -495,7 +495,6 @@ class RoutinesMixin:
                 "figsize": [8, 4],
                 "title": "plot1D",
                 "off_screen": True,
-                "n": None,
                 "colors": [
                     "#5ccfe6",
                     "#fdb6d0",
@@ -522,7 +521,6 @@ class RoutinesMixin:
                 "add_patch": False,
                 "title": "plot2D",
                 "off_screen": True,
-                "n": None,
                 "interpolation": "spline36",
                 "dpi": 100,
                 "return_handles": False,
@@ -547,7 +545,6 @@ class RoutinesMixin:
                 "zoom": 1.0,
                 "camera_position": None,
                 "nan_opacity": 1.0,
-                "n": None,
             }
         elif name == "plot3DonSTL":
             plotkw = {
@@ -570,7 +567,6 @@ class RoutinesMixin:
                 "clip_bounds": None,
                 "title": "plot3DonSTL",
                 "off_screen": True,
-                "n": None,
                 "zoom": 1.2,
                 "camera_position": None,
             }
