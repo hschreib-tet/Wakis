@@ -747,11 +747,7 @@ class Field:
                         init_outline = surf.slice(
                             normal=normal, origin=origin_fn(position)
                         )
-                        color = (
-                            stl_colors_map[key]
-                            if isinstance(stl_colors_map, dict) and key in stl_colors_map
-                            else "white"
-                        )
+                        color = 'black'
                         outline_actors[key] = (
                             pl.add_mesh(init_outline, color=color, name=f"outline_{key}"),
                             surf,
@@ -775,6 +771,14 @@ class Field:
                         name="grid_wire",
                     )
 
+                _view_fns = {
+                    "XY": pl.view_xy,
+                    "XZ": pl.view_xz,
+                    "YZ": pl.view_yz,
+                    "ZX": pl.view_zx,
+                    "ZY": pl.view_zy,
+                }
+                _view_fns.get(plane_up, pl.view_yz)()
                 pl.render()
 
             # --- Slider ---
@@ -813,6 +817,7 @@ class Field:
             pl.set_background("mistyrose", top="white")
             pl.add_axes()
             pl.enable_anti_aliasing()
+            pl.enable_3_lights()
 
             if off_screen:
                 pl.off_screen = True
