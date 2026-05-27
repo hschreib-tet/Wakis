@@ -100,6 +100,7 @@ class TestPecCubicCavity:
             Nz,
             stl_solids=stl_solids,
             stl_materials=stl_materials,
+            verbose=2,
         )
 
         # Beam parameters
@@ -124,6 +125,7 @@ class TestPecCubicCavity:
             save=False,
             Ez_file="tests/001_Ez.h5",
             skip_cells=skip_cells,
+            verbose=2,
         )
 
         # boundary conditions
@@ -140,6 +142,7 @@ class TestPecCubicCavity:
             bg="pec",
             dtype=self.dtype,
             use_gpu=use_gpu,
+            verbose=2,
         )
 
         wakelength = 1.0  # [m]
