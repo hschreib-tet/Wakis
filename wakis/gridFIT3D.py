@@ -22,7 +22,6 @@ try:
 except ImportError:
     imported_mpi = False
 
-
 class GridFIT3D(PlotMixin):
     """
     Class holding the grid information and
@@ -199,7 +198,6 @@ class GridFIT3D(PlotMixin):
             self.update_logger(["stl_translate"])
         if stl_scale != 1.0:
             self.update_logger(["stl_scale"])
-
         if stl_solids is not None:
             self._prepare_stl_dicts()
 
@@ -218,15 +216,14 @@ class GridFIT3D(PlotMixin):
                 self._compute_snap_points(snap_solids=snap_solids, snap_tol=snap_tol)
             self._refine_xyz_axis(method=refinement_method, tol=refinement_tol)
 
-        if verbose:
-            print(f"Generating grid with {self.Nx * self.Ny * self.Nz} mesh cells...")
-            if verbose > 1:
-                print(
-                    f" * Simulation domain bounds: \n\
-                    x:[{xmin:.3f}, {xmax:.3f}],\n\
-                    y:[{ymin:.3f}, {ymax:.3f}],\n\
-                    z:[{zmin:.3f}, {zmax:.3f}]"
-                )
+        print(f"Generating grid with {self.Nx * self.Ny * self.Nz} mesh cells...")
+        if verbose > 1:
+            print(
+                f"    * Simulation domain bounds: \n\
+                x:[{xmin:.3f}, {xmax:.3f}],\n\
+                y:[{ymin:.3f}, {ymax:.3f}],\n\
+                z:[{zmin:.3f}, {zmax:.3f}]"
+            )
 
         # MPI subdivide domain
         if self.use_mpi:
@@ -330,7 +327,7 @@ class GridFIT3D(PlotMixin):
         self.Z += (self.ZMAX - self.ZMIN) / (2 * self.NZ)
 
         if self.verbose and self.rank == 0:
-            print(f" * Global grid ZMIN={self.ZMIN}, ZMAX={self.ZMAX}, NZ={self.NZ}")
+            print(f"* Global grid ZMIN={self.ZMIN}, ZMAX={self.ZMAX}, NZ={self.NZ}")
 
         # MPI subdomain quantities [TODO: support non-uniform dz with MPI]
         self.Nz = self.NZ // (self.size)
@@ -340,7 +337,7 @@ class GridFIT3D(PlotMixin):
 
         if self.verbose:
             print(
-                f"MPI rank {self.rank} of {self.size} initialized with \
+                f"    * MPI rank {self.rank} of {self.size} initialized with \
                         zmin={self.zmin}, zmax={self.zmax}, Nz={self.Nz}"
             )
         # Add ghost cells
@@ -406,7 +403,7 @@ class GridFIT3D(PlotMixin):
                 self.stl_solids = {"Solid 1": self.stl_solids}
             else:
                 raise Exception(
-                    "Attribute `stl_solids` must contain a string or a dictionary"
+                    "[!] Attribute `stl_solids` must contain a string or a dictionary"
                 )
 
         if type(self.stl_rotate) is not dict:
@@ -456,7 +453,7 @@ class GridFIT3D(PlotMixin):
                 self.stl_materials = {"Solid 1": self.stl_materials}
             else:
                 raise Exception(
-                    "Attribute `stl_materials` must contain a string or a dictionary"
+                    "[!] Attribute `stl_materials` must contain a string or a dictionary"
                 )
 
         for key in self.stl_solids.keys():
@@ -600,7 +597,7 @@ class GridFIT3D(PlotMixin):
 
             if self.verbose > 1:
                 print(
-                    f" * STL solid {key}: {np.sum(self.grid[key])} cells marked inside the solid."
+                    f"    * STL solid {key}: {np.sum(self.grid[key])} cells marked inside the solid."
                 )
 
     def _mark_cells_in_surface(self, key):
@@ -663,7 +660,7 @@ class GridFIT3D(PlotMixin):
             Tolerance for snap point detection.
         """
         if self.verbose > 1:
-            print(" * Calculating snappy points...")
+            print("    * Calculating snappy points...")
         # Support for user-defined stl_keys as list
         if snap_solids is None:
             snap_solids = self.stl_solids.keys()
@@ -877,7 +874,7 @@ class GridFIT3D(PlotMixin):
         """
 
         if self.verbose > 1:
-            print(f" * Refining x axis with {len(self.x_snaps)} snaps...")
+            print(f"    * Refining x axis with {len(self.x_snaps)} snaps...")
         self.x = self.refine_axis(
             self.xmin,
             self.xmax,
@@ -888,7 +885,7 @@ class GridFIT3D(PlotMixin):
         )
 
         if self.verbose > 1:
-            print(f" * Refining y axis with {len(self.y_snaps)} snaps...")
+            print(f"    * Refining y axis with {len(self.y_snaps)} snaps...")
         self.y = self.refine_axis(
             self.ymin,
             self.ymax,
@@ -899,7 +896,7 @@ class GridFIT3D(PlotMixin):
         )
 
         if self.verbose > 1:
-            print(f" * Refining z axis with {len(self.z_snaps)} snaps...")
+            print(f"    * Refining z axis with {len(self.z_snaps)} snaps...")
         self.z = self.refine_axis(
             self.zmin,
             self.zmax,
@@ -1058,19 +1055,19 @@ class GridFIT3D(PlotMixin):
         # add verbosity
         if self.verbose > 1:
             print(f"Loaded grid with {self.Nx * self.Ny * self.Nz} mesh cells:")
-            print(f" * Number of cells: Nx={self.Nx}, Ny={self.Ny}, Nz={self.Nz}")
+            print(f"    * Number of cells: Nx={self.Nx}, Ny={self.Ny}, Nz={self.Nz}")
             print(
-                f" * Simulation domain bounds: \n\
+                f"    * Simulation domain bounds: \n\
                 x:[{self.xmin:.3f}, {self.xmax:.3f}],\n\
                 y:[{self.ymin:.3f}, {self.ymax:.3f}],\n\
                 z:[{self.zmin:.3f}, {self.zmax:.3f}]"
             )
             print(
-                f" * STL solids imported:\n\
+                f"    * STL solids imported:\n\
                 {list(self.stl_solids.keys())}"
             )
             print(
-                f" * STL solids assigned materials [eps_r, mu_r, sigma]:\n\
+                f"    * STL solids assigned materials [eps_r, mu_r, sigma]:\n\
                 {list(self.stl_materials.values())}"
             )
 
