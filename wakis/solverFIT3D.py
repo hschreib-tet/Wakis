@@ -319,16 +319,15 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         if self.verbose > 1:
             print(f"    * Simulation timestep: dt={self.dt:.3e} s")
         if self.verbose > 1 and wake is not None:
+            wakelength = 1.0 if self.wake.wakelength is None else self.wake.wakelength
             tmax = (
-                wake.wakelength
-                + self.wake.ti * self.wake.v
-                + (self.z.max() - self.z.min())
+                wakelength + self.wake.ti * self.wake.v + (self.z.max() - self.z.min())
             ) / self.wake.v  # [s]
             print(
-                f"    * Total simulation time for wakelength={wake.wakelength} m: tmax={tmax:.3e} s"
+                f"    * Total simulation time for wakelength={wakelength} m: tmax={tmax:.3e} s"
             )
             print(
-                f"    * Total number of timesteps for wakelength={wake.wakelength} m: Nt={int(tmax / self.dt)}"
+                f"    * Total number of timesteps for wakelength={wakelength} m: Nt={int(tmax / self.dt)}"
             )
 
         # Pre-computing
