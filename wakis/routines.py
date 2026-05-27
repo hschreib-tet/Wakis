@@ -230,7 +230,7 @@ class RoutinesMixin:
 
     def wakesolve(
         self,
-        wakelength,
+        wakelength=None,
         wake=None,
         callback=None,
         compute_plane="both",
@@ -325,6 +325,9 @@ class RoutinesMixin:
             raise AttributeError(
                 "Wake solver information not passed to the solver instantiation"
             )
+
+        if wakelength is None:
+            wakelength = self.wake.wakelength
 
         if add_space is not None:  # legacy support
             self.wake.skip_cells = add_space

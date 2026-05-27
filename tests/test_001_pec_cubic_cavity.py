@@ -114,7 +114,9 @@ class TestPecCubicCavity:
 
         global wake
         skip_cells = 12  # no. cells to skip in WP integration
+        wakelength = 1.0  # [m]
         wake = WakeSolver(
+            wakelength=wakelength,
             q=q,
             sigmaz=sigmaz,
             beta=beta,
@@ -145,7 +147,6 @@ class TestPecCubicCavity:
             verbose=2,
         )
 
-        wakelength = 1.0  # [m]
         solver.wakesolve(wakelength=wakelength, save_J=False)
         os.remove("tests/001_Ez.h5")
 
