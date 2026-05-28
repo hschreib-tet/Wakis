@@ -4,7 +4,7 @@
 # ########################################### #
 
 import numpy as np
-from scipy.constants import mu_0 as mu_0
+from scipy.constants import mu_0, epsilon_0
 from scipy.sparse import diags
 
 from .field import Field
@@ -211,8 +211,8 @@ class BCsMixin:
             for d in ["x", "y", "z"]:
                 # Get the properties from the layer before the PML
                 # Take the values at the center of the yz plane
-                ieps_0_pml = self.ieps[self.n_pml + 1, self.Ny // 2, self.Nz // 2, d]
-                sigma_0_pml = self.sigma[self.n_pml + 1, self.Ny // 2, self.Nz // 2, d]
+                ieps_0_pml = 1/epsilon_0 #self.ieps[self.n_pml + 1, self.Ny // 2, self.Nz // 2, d]
+                sigma_0_pml = 0. #self.sigma[self.n_pml + 1, self.Ny // 2, self.Nz // 2, d]
                 sigma_mult_pml = (
                     1 if sigma_0_pml < 1 else sigma_0_pml
                 )  # avoid null sigma in PML for relaxation time computation
@@ -227,8 +227,8 @@ class BCsMixin:
             for d in ["x", "y", "z"]:
                 # Get the properties from the layer before the PML
                 # Take the values at the center of the xz plane
-                ieps_0_pml = self.ieps[self.Nx // 2, self.n_pml + 1, self.Nz // 2, d]
-                sigma_0_pml = self.sigma[self.Nx // 2, self.n_pml + 1, self.Nz // 2, d]
+                ieps_0_pml = 1/epsilon_0 #self.ieps[self.Nx // 2, self.n_pml + 1, self.Nz // 2, d]
+                sigma_0_pml = 0. #self.sigma[self.Nx // 2, self.n_pml + 1, self.Nz // 2, d]
                 sigma_mult_pml = (
                     1 if sigma_0_pml < 1 else sigma_0_pml
                 )  # avoid null sigma in PML for relaxation time computation
@@ -243,8 +243,8 @@ class BCsMixin:
             for d in ["x", "y", "z"]:
                 # Get the properties from the layer before the PML
                 # Take the values at the center of the xy plane
-                ieps_0_pml = self.ieps[self.Nx // 2, self.Ny // 2, self.n_pml + 1, d]
-                sigma_0_pml = self.sigma[self.Nx // 2, self.Ny // 2, self.n_pml + 1, d]
+                ieps_0_pml = 1/epsilon_0 #self.ieps[self.Nx // 2, self.Ny // 2, self.n_pml + 1, d]
+                sigma_0_pml = 0. #self.sigma[self.Nx // 2, self.Ny // 2, self.n_pml + 1, d]
                 sigma_mult_pml = (
                     1 if sigma_0_pml < 1 else sigma_0_pml
                 )  # avoid null sigma in PML for relaxation time computation
@@ -259,10 +259,8 @@ class BCsMixin:
             for d in ["x", "y", "z"]:
                 # Get the properties from the layer before the PML
                 # Take the values at the center of the yz plane
-                ieps_0_pml = self.ieps[-(self.n_pml + 1), self.Ny // 2, self.Nz // 2, d]
-                sigma_0_pml = self.sigma[
-                    -(self.n_pml + 1), self.Ny // 2, self.Nz // 2, d
-                ]
+                ieps_0_pml = 1/epsilon_0 #self.ieps[-(self.n_pml + 1), self.Ny // 2, self.Nz // 2, d]
+                sigma_0_pml = 0. #self.sigma[ -(self.n_pml + 1), self.Ny // 2, self.Nz // 2, d]
                 sigma_mult_pml = (
                     1 if sigma_0_pml < 1 else sigma_0_pml
                 )  # avoid null sigma in PML for relaxation time computation
@@ -278,10 +276,8 @@ class BCsMixin:
             for d in ["x", "y", "z"]:
                 # Get the properties from the layer before the PML
                 # Take the values at the center of the xz plane
-                ieps_0_pml = self.ieps[self.Nx // 2, -(self.n_pml + 1), self.Nz // 2, d]
-                sigma_0_pml = self.sigma[
-                    self.Nx // 2, -(self.n_pml + 1), self.Nz // 2, d
-                ]
+                ieps_0_pml = 1/epsilon_0 #self.ieps[self.Nx // 2, -(self.n_pml + 1), self.Nz // 2, d]
+                sigma_0_pml = 0. #self.sigma[self.Nx // 2, -(self.n_pml + 1), self.Nz // 2, d]
                 sigma_mult_pml = (
                     1 if sigma_0_pml < 1 else sigma_0_pml
                 )  # avoid null sigma in PML for relaxation time computation
@@ -297,10 +293,8 @@ class BCsMixin:
             for d in ["x", "y", "z"]:
                 # Get the properties from the layer before the PML
                 # Take the values at the center of the xy plane
-                ieps_0_pml = self.ieps[self.Nx // 2, self.Ny // 2, -(self.n_pml + 1), d]
-                sigma_0_pml = self.sigma[
-                    self.Nx // 2, self.Ny // 2, -(self.n_pml + 1), d
-                ]
+                ieps_0_pml = 1/epsilon_0 #self.ieps[self.Nx // 2, self.Ny // 2, -(self.n_pml + 1), d]
+                sigma_0_pml = 0. #self.sigma[self.Nx // 2, self.Ny // 2, -(self.n_pml + 1), d]
                 sigma_mult_pml = (
                     1 if sigma_0_pml < 1 else sigma_0_pml
                 )  # avoid null sigma in PML for relaxation time computation

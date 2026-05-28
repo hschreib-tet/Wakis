@@ -1833,12 +1833,12 @@ class PlotMixinGrid:
         stl_solid : str
             Key name of the `stl_solids` dictionary to retrieve the mask for
             visualization (used as the scalar field).
-        plane : {'XY', 'ZY', 'ZX'}, optional
+        plane : {'XY', 'YX', 'ZY', 'YZ', 'ZX', 'XZ'}, optional
             Plane of the slice. Default 'ZX'.
 
-            - 'XY' → normal along Z, slider controls Z position.
-            - 'ZY' → normal along X, slider controls X position.
-            - 'ZX' → normal along Y, slider controls Y position.
+            - 'XY' / 'YX' → normal along Z, slider controls Z position.
+            - 'ZY' / 'YZ' → normal along X, slider controls X position.
+            - 'ZX' / 'XZ' → normal along Y, slider controls Y position.
         position : float or None, optional
             Initial position of the slice along the normal axis. If None, uses
             the center of the domain along that axis.
@@ -1874,9 +1874,9 @@ class PlotMixinGrid:
             stl_colors = self.stl_colors
 
         plane = plane.upper()
-        plane_to_normal = {"XY": "z", "ZY": "x", "ZX": "y"}
+        plane_to_normal = {"XY": "z", "YX": "z", "ZY": "x", "YZ": "x", "ZX": "y", "XZ": "y"}
         if plane not in plane_to_normal:
-            raise ValueError(f"plane must be one of 'XY', 'ZY', 'ZX', got '{plane}'")
+            raise ValueError(f"plane must be one of 'XY', 'YX', 'ZY', 'YZ', 'ZX', 'XZ', got '{plane}'")
 
         normal = plane_to_normal[plane]
         if normal == "x":
@@ -1947,7 +1947,6 @@ class PlotMixinGrid:
                     new_slice, style="wireframe", color="grey", opacity=0.3, name="grid"
                 )
 
-            pl.camera_position = plane.lower()  # 'xy', 'zy', 'zx' views
             pl.render()
 
         # --- Slider ---
@@ -2048,11 +2047,19 @@ class PlotMixinGrid:
                             name=key,
                         )
 
-        # Camera orientation
+        # Camera orientation — use view_*() to enforce correct horizontal/vertical axes
+        _view_fns = {
+            "XY": pl.view_xy,
+            "YX": pl.view_xy,
+            "XZ": pl.view_xz,
+            "YZ": pl.view_yz,
+            "ZX": pl.view_zx,
+            "ZY": pl.view_zy,
+        }
+        _view_fns.get(plane, pl.view_yz)()
         pl.set_background("mistyrose", top="white")
         self._add_logo_widget(pl)
         pl.add_axes()
-        pl.camera_position = plane.lower()  # 'xy', 'zy', 'zx' views
 
         if bounding_box:
             pl.add_mesh(

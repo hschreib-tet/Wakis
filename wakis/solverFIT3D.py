@@ -284,6 +284,8 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             self.n_pml = n_pml
             self._initialize_PML()
             self.update_logger(["n_pml"])
+            if verbose > 1:
+                print(f"    * PML thickness: {self.n_pml} cells")
 
         # Timestep calculation
         if verbose:
@@ -313,6 +315,20 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
 
             if self.dt > self.tau.min():
                 self.dt = self.tau.min()
+
+        if self.verbose > 1:
+            print(f"    * Simulation timestep: dt={self.dt:.3e} s")
+        if self.verbose > 1 and wake is not None:
+            wakelength = 1.0 if self.wake.wakelength is None else self.wake.wakelength
+            tmax = (
+                wakelength + self.wake.ti * self.wake.v + (self.z.max() - self.z.min())
+            ) / self.wake.v  # [s]
+            print(
+                f"    * Total simulation time for wakelength={wakelength} m: tmax={tmax:.3e} s"
+            )
+            print(
+                f"    * Total number of timesteps for wakelength={wakelength} m: Nt={int(tmax / self.dt)}"
+            )
 
         # Pre-computing
         if verbose:
@@ -451,11 +467,13 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
                 sigma = self.stl_materials[key][2]
 
                 # Relaxation time approximation
-                if self.use_sibc and sigma > 0.: 
+                if self.use_sibc and sigma > 0.0:
                     eps = sigma * eps_0
 
                 # Mark surface cells for SIBC if conductivity is high
-                if self.use_sibc and self.stl_materials[key][2] > np.inf: #self.sigma_max*:
+                if (
+                    self.use_sibc and self.stl_materials[key][2] > np.inf
+                ):  # self.sigma_max*:
                     if self.verbose > 1:
                         print(
                             f'    * Applying SIBC for solid "{key}" with sigma={sigma} S/m'
