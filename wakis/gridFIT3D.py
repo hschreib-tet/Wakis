@@ -224,6 +224,9 @@ class GridFIT3D(PlotMixin):
                 y:[{ymin:.3f}, {ymax:.3f}],\n\
                 z:[{zmin:.3f}, {zmax:.3f}]"
             )
+            print("    * Minimum cell sizes: dx={:.3e}, dy={:.3e}, dz={:.3e}".format(
+                np.min(self.dx), np.min(self.dy), np.min(self.dz)
+            ))
 
         # MPI subdivide domain
         if self.use_mpi:
