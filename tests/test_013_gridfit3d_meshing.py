@@ -198,6 +198,136 @@ class TestGridFIT3DMeshing:
             f"Volume of the shell mask is {vol}, expected {vol_expected}"
         )
 
+
+    def test_conformal_geometry_masks(self, use_gpu):
+        """
+        Test conformal STL mask generation.
+
+        Verifies that:
+        1. the primal point mask is defined on all primal grid points,
+        2. the cell mask stored in ``grid.grid[key]`` follows the
+        5-of-8 corner-point rule,
+        3. the dual point mask is derived consistently from the
+        cell-center classification.
+        """
+
+        # Geometry & Materials
+        solid_1 = "tests/stl/007_vacuum_cavity.stl"
+        solid_2 = "tests/stl/007_lossymetal_shell.stl"
+
+        stl_solids = {
+            "cavity": solid_1,
+            "shell": solid_2,
+        }
+
+        stl_materials = {
+            "cavity": "vacuum",
+            "shell": [30, 1.0, 30],
+        }
+
+        # Extract domain bounds from geometry
+        solids = pv.read(solid_1) + pv.read(solid_2)
+        xmin, xmax, ymin, ymax, zmin, zmax = solids.bounds
+
+        # Number of mesh cells
+        Nx = 60
+        Ny = 60
+        Nz = 140
+
+        grid = GridFIT3D(
+            xmin,
+            xmax,
+            ymin,
+            ymax,
+            zmin,
+            zmax,
+            Nx,
+            Ny,
+            Nz,
+            stl_solids=stl_solids,
+            stl_materials=stl_materials,
+            stl_method="voxelize_rectilinear",
+            geometry_mode="conformal",
+            subpixel_smoothing=False,
+            stl_scale=1.0,
+            stl_rotate=[0, 0, 0],
+            stl_translate=[0, 0, 0],
+            verbose=1,
+        )
+
+        # ----------------------------------------------------------
+        # 1. Primal point mask
+        # ----------------------------------------------------------
+        primal = grid.primal_point_masks["shell"]
+
+        assert primal.shape == (
+            Nx + 1,
+            Ny + 1,
+            Nz + 1,
+        )
+
+        assert primal.dtype == bool
+
+        # ----------------------------------------------------------
+        # 2. Independently reconstruct the expected 5-of-8
+        #    cell-center classification
+        # ----------------------------------------------------------
+        corner_count = (
+            primal[:-1, :-1, :-1].astype(np.uint8)
+            + primal[1:, :-1, :-1].astype(np.uint8)
+            + primal[:-1, 1:, :-1].astype(np.uint8)
+            + primal[1:, 1:, :-1].astype(np.uint8)
+            + primal[:-1, :-1, 1:].astype(np.uint8)
+            + primal[1:, :-1, 1:].astype(np.uint8)
+            + primal[:-1, 1:, 1:].astype(np.uint8)
+            + primal[1:, 1:, 1:].astype(np.uint8)
+        )
+
+        expected_cell_mask = corner_count > 4
+
+        assert expected_cell_mask.shape == (
+            Nx,
+            Ny,
+            Nz,
+        )
+
+        # Cell mask actually stored in the PyVista grid
+        cell_mask = np.reshape(
+            np.asarray(grid.grid["shell"], dtype=bool),
+            (Nx, Ny, Nz),
+            order="C",
+        )
+
+        np.testing.assert_array_equal(
+            cell_mask,
+            expected_cell_mask,
+        )
+
+        # ----------------------------------------------------------
+        # 3. Dual point mask
+        # ----------------------------------------------------------
+        dual = grid.dual_point_masks["shell"]
+
+        assert dual.shape == (
+            Nx + 1,
+            Ny + 1,
+            Nz + 1,
+        )
+
+        expected_dual_mask = np.pad(
+            expected_cell_mask,
+            (
+                (0, 1),
+                (0, 1),
+                (0, 1),
+            ),
+            mode="edge",
+        )
+
+        np.testing.assert_array_equal(
+            dual,
+            expected_dual_mask,
+        )
     def test_long_wake_potential_and_impedance(self, use_gpu):
         global grid
         # ------------ Beam source ----------------
