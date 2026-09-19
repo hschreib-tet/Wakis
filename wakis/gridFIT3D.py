@@ -54,6 +54,7 @@ class GridFIT3D(PlotMixin):
         snap_solids=None,
         stl_solids=None,
         stl_materials=None,
+        stl_material_models=None,
         stl_rotate=[0.0, 0.0, 0.0],
         stl_translate=[0.0, 0.0, 0.0],
         stl_scale=1.0,
@@ -100,6 +101,20 @@ class GridFIT3D(PlotMixin):
         stl_materials : dict, optional
             Material properties associated with STL solids.
             {'Solid 1': [eps1, mu1], ...}
+        stl_material_models : dict, str, or None, optional
+            Numerical material model assigned to each STL solid.
+
+            Supported models are:
+
+            - ``"bulk"``: volumetric material treatment using epsilon,
+            mu, and sigma.
+            - ``"sibc"``: surface impedance treatment. The STL volume
+            is excluded from the electromagnetic domain and the surface
+            impedance is determined from mu and sigma.
+
+            If None, all STL solids default to ``"bulk"``. PEC materials
+            are always treated as excluded volumes independently of the
+            specified material model.
         stl_rotate : list or dict, optional
             Angle of rotation to apply to the STL models: [rot_x, rot_y, rot_z].
             If dict, must contain the same keys as stl_solids.
@@ -216,6 +231,7 @@ class GridFIT3D(PlotMixin):
         # stl info
         self.stl_solids = stl_solids
         self.stl_materials = stl_materials
+        self.stl_material_models = stl_material_models
         self.stl_rotate = stl_rotate
         self.stl_translate = stl_translate
         self.stl_scale = stl_scale
@@ -230,6 +246,7 @@ class GridFIT3D(PlotMixin):
 
         if stl_solids is not None:
             self._prepare_stl_dicts()
+            self._prepare_stl_material_models()
 
         # refine self.x, self.y, self.z using snap points
         self.use_mesh_refinement = use_mesh_refinement
@@ -524,6 +541,111 @@ class GridFIT3D(PlotMixin):
             elif len(self.stl_materials[key]) == 2:
                 self.stl_materials[key].append(0.0)
 
+
+    def _prepare_stl_material_models(self):
+        """
+        Prepare and validate numerical material models for all STL solids.
+
+        Supported models are ``"bulk"`` and ``"sibc"``.
+
+        PEC materials are identified by infinite relative permittivity and
+        are always treated as excluded volumes independently of the selected
+        material model.
+        """
+
+        valid_models = {"bulk", "sibc"}
+
+        # Default: preserve previous WAKIS behaviour
+        if self.stl_material_models is None:
+            self.stl_material_models = {
+                key: "bulk"
+                for key in self.stl_solids.keys()
+            }
+
+        # Allow one model to be applied to all STL solids
+        elif isinstance(self.stl_material_models, str):
+            model = self.stl_material_models.lower()
+
+            if model not in valid_models:
+                raise ValueError(
+                    f"[!] Invalid stl_material_model '{model}'. "
+                    "Supported models are 'bulk' and 'sibc'."
+                )
+
+            self.stl_material_models = {
+                key: model
+                for key in self.stl_solids.keys()
+            }
+
+        elif isinstance(self.stl_material_models, dict):
+            unknown_keys = (
+                set(self.stl_material_models)
+                - set(self.stl_solids)
+            )
+
+            if unknown_keys:
+                raise ValueError(
+                    "[!] stl_material_models contains unknown STL "
+                    f"keys: {sorted(unknown_keys)}"
+                )
+
+            # Missing entries default to bulk
+            self.stl_material_models = {
+                key: self.stl_material_models.get(key, "bulk").lower()
+                for key in self.stl_solids.keys()
+            }
+
+        else:
+            raise TypeError(
+                "[!] stl_material_models must be None, a string, "
+                "or a dictionary."
+            )
+
+        # Validate the normalized models
+        for key in self.stl_solids.keys():
+            model = self.stl_material_models[key]
+
+            if model not in valid_models:
+                raise ValueError(
+                    f"[!] Invalid material model '{model}' for STL "
+                    f"solid '{key}'. Supported models are "
+                    "'bulk' and 'sibc'."
+                )
+
+            eps_r, mu_r, sigma = self.stl_materials[key]
+
+            # PEC always takes precedence over the material model
+            if np.isinf(eps_r):
+                if self.verbose and model == "sibc":
+                    print(
+                        f"    * STL solid '{key}' is PEC. "
+                        "The requested SIBC material model is ignored "
+                        "and PEC treatment is used."
+                    )
+                continue
+
+            if model == "sibc":
+                if not np.isfinite(sigma) or sigma <= 0.0:
+                    raise ValueError(
+                        f"[!] STL solid '{key}' uses material_model="
+                        f"'sibc', but conductivity sigma={sigma} S/m. "
+                        "SIBC requires a finite positive conductivity."
+                    )
+
+                if self.verbose:
+                    print(
+                        f"    * STL solid '{key}' uses SIBC: "
+                        f"epsilon_r={eps_r} is ignored; "
+                        f"mu_r={mu_r} and sigma={sigma} S/m are used."
+                    )
+
+                if self.verbose > 1:
+                    print(
+                        "      SIBC assumes a strong skin effect. "
+                        "Verify that the skin depth is sufficiently "
+                        "small compared with the relevant conductor "
+                        "dimensions over the frequency range of interest."
+                    )
     def _point_mask_to_cell_mask(self, point_mask, threshold=0.5):
         """
         Approximate the material classification at primal cell centers
