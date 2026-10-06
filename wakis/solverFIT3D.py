@@ -855,6 +855,8 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         self.stl_materials = self.grid.stl_materials
         self.stl_colors = self.grid.stl_colors
 
+        # SIBC currently relies on cell-based surface masks and is therefore
+        # not yet compatible with the conformal material discretization.
         if self.use_sibc and any(
             self.stl_materials[key][2] > 0.0
             for key in self.stl_solids.keys()
@@ -863,18 +865,6 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
                 "SIBC for conductive STL materials is currently not supported "
                 "with geometry_mode='conformal'."
             )
-
-        if sigma > 0.0:
-            if sigma > 10 * eps / eps_0:
-                print(
-                    f"[!] Warning: High conductivity sigma={sigma} S/m "
-                    f"for solid '{key}' with low permittivity "
-                    f"epsilon_r={eps / eps_0} will considerably reduce "
-                    f"the maximal stable timestep.\n"
-                    f"Consider using the legacy geometry mode with `use_sibc=True` "
-                    f"for the SIBC approximation."
-                )
-            self.use_conductivity = True
 
         shape = (
             self.Nx + 1,
@@ -916,6 +906,14 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
 
             if sigma > 0.0:
                 self.use_conductivity = True
+
+                if sigma > 10 * eps / eps_0:
+                    print(
+                        f"[!] Warning: High conductivity sigma={sigma} S/m "
+                        f"for solid '{key}' with low permittivity "
+                        f"epsilon_r={eps / eps_0} will considerably reduce "
+                        f"the maximal stable timestep."
+                    )
 
         # Average material values over the corresponding FIT faces.
         eps_x, eps_y, eps_z = (

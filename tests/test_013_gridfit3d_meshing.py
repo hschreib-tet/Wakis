@@ -1,5 +1,10 @@
 import sys
 
+from types import SimpleNamespace
+
+from scipy.constants import epsilon_0 as eps_0
+from scipy.constants import mu_0 as mu_0
+
 import numpy as np
 import pyvista as pv
 
@@ -474,6 +479,259 @@ class TestGridFIT3DMeshing:
         )
         assert values_x[i, j, k] == pytest.approx(expected)
 
+
+    def test_conformal_material_assignment(self):
+        """Test point-based material assignment onto FIT material tensors."""
+
+        Nx = 2
+        Ny = 2
+        Nz = 2
+
+        shape_points = (Nx + 1, Ny + 1, Nz + 1)
+        shape_cells = (Nx, Ny, Nz)
+
+        # ----------------------------------------------------------
+        # Synthetic primal and dual point masks
+        # ----------------------------------------------------------
+        primal_mask = np.zeros(shape_points, dtype=bool)
+        dual_mask = np.zeros(shape_points, dtype=bool)
+
+        # For eps_x[1, 1, 1], the associated dual yz face uses
+        #
+        # (1,1,1), (1,0,1), (1,0,0), (1,1,0).
+        #
+        # Mark two of these four points as material.
+        dual_mask[1, 1, 1] = True
+        dual_mask[1, 0, 1] = True
+
+        # For mu_x[0, 0, 0], the associated primal yz face uses
+        #
+        # (1,0,0), (1,1,0), (1,1,1), (1,0,1).
+        #
+        # Mark three of these four points as material.
+        primal_mask[1, 0, 0] = True
+        primal_mask[1, 1, 0] = True
+        primal_mask[1, 1, 1] = True
+
+        # ----------------------------------------------------------
+        # Minimal grid object required by the conformal material path
+        # ----------------------------------------------------------
+        grid = SimpleNamespace(
+            stl_solids={"solid": None},
+            stl_materials={"solid": [5.0, 3.0, 8.0]},
+            stl_colors={"solid": None},
+            primal_point_masks={"solid": primal_mask},
+            dual_point_masks={"solid": dual_mask},
+        )
+
+        # ----------------------------------------------------------
+        # Minimal solver object
+        # ----------------------------------------------------------
+        solver = SolverFIT3D.__new__(SolverFIT3D)
+
+        solver.Nx = Nx
+        solver.Ny = Ny
+        solver.Nz = Nz
+        solver.grid = grid
+
+        solver.dtype = np.float64
+
+        solver.eps_bg = eps_0
+        solver.mu_bg = mu_0
+        solver.sigma_bg = 0.0
+
+        solver.use_sibc = False
+        solver.use_conductivity = False
+        solver.verbose = 0
+
+        solver.ieps = SimpleNamespace(
+            field_x=np.zeros(shape_cells),
+            field_y=np.zeros(shape_cells),
+            field_z=np.zeros(shape_cells),
+        )
+
+        solver.imu = SimpleNamespace(
+            field_x=np.zeros(shape_cells),
+            field_y=np.zeros(shape_cells),
+            field_z=np.zeros(shape_cells),
+        )
+
+        solver.sigma = SimpleNamespace(
+            field_x=np.zeros(shape_cells),
+            field_y=np.zeros(shape_cells),
+            field_z=np.zeros(shape_cells),
+        )
+
+        # ----------------------------------------------------------
+        # Apply new conformal material discretization
+        # ----------------------------------------------------------
+        solver._apply_stl_materials_conformal()
+
+        # ----------------------------------------------------------
+        # Electric material relation
+        # ----------------------------------------------------------
+        # Two of four dual-face points have eps_r = 5,
+        # two remain background eps_r = 1.
+        #
+        # eps_eff / eps_0 = (5 + 5 + 1 + 1) / 4 = 3
+        expected_eps = 3.0 * eps_0
+
+        assert solver.ieps.field_x[1, 1, 1] == pytest.approx(
+            1.0 / expected_eps
+        )
+
+        # Same two points carry sigma = 8 S/m:
+        #
+        # sigma_eff = (8 + 8 + 0 + 0) / 4 = 4 S/m
+        assert solver.sigma.field_x[1, 1, 1] == pytest.approx(4.0)
+
+        # ----------------------------------------------------------
+        # Magnetic material relation
+        # ----------------------------------------------------------
+        # Three of four primal-face points have mu_r = 3,
+        # one remains background mu_r = 1.
+        #
+        # mu_eff / mu_0 = (3 + 3 + 3 + 1) / 4 = 2.5
+        expected_mu = 2.5 * mu_0
+
+        assert solver.imu.field_x[0, 0, 0] == pytest.approx(
+            1.0 / expected_mu
+        )
+
+        # Conductive material must enable conductivity treatment.
+        assert solver.use_conductivity
+
+
+    def test_conformal_material_assignment_homogeneous(self):
+        """Test conformal material assignment for a homogeneous solid."""
+
+        Nx = 2
+        Ny = 3
+        Nz = 4
+
+        shape_points = (Nx + 1, Ny + 1, Nz + 1)
+        shape_cells = (Nx, Ny, Nz)
+
+        # All primal and dual grid points belong to the material.
+        primal_mask = np.ones(shape_points, dtype=bool)
+        dual_mask = np.ones(shape_points, dtype=bool)
+
+        eps_r = 4.0
+        mu_r = 2.5
+        sigma = 7.0
+
+        grid = SimpleNamespace(
+            stl_solids={"solid": None},
+            stl_materials={"solid": [eps_r, mu_r, sigma]},
+            stl_colors={"solid": None},
+            primal_point_masks={"solid": primal_mask},
+            dual_point_masks={"solid": dual_mask},
+        )
+
+        solver = SolverFIT3D.__new__(SolverFIT3D)
+
+        solver.Nx = Nx
+        solver.Ny = Ny
+        solver.Nz = Nz
+        solver.grid = grid
+
+        solver.dtype = np.float64
+
+        solver.eps_bg = eps_0
+        solver.mu_bg = mu_0
+        solver.sigma_bg = 0.0
+
+        solver.use_sibc = False
+        solver.use_conductivity = False
+        solver.verbose = 0
+
+        solver.ieps = SimpleNamespace(
+            field_x=np.zeros(shape_cells),
+            field_y=np.zeros(shape_cells),
+            field_z=np.zeros(shape_cells),
+        )
+
+        solver.imu = SimpleNamespace(
+            field_x=np.zeros(shape_cells),
+            field_y=np.zeros(shape_cells),
+            field_z=np.zeros(shape_cells),
+        )
+
+        solver.sigma = SimpleNamespace(
+            field_x=np.zeros(shape_cells),
+            field_y=np.zeros(shape_cells),
+            field_z=np.zeros(shape_cells),
+        )
+
+        solver._apply_stl_materials_conformal()
+
+        expected_ieps = 1.0 / (eps_r * eps_0)
+        expected_imu = 1.0 / (mu_r * mu_0)
+
+        for field in (
+            solver.ieps.field_x,
+            solver.ieps.field_y,
+            solver.ieps.field_z,
+        ):
+            np.testing.assert_allclose(field, expected_ieps)
+
+        for field in (
+            solver.imu.field_x,
+            solver.imu.field_y,
+            solver.imu.field_z,
+        ):
+            np.testing.assert_allclose(field, expected_imu)
+
+        for field in (
+            solver.sigma.field_x,
+            solver.sigma.field_y,
+            solver.sigma.field_z,
+        ):
+            np.testing.assert_allclose(field, sigma)
+
+        assert solver.use_conductivity
+
+    def test_conformal_material_assignment_rejects_sibc(self):
+        """Test that SIBC is explicitly rejected for conformal geometry."""
+
+        Nx = 2
+        Ny = 2
+        Nz = 2
+
+        shape_points = (Nx + 1, Ny + 1, Nz + 1)
+
+        mask = np.ones(shape_points, dtype=bool)
+
+        grid = SimpleNamespace(
+            stl_solids={"conductor": None},
+            stl_materials={"conductor": [1.0, 1.0, 1.0e6]},
+            stl_colors={"conductor": None},
+            primal_point_masks={"conductor": mask},
+            dual_point_masks={"conductor": mask},
+        )
+
+        solver = SolverFIT3D.__new__(SolverFIT3D)
+
+        solver.Nx = Nx
+        solver.Ny = Ny
+        solver.Nz = Nz
+        solver.grid = grid
+
+        solver.dtype = np.float64
+
+        solver.eps_bg = eps_0
+        solver.mu_bg = mu_0
+        solver.sigma_bg = 0.0
+
+        solver.use_sibc = True
+        solver.use_conductivity = False
+        solver.verbose = 0
+
+        with pytest.raises(
+            NotImplementedError,
+            match="SIBC.*not supported",
+        ):
+            solver._apply_stl_materials_conformal()
 
     def test_long_wake_potential_and_impedance(self, use_gpu, plot_comparison):
         global grid
