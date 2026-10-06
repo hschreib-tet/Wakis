@@ -198,6 +198,283 @@ class TestGridFIT3DMeshing:
             f"Volume of the shell mask is {vol}, expected {vol_expected}"
         )
 
+    def test_conformal_geometry_masks(self):
+        """
+        Test conformal STL mask generation.
+
+        Verifies that:
+        1. the primal point mask is defined on all primal grid points,
+        2. the cell mask stored in ``grid.grid[key]`` follows the
+           5-of-8 corner-point rule,
+        3. the dual point mask is derived consistently from the
+           cell-center classification.
+        """
+
+        # Geometry & Materials
+        solid_1 = "tests/stl/007_vacuum_cavity.stl"
+        solid_2 = "tests/stl/007_lossymetal_shell.stl"
+
+        stl_solids = {
+            "cavity": solid_1,
+            "shell": solid_2,
+        }
+
+        stl_materials = {
+            "cavity": "vacuum",
+            "shell": [30, 1.0, 30],
+        }
+
+        # Extract domain bounds from geometry
+        solids = pv.read(solid_1) + pv.read(solid_2)
+        xmin, xmax, ymin, ymax, zmin, zmax = solids.bounds
+
+        # Number of mesh cells
+        Nx = 60
+        Ny = 60
+        Nz = 140
+
+        grid = GridFIT3D(
+            xmin,
+            xmax,
+            ymin,
+            ymax,
+            zmin,
+            zmax,
+            Nx,
+            Ny,
+            Nz,
+            stl_solids=stl_solids,
+            stl_materials=stl_materials,
+            stl_method="voxelize_rectilinear",
+            geometry_mode="conformal",
+            subpixel_smoothing=False,
+            stl_scale=1.0,
+            stl_rotate=[0, 0, 0],
+            stl_translate=[0, 0, 0],
+            verbose=1,
+        )
+
+        # ----------------------------------------------------------
+        # 1. Primal point mask
+        # ----------------------------------------------------------
+        primal = grid.primal_point_masks["shell"]
+
+        assert primal.shape == (
+            Nx + 1,
+            Ny + 1,
+            Nz + 1,
+        )
+
+        assert primal.dtype == bool
+
+        # ----------------------------------------------------------
+        # 2. Independently reconstruct the expected 5-of-8
+        #    cell-center classification
+        # ----------------------------------------------------------
+        corner_count = (
+            primal[:-1, :-1, :-1].astype(np.uint8)
+            + primal[1:, :-1, :-1].astype(np.uint8)
+            + primal[:-1, 1:, :-1].astype(np.uint8)
+            + primal[1:, 1:, :-1].astype(np.uint8)
+            + primal[:-1, :-1, 1:].astype(np.uint8)
+            + primal[1:, :-1, 1:].astype(np.uint8)
+            + primal[:-1, 1:, 1:].astype(np.uint8)
+            + primal[1:, 1:, 1:].astype(np.uint8)
+        )
+
+        expected_cell_mask = corner_count > 4
+
+        assert expected_cell_mask.shape == (
+            Nx,
+            Ny,
+            Nz,
+        )
+
+        # Cell mask actually stored in the PyVista grid
+        cell_mask = np.reshape(
+            np.asarray(grid.grid["shell"], dtype=bool),
+            (Nx, Ny, Nz),
+            order="C",
+        )
+
+        np.testing.assert_array_equal(
+            cell_mask,
+            expected_cell_mask,
+        )
+
+        # ----------------------------------------------------------
+        # 3. Dual point mask
+        # ----------------------------------------------------------
+        dual = grid.dual_point_masks["shell"]
+
+        assert dual.shape == (
+            Nx + 1,
+            Ny + 1,
+            Nz + 1,
+        )
+
+        expected_dual_mask = np.pad(
+            expected_cell_mask,
+            (
+                (0, 1),
+                (0, 1),
+                (0, 1),
+            ),
+            mode="edge",
+        )
+
+        np.testing.assert_array_equal(
+            dual,
+            expected_dual_mask,
+        )
+
+
+    def test_average_dual_points_to_primal_edges(self):
+        """Test dual-point averaging onto the faces of primal edges."""
+
+        Nx = 3
+        Ny = 4
+        Nz = 5
+
+        # Unique value at every grid point, so indexing errors are visible.
+        values = np.arange(
+            (Nx + 1) * (Ny + 1) * (Nz + 1),
+            dtype=float,
+        ).reshape(Nx + 1, Ny + 1, Nz + 1)
+
+        values_x, values_y, values_z = (
+            SolverFIT3D._average_dual_points_to_primal_edges(values)
+        )
+
+        assert values_x.shape == (Nx, Ny, Nz)
+        assert values_y.shape == (Nx, Ny, Nz)
+        assert values_z.shape == (Nx, Ny, Nz)
+
+        # ----------------------------------------------------------
+        # Interior faces
+        # ----------------------------------------------------------
+
+        # x-directed primal edge -> dual yz face
+        i, j, k = 1, 2, 3
+        expected = 0.25 * (
+            values[i, j, k]
+            + values[i, j - 1, k]
+            + values[i, j - 1, k - 1]
+            + values[i, j, k - 1]
+        )
+        assert values_x[i, j, k] == pytest.approx(expected)
+
+        # y-directed primal edge -> dual xz face
+        i, j, k = 2, 1, 3
+        expected = 0.25 * (
+            values[i, j, k]
+            + values[i - 1, j, k]
+            + values[i - 1, j, k - 1]
+            + values[i, j, k - 1]
+        )
+        assert values_y[i, j, k] == pytest.approx(expected)
+
+        # z-directed primal edge -> dual xy face
+        i, j, k = 2, 2, 1
+        expected = 0.25 * (
+            values[i, j, k]
+            + values[i - 1, j, k]
+            + values[i - 1, j - 1, k]
+            + values[i, j - 1, k]
+        )
+        assert values_z[i, j, k] == pytest.approx(expected)
+
+        # ----------------------------------------------------------
+        # Low-side boundary treatment
+        # ----------------------------------------------------------
+
+        # x edge on ymin: only two distinct dual points contribute
+        i, j, k = 1, 0, 3
+        expected = 0.5 * (
+            values[i, 0, k]
+            + values[i, 0, k - 1]
+        )
+        assert values_x[i, j, k] == pytest.approx(expected)
+
+        # x edge on ymin and zmin: only one dual point contributes
+        i, j, k = 1, 0, 0
+        expected = values[i, 0, 0]
+        assert values_x[i, j, k] == pytest.approx(expected)
+
+
+    def test_average_primal_points_to_dual_edges(self):
+        """Test primal-point averaging onto the faces of dual edges."""
+
+        Nx = 3
+        Ny = 4
+        Nz = 5
+
+        values = np.arange(
+            (Nx + 1) * (Ny + 1) * (Nz + 1),
+            dtype=float,
+        ).reshape(Nx + 1, Ny + 1, Nz + 1)
+
+        values_x, values_y, values_z = (
+            SolverFIT3D._average_primal_points_to_dual_edges(values)
+        )
+
+        assert values_x.shape == (Nx, Ny, Nz)
+        assert values_y.shape == (Nx, Ny, Nz)
+        assert values_z.shape == (Nx, Ny, Nz)
+
+        # ----------------------------------------------------------
+        # Interior faces
+        # ----------------------------------------------------------
+
+        # x-directed dual edge -> primal yz face at x[i+1]
+        i, j, k = 1, 2, 3
+        expected = 0.25 * (
+            values[i + 1, j, k]
+            + values[i + 1, j + 1, k]
+            + values[i + 1, j + 1, k + 1]
+            + values[i + 1, j, k + 1]
+        )
+        assert values_x[i, j, k] == pytest.approx(expected)
+
+        # y-directed dual edge -> primal xz face at y[j+1]
+        i, j, k = 1, 1, 3
+        expected = 0.25 * (
+            values[i, j + 1, k]
+            + values[i + 1, j + 1, k]
+            + values[i + 1, j + 1, k + 1]
+            + values[i, j + 1, k + 1]
+        )
+        assert values_y[i, j, k] == pytest.approx(expected)
+
+        # z-directed dual edge -> primal xy face at z[k+1]
+        i, j, k = 1, 2, 1
+        expected = 0.25 * (
+            values[i, j, k + 1]
+            + values[i + 1, j, k + 1]
+            + values[i + 1, j + 1, k + 1]
+            + values[i, j + 1, k + 1]
+        )
+        assert values_z[i, j, k] == pytest.approx(expected)
+
+        # ----------------------------------------------------------
+        # High-side boundary
+        # ----------------------------------------------------------
+
+        # Last stored x-directed dual edge terminates at x[Nx].
+        # All four primal points of its associated face exist.
+        i = Nx - 1
+        j = Ny - 1
+        k = Nz - 1
+
+        expected = 0.25 * (
+            values[Nx, Ny - 1, Nz - 1]
+            + values[Nx, Ny, Nz - 1]
+            + values[Nx, Ny, Nz]
+            + values[Nx, Ny - 1, Nz]
+        )
+        assert values_x[i, j, k] == pytest.approx(expected)
+
+
     def test_long_wake_potential_and_impedance(self, use_gpu, plot_comparison):
         global grid
         # ------------ Beam source ----------------

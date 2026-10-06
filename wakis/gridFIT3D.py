@@ -4,6 +4,7 @@
 # ########################################### #
 
 import time
+import warnings
 
 import h5py
 import numpy as np
@@ -59,6 +60,7 @@ class GridFIT3D(PlotMixin):
         stl_colors=None,
         stl_tol=1e-3,
         stl_method="legacy",
+        geometry_mode="legacy",
         subpixel_smoothing=False,
         subpixel_smoothing_factor=4,
         subpixel_smoothing_threshold=0.3,
@@ -115,6 +117,11 @@ class GridFIT3D(PlotMixin):
         stl_method : str, optional
             Method for marking cells inside STL solids. Options are "legacy" (default),
             "interior_points", "implicit_distance", or "voxelize_rectilinear".
+        geometry_mode : str, optional
+            Geometry-mask representation used after STL classification.
+            ``"legacy"`` preserves the existing cell-based mask pipeline.
+            ``"conformal"`` generates primal point masks and derives the
+            corresponding cell and dual-point masks. Default is ``"legacy"``.
         subpixel_smoothing : bool, optional
             Whether to apply subpixel smoothing to the STL masks after voxelization. Default is False.
         subpixel_smoothing_factor : int, optional
@@ -151,6 +158,18 @@ class GridFIT3D(PlotMixin):
         self.logger = Logger()
         self.verbose = verbose
         self.use_mpi = use_mpi
+
+        self.geometry_mode = geometry_mode.lower()
+
+        if self.geometry_mode not in ("legacy", "conformal"):
+            raise ValueError(
+                "[!] geometry_mode must be 'legacy' or 'conformal'."
+            )
+
+        
+        # Point-based STL masks used by the conformal geometry pipeline
+        self.primal_point_masks = {}
+        self.dual_point_masks = {}
 
         # Grid data
         # generate from file
@@ -272,12 +291,26 @@ class GridFIT3D(PlotMixin):
             print("Importing STL solids...")
         self.stl_tol = stl_tol
         self.stl_method = stl_method
+
         self.use_subpixel_smoothing = subpixel_smoothing
         self.subpixel_smoothing_factor = subpixel_smoothing_factor
         self.subpixel_smoothing_threshold = subpixel_smoothing_threshold
         self.subpixel_smoothing_bool = subpixel_smoothing_bool
+
         if self.subpixel_smoothing_threshold is None:
-            self.subpixel_smoothing_threshold = 1 / (self.subpixel_smoothing_factor**3)
+            self.subpixel_smoothing_threshold = 1 / (
+                self.subpixel_smoothing_factor**3
+            )
+
+        if self.geometry_mode == "conformal" and self.use_subpixel_smoothing:
+            warnings.warn(
+                "subpixel_smoothing is ignored when geometry_mode='conformal'. "
+                "The conformal geometry pipeline derives the masks from "
+                "primal grid-point classifications.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         if stl_solids is not None:
             self._mark_cells_in_stl(method=self.stl_method)
 
@@ -498,7 +531,145 @@ class GridFIT3D(PlotMixin):
             elif len(self.stl_materials[key]) == 2:
                 self.stl_materials[key].append(0.0)
 
+    def _point_mask_to_cell_mask(self, point_mask, threshold=0.5):
+        """
+        Derive a cell mask from a boolean mask on primal grid points.
+
+        The cell centers correspond to the interior dual grid points.
+        The cell classification is obtained from the eight primal
+        corner-point classifications using a majority rule.
+
+        With threshold=0.5, at least five of the eight primal corner
+        points must lie inside the solid.
+
+        This mask is used to construct the dual point mask and is not
+        the legacy WAKIS cell mask stored in ``self.grid[key]``.
+        
+        Parameters
+        ----------
+        point_mask : ndarray of bool
+            Boolean mask with shape (Nx+1, Ny+1, Nz+1).
+        threshold : float, optional
+            Occupancy threshold used for the cell classification.
+
+        Returns
+        -------
+        cell_mask : ndarray of bool
+            Boolean mask with shape (Nx, Ny, Nz).
+        """
+        point_mask = np.asarray(point_mask, dtype=bool)
+
+        expected_shape = (self.Nx + 1, self.Ny + 1, self.Nz + 1)
+        if point_mask.shape != expected_shape:
+            raise ValueError(
+                f"Expected primal point mask shape {expected_shape}, "
+                f"got {point_mask.shape}."
+            )
+
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("threshold must be between 0 and 1.")
+
+        # Count how many of the eight corner points lie inside the STL.
+        # uint8 is sufficient (maximum value is 8) and avoids a large
+        # temporary floating-point array.
+        count = point_mask[:-1, :-1, :-1].astype(np.uint8)
+
+        count += point_mask[1:, :-1, :-1]
+        count += point_mask[:-1, 1:, :-1]
+        count += point_mask[:-1, :-1, 1:]
+        count += point_mask[1:, 1:, :-1]
+        count += point_mask[1:, :-1, 1:]
+        count += point_mask[:-1, 1:, 1:]
+        count += point_mask[1:, 1:, 1:]
+
+        return count > 8.0 * threshold
+
+    def _cell_mask_to_dual_point_mask(self, cell_mask):
+        """
+        Convert a primal cell mask to a mask on dual grid points.
+
+        Interior dual grid points coincide with primal cell centers.
+        The additional high-side dual point lies on the physical domain
+        boundary. Its material classification is extended from the adjacent
+        cell-center value.
+
+        Parameters
+        ----------
+        cell_mask : ndarray of bool
+            Boolean cell mask with shape (Nx, Ny, Nz).
+
+        Returns
+        -------
+        dual_point_mask : ndarray of bool
+            Boolean mask with shape (Nx+1, Ny+1, Nz+1).
+        """
+        cell_mask = np.asarray(cell_mask, dtype=bool)
+
+        expected_shape = (self.Nx, self.Ny, self.Nz)
+        if cell_mask.shape != expected_shape:
+            raise ValueError(
+                f"Expected cell mask shape {expected_shape}, "
+                f"got {cell_mask.shape}."
+            )
+
+        return np.pad(
+            cell_mask,
+            ((0, 1), (0, 1), (0, 1)),
+            mode="edge",
+        )
+
+    def _store_stl_masks(self, key, primal_point_mask, cell_threshold=0.5):
+        """
+        Store primal-point, cell-center, and dual-point masks for one STL solid.
+
+        The cell-center classification is obtained from the eight primal
+        corner-point values. It is used both as the conformal cell mask
+        stored in ``self.grid[key]`` and as the basis for the dual-point mask.
+
+        Parameters
+        ----------
+        key : str
+            STL solid key.
+        primal_point_mask : ndarray of bool
+            Boolean mask on primal grid points with shape
+            (Nx+1, Ny+1, Nz+1).
+        cell_threshold : float, optional
+            Threshold used to classify the cell center from the eight
+            primal corner-point values. With the default value 0.5,
+            at least five of eight corner points must lie inside the solid.
+        """
+        primal_point_mask = np.asarray(
+            primal_point_mask,
+            dtype=bool,
+        )
+
+        cell_center_mask = self._point_mask_to_cell_mask(
+            primal_point_mask,
+            threshold=cell_threshold,
+        )
+
+        dual_point_mask = self._cell_mask_to_dual_point_mask(
+            cell_center_mask
+        )
+
+        self.primal_point_masks[key] = primal_point_mask
+        self.dual_point_masks[key] = dual_point_mask
+
+        self.grid[key] = np.reshape(
+            cell_center_mask,
+            self.Nx * self.Ny * self.Nz,
+            order="C",
+        )
+
+
     def _mark_cells_in_stl(self, method):
+        if self.geometry_mode == "legacy":
+            self._mark_cells_in_stl_legacy(method)
+
+        elif self.geometry_mode == "conformal":
+            self._mark_cells_in_stl_conformal(method)
+
+    def _mark_cells_in_stl_legacy(self, method):
         """
         Mark grid cells that are inside each STL solid.
 
@@ -641,6 +812,191 @@ class GridFIT3D(PlotMixin):
                     f"    * STL solid {key}: {np.sum(self.grid[key])} cells marked inside the solid."
                 )
 
+    
+    def _mark_cells_in_stl_conformal(self, method):
+        """
+        Generate STL masks using the selected PyVista geometry method.
+
+        Each geometry method first produces a boolean mask on the primal
+        grid points. The cell mask is then derived consistently from the
+        eight corner-point values, and the dual-point mask is obtained
+        from the resulting cell mask.
+
+        The existing ``self.grid[key]`` cell-mask interface is preserved.
+
+        Parameters
+        ----------
+        method : str
+            STL classification method. Supported methods are
+            "legacy", "interior_points", "implicit_distance",
+            and "voxelize_rectilinear".
+        """
+        stl_tolerance = (
+            np.min(
+                [
+                    np.min(self.dx),
+                    np.min(self.dy),
+                    np.min(self.dz),
+                ]
+            )
+            * self.stl_tol
+        )
+
+        progress_bar = False
+        if self.verbose > 1:
+            progress_bar = True
+
+        method = method.lower()
+
+        for key in self.stl_solids.keys():
+            surf = self.read_stl(key)
+
+            if self.verbose:
+                print(f" * Marking grid points inside STL solid '{key}'...")
+
+            # ----------------------------------------------------------
+            # select_interior_points / legacy
+            # ----------------------------------------------------------
+            if method in ("legacy", "interior_points"):
+                try:
+                    select = self.grid.select_interior_points(
+                        surf,
+                        method="cell_locator",
+                        locator_tolerance=stl_tolerance,
+                    )
+
+                except Exception:
+                    select = self.grid.select_interior_points(
+                        surf,
+                        method="cell_locator",
+                        locator_tolerance=stl_tolerance,
+                        check_surface=False,
+                    )
+
+                    if self.verbose > 1:
+                        print(
+                            f"[!] Warning: STL solid {key} may have issues "
+                            "with closed surfaces. Consider checking the STL file."
+                        )
+
+                # self.grid was constructed using transposed meshgrid arrays.
+                # Its flattened point-data ordering maps to the logical
+                # (i, j, k) indexing using C-order here.
+                primal_point_mask = np.reshape(
+                    np.asarray(
+                        select.point_data["selected_points"],
+                        dtype=bool,
+                    ),
+                    (self.Nx + 1, self.Ny + 1, self.Nz + 1),
+                    order="C",
+                )
+
+            # ----------------------------------------------------------
+            # implicit distance
+            # ----------------------------------------------------------
+            elif method == "implicit_distance":
+                try:
+                    select = self.grid.compute_implicit_distance(surf)
+
+                except Exception:
+                    print(
+                        f"[!] Warning: Implicit distance computation for "
+                        f"STL solid {key} failed."
+                    )
+                    continue
+
+                # Negative signed distance corresponds to points
+                # inside the closed surface.
+                primal_point_mask = np.reshape(
+                    np.asarray(
+                        select.point_data["implicit_distance"]
+                    )
+                    <= 0.0,
+                    (self.Nx + 1, self.Ny + 1, self.Nz + 1),
+                    order="C",
+                )
+
+
+            # ----------------------------------------------------------
+            # voxelize rectilinear
+            # ----------------------------------------------------------
+            elif method == "voxelize_rectilinear":
+                dx, dy, dz = (
+                    (self.xmax - self.xmin) / self.Nx,
+                    (self.ymax - self.ymin) / self.Ny,
+                    (self.zmax - self.zmin) / self.Nz,
+                )
+
+                reference_vol = pv.ImageData(
+                    dimensions=(
+                        self.Nx + 1,
+                        self.Ny + 1,
+                        self.Nz + 1,
+                    ),
+                    origin=(
+                        self.xmin,
+                        self.ymin,
+                        self.zmin,
+                    ),
+                    spacing=(dx, dy, dz),
+                )
+
+                try:
+                    vox = surf.voxelize_rectilinear(
+                        reference_volume=reference_vol,
+                        progress_bar=progress_bar,
+                    )
+
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Voxelization failed for STL solid '{key}'."
+                    ) from exc
+
+                # voxelize_rectilinear creates one voxel centered on each point
+                # of the reference volume. Its cell mask therefore represents
+                # the STL classification at the primal FIT grid points.
+                primal_point_mask = np.reshape(
+                    np.asarray(
+                        vox.cell_data["mask"],
+                        dtype=bool,
+                    ),
+                    (self.Nx + 1, self.Ny + 1, self.Nz + 1),
+                    order="F",
+                )
+
+
+            else:
+                raise ValueError(
+                    f"[!] Error: stl_method {method} not recognized. "
+                    "Use 'legacy', 'interior_points', "
+                    "'implicit_distance', or 'voxelize_rectilinear'."
+                )
+
+            # ----------------------------------------------------------
+            # Common mask pipeline for all geometry methods
+            # ----------------------------------------------------------
+            self._store_stl_masks(
+                key,
+                primal_point_mask,
+                cell_threshold=0.5,
+            )
+
+            if self.verbose and np.sum(self.grid[key]) == 0:
+                print(
+                    f"[!] Warning: no cells were marked inside STL solid "
+                    f"{key}. Consider checking the STL geometry or grid "
+                    "resolution."
+                )
+
+            if self.verbose:
+                print(
+                    f"    * STL solid {key}: "
+                    f"{np.sum(self.primal_point_masks[key])} primal points, "
+                    f"{np.sum(self.grid[key])} cell centers, and "
+                    f"{np.sum(self.dual_point_masks[key])} dual points "
+                    "marked inside the solid."
+                )
+         
     def _apply_subpixel_smoothing(
         self,
         key,
@@ -1134,7 +1490,21 @@ class GridFIT3D(PlotMixin):
                         grp.create_dataset(str(key), data=np.array(val))
 
             for key in self.stl_solids.keys():
-                hf.create_dataset("grid_" + key, data=np.array(self.grid[key]))
+                # Existing cell mask
+                hf.create_dataset(
+                    "grid_" + key,
+                    data=np.array(self.grid[key]),
+                )
+
+                # New primal point mask
+                if key in self.primal_point_masks:
+                    hf.create_dataset(
+                        "grid_primal_points_" + key,
+                        data=np.asarray(
+                            self.primal_point_masks[key],
+                            dtype=bool,
+                        ),
+                    )
 
     def load_from_h5(self, filename):
         """
@@ -1197,7 +1567,31 @@ class GridFIT3D(PlotMixin):
         # asign masks to grid.cell_data
         with h5py.File(filename, "r") as hf:
             for key in self.stl_solids.keys():
+                # Existing cell mask
                 self.grid[key] = hf["grid_" + key][()]
+
+                # New files contain the primal point mask.
+                # Old HDF5 files remain loadable.
+                point_mask_name = "grid_primal_points_" + key
+
+                if point_mask_name in hf:
+                    primal_point_mask = np.asarray(
+                        hf[point_mask_name][()],
+                        dtype=bool,
+                    )
+
+                    self.primal_point_masks[key] = primal_point_mask
+
+                    cell_center_mask = self._point_mask_to_cell_mask(
+                        primal_point_mask,
+                        threshold=0.5,
+                    )
+
+                    self.dual_point_masks[key] = (
+                        self._cell_mask_to_dual_point_mask(
+                            cell_center_mask
+                        )
+                    )
 
         # add verbosity
         if self.verbose > 1:

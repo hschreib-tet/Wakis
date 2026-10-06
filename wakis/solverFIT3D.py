@@ -625,7 +625,153 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         self.itDaiDepsDstC = self.iDeps * self.itDa * self.C.transpose() * self.tDs
         self.step_0 = False
 
+
+
+    @staticmethod
+    def _average_dual_points_to_primal_edges(point_values):
+        """
+        Average material values at dual grid points over the dual faces
+        associated with the stored primal edges.
+
+        Parameters
+        ----------
+        point_values : ndarray
+            Material values on the dual grid points with shape
+            (Nx+1, Ny+1, Nz+1).
+
+        Returns
+        -------
+        values_x, values_y, values_z : ndarray
+            Face-averaged material values associated with the x-, y-, and
+            z-directed primal edges. Each array has shape (Nx, Ny, Nz).
+
+        Notes
+        -----
+        At low-side boundaries, the dual face is truncated by the physical
+        domain boundary. Missing dual-face vertices are represented by
+        constant extrapolation of the nearest available dual-point value.
+        """
+        point_values = np.asarray(point_values)
+
+        Nx = point_values.shape[0] - 1
+        Ny = point_values.shape[1] - 1
+        Nz = point_values.shape[2] - 1
+
+        # ----------------------------------------------------------
+        # x-directed primal edges -> dual yz faces
+        # ----------------------------------------------------------
+        values = point_values[:Nx, :, :]
+
+        padded = np.pad(
+            values,
+            ((0, 0), (1, 0), (1, 0)),
+            mode="edge",
+        )
+
+        values_x = 0.25 * (
+            padded[:, 1 : Ny + 1, 1 : Nz + 1]
+            + padded[:, :Ny, 1 : Nz + 1]
+            + padded[:, :Ny, :Nz]
+            + padded[:, 1 : Ny + 1, :Nz]
+        )
+
+        # ----------------------------------------------------------
+        # y-directed primal edges -> dual xz faces
+        # ----------------------------------------------------------
+        values = point_values[:, :Ny, :]
+
+        padded = np.pad(
+            values,
+            ((1, 0), (0, 0), (1, 0)),
+            mode="edge",
+        )
+
+        values_y = 0.25 * (
+            padded[1 : Nx + 1, :, 1 : Nz + 1]
+            + padded[:Nx, :, 1 : Nz + 1]
+            + padded[:Nx, :, :Nz]
+            + padded[1 : Nx + 1, :, :Nz]
+        )
+
+        # ----------------------------------------------------------
+        # z-directed primal edges -> dual xy faces
+        # ----------------------------------------------------------
+        values = point_values[:, :, :Nz]
+
+        padded = np.pad(
+            values,
+            ((1, 0), (1, 0), (0, 0)),
+            mode="edge",
+        )
+
+        values_z = 0.25 * (
+            padded[1 : Nx + 1, 1 : Ny + 1, :]
+            + padded[:Nx, 1 : Ny + 1, :]
+            + padded[:Nx, :Ny, :]
+            + padded[1 : Nx + 1, :Ny, :]
+        )
+
+        return values_x, values_y, values_z
+
+
+    @staticmethod
+    def _average_primal_points_to_dual_edges(point_values):
+        """
+        Average material values at primal grid points over the primal faces
+        associated with the stored dual edges.
+
+        Parameters
+        ----------
+        point_values : ndarray
+            Material values on the primal grid points with shape
+            (Nx+1, Ny+1, Nz+1).
+
+        Returns
+        -------
+        values_x, values_y, values_z : ndarray
+            Face-averaged material values associated with the x-, y-, and
+            z-directed dual edges. Each array has shape (Nx, Ny, Nz).
+        """
+        point_values = np.asarray(point_values)
+
+        # x-directed dual edges -> primal yz faces at x[i+1]
+        values_x = 0.25 * (
+            point_values[1:, :-1, :-1]
+            + point_values[1:, 1:, :-1]
+            + point_values[1:, 1:, 1:]
+            + point_values[1:, :-1, 1:]
+        )
+
+        # y-directed dual edges -> primal xz faces at y[j+1]
+        values_y = 0.25 * (
+            point_values[:-1, 1:, :-1]
+            + point_values[1:, 1:, :-1]
+            + point_values[1:, 1:, 1:]
+            + point_values[:-1, 1:, 1:]
+        )
+
+        # z-directed dual edges -> primal xy faces at z[k+1]
+        values_z = 0.25 * (
+            point_values[:-1, :-1, 1:]
+            + point_values[1:, :-1, 1:]
+            + point_values[1:, 1:, 1:]
+            + point_values[:-1, 1:, 1:]
+        )
+
+        return values_x, values_y, values_z
+
+
     def _apply_stl_materials(self):
+        """Assign STL materials using the selected geometry representation."""
+
+        if self.grid.geometry_mode == "legacy":
+            self._apply_stl_materials_legacy()
+
+        elif self.grid.geometry_mode == "conformal":
+            self._apply_stl_materials_conformal()
+
+
+    def _apply_stl_materials_legacy(self):
         """
         Mask STL solids in the grid and assign user-defined materials.
 
@@ -695,6 +841,108 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             # Apply SIBC if enabled
             if self.stl_materials[key][2] > 0.0 and self.use_sibc:
                 self._apply_SIBC(key)
+
+    def _apply_stl_materials_conformal(self):
+        """
+        Assign STL materials using primal and dual point masks.
+
+        Electric permittivity and conductivity are averaged over the
+        dual faces associated with the stored primal electric edges.
+        Magnetic permeability is averaged over the primal faces associated
+        with the stored dual magnetic edges.
+        """
+        self.stl_solids = self.grid.stl_solids
+        self.stl_materials = self.grid.stl_materials
+        self.stl_colors = self.grid.stl_colors
+
+        if self.use_sibc and any(
+            self.stl_materials[key][2] > 0.0
+            for key in self.stl_solids.keys()
+        ):
+            raise NotImplementedError(
+                "SIBC for conductive STL materials is currently not supported "
+                "with geometry_mode='conformal'."
+            )
+
+        if sigma > 0.0:
+            if sigma > 10 * eps / eps_0:
+                print(
+                    f"[!] Warning: High conductivity sigma={sigma} S/m "
+                    f"for solid '{key}' with low permittivity "
+                    f"epsilon_r={eps / eps_0} will considerably reduce "
+                    f"the maximal stable timestep.\n"
+                    f"Consider using the legacy geometry mode with `use_sibc=True` "
+                    f"for the SIBC approximation."
+                )
+            self.use_conductivity = True
+
+        shape = (
+            self.Nx + 1,
+            self.Ny + 1,
+            self.Nz + 1,
+        )
+
+        # Initialize point-wise material values with the background material.
+        eps_dual = np.full(
+            shape,
+            self.eps_bg,
+            dtype=self.dtype,
+        )
+
+        sigma_dual = np.full(
+            shape,
+            self.sigma_bg,
+            dtype=self.dtype,
+        )
+
+        mu_primal = np.full(
+            shape,
+            self.mu_bg,
+            dtype=self.dtype,
+        )
+
+        # Assign STL material values to primal and dual grid points.
+        for key in self.stl_solids.keys():
+            primal_mask = self.grid.primal_point_masks[key]
+            dual_mask = self.grid.dual_point_masks[key]
+
+            eps = self.stl_materials[key][0] * eps_0
+            mu = self.stl_materials[key][1] * mu_0
+            sigma = self.stl_materials[key][2]
+
+            eps_dual[dual_mask] = eps
+            sigma_dual[dual_mask] = sigma
+            mu_primal[primal_mask] = mu
+
+            if sigma > 0.0:
+                self.use_conductivity = True
+
+        # Average material values over the corresponding FIT faces.
+        eps_x, eps_y, eps_z = (
+            self._average_dual_points_to_primal_edges(eps_dual)
+        )
+
+        sigma_x, sigma_y, sigma_z = (
+            self._average_dual_points_to_primal_edges(sigma_dual)
+        )
+
+        mu_x, mu_y, mu_z = (
+            self._average_primal_points_to_dual_edges(mu_primal)
+        )
+
+        # Convert physical material values to the quantities used
+        # in the explicit FIT update equations.
+        self.ieps.field_x = 1.0 / eps_x
+        self.ieps.field_y = 1.0 / eps_y
+        self.ieps.field_z = 1.0 / eps_z
+
+        self.imu.field_x = 1.0 / mu_x
+        self.imu.field_y = 1.0 / mu_y
+        self.imu.field_z = 1.0 / mu_z
+
+        self.sigma.field_x = sigma_x
+        self.sigma.field_y = sigma_y
+        self.sigma.field_z = sigma_z
 
     def _apply_SIBC(self, key):
         eps = self.stl_materials[key][0] * eps_0
