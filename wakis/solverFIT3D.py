@@ -625,8 +625,6 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         self.itDaiDepsDstC = self.iDeps * self.itDa * self.C.transpose() * self.tDs
         self.step_0 = False
 
-
-
     @staticmethod
     def _average_dual_points_to_primal_edges(point_values):
         """
@@ -713,7 +711,6 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
 
         return values_x, values_y, values_z
 
-
     @staticmethod
     def _average_primal_points_to_dual_edges(point_values):
         """
@@ -760,7 +757,6 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
 
         return values_x, values_y, values_z
 
-
     def _apply_stl_materials(self):
         """Assign STL materials using the selected geometry representation."""
 
@@ -769,7 +765,6 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
 
         elif self.grid.geometry_mode == "conformal":
             self._apply_stl_materials_conformal()
-
 
     def _apply_stl_materials_legacy(self):
         """
@@ -858,8 +853,7 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         # SIBC currently relies on cell-based surface masks and is therefore
         # not yet compatible with the conformal material discretization.
         if self.use_sibc and any(
-            self.stl_materials[key][2] > 0.0
-            for key in self.stl_solids.keys()
+            self.stl_materials[key][2] > 0.0 for key in self.stl_solids.keys()
         ):
             raise NotImplementedError(
                 "SIBC for conductive STL materials is currently not supported "
@@ -916,17 +910,13 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
                     )
 
         # Average material values over the corresponding FIT faces.
-        eps_x, eps_y, eps_z = (
-            self._average_dual_points_to_primal_edges(eps_dual)
+        eps_x, eps_y, eps_z = self._average_dual_points_to_primal_edges(eps_dual)
+
+        sigma_x, sigma_y, sigma_z = self._average_dual_points_to_primal_edges(
+            sigma_dual
         )
 
-        sigma_x, sigma_y, sigma_z = (
-            self._average_dual_points_to_primal_edges(sigma_dual)
-        )
-
-        mu_x, mu_y, mu_z = (
-            self._average_primal_points_to_dual_edges(mu_primal)
-        )
+        mu_x, mu_y, mu_z = self._average_primal_points_to_dual_edges(mu_primal)
 
         # Convert physical material values to the quantities used
         # in the explicit FIT update equations.

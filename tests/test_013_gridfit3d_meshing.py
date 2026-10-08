@@ -1,12 +1,10 @@
 import sys
-
 from types import SimpleNamespace
-
-from scipy.constants import epsilon_0 as eps_0
-from scipy.constants import mu_0 as mu_0
 
 import numpy as np
 import pyvista as pv
+from scipy.constants import epsilon_0 as eps_0
+from scipy.constants import mu_0 as mu_0
 
 sys.path.append("../wakis")
 
@@ -333,7 +331,6 @@ class TestGridFIT3DMeshing:
             expected_dual_mask,
         )
 
-
     def test_average_dual_points_to_primal_edges(self):
         """Test dual-point averaging onto the faces of primal edges."""
 
@@ -347,8 +344,8 @@ class TestGridFIT3DMeshing:
             dtype=float,
         ).reshape(Nx + 1, Ny + 1, Nz + 1)
 
-        values_x, values_y, values_z = (
-            SolverFIT3D._average_dual_points_to_primal_edges(values)
+        values_x, values_y, values_z = SolverFIT3D._average_dual_points_to_primal_edges(
+            values
         )
 
         assert values_x.shape == (Nx, Ny, Nz)
@@ -395,17 +392,13 @@ class TestGridFIT3DMeshing:
 
         # x edge on ymin: only two distinct dual points contribute
         i, j, k = 1, 0, 3
-        expected = 0.5 * (
-            values[i, 0, k]
-            + values[i, 0, k - 1]
-        )
+        expected = 0.5 * (values[i, 0, k] + values[i, 0, k - 1])
         assert values_x[i, j, k] == pytest.approx(expected)
 
         # x edge on ymin and zmin: only one dual point contributes
         i, j, k = 1, 0, 0
         expected = values[i, 0, 0]
         assert values_x[i, j, k] == pytest.approx(expected)
-
 
     def test_average_primal_points_to_dual_edges(self):
         """Test primal-point averaging onto the faces of dual edges."""
@@ -419,8 +412,8 @@ class TestGridFIT3DMeshing:
             dtype=float,
         ).reshape(Nx + 1, Ny + 1, Nz + 1)
 
-        values_x, values_y, values_z = (
-            SolverFIT3D._average_primal_points_to_dual_edges(values)
+        values_x, values_y, values_z = SolverFIT3D._average_primal_points_to_dual_edges(
+            values
         )
 
         assert values_x.shape == (Nx, Ny, Nz)
@@ -478,7 +471,6 @@ class TestGridFIT3DMeshing:
             + values[Nx, Ny - 1, Nz]
         )
         assert values_x[i, j, k] == pytest.approx(expected)
-
 
     def test_conformal_material_assignment(self):
         """Test point-based material assignment onto FIT material tensors."""
@@ -576,9 +568,7 @@ class TestGridFIT3DMeshing:
         # eps_eff / eps_0 = (5 + 5 + 1 + 1) / 4 = 3
         expected_eps = 3.0 * eps_0
 
-        assert solver.ieps.field_x[1, 1, 1] == pytest.approx(
-            1.0 / expected_eps
-        )
+        assert solver.ieps.field_x[1, 1, 1] == pytest.approx(1.0 / expected_eps)
 
         # Same two points carry sigma = 8 S/m:
         #
@@ -594,13 +584,10 @@ class TestGridFIT3DMeshing:
         # mu_eff / mu_0 = (3 + 3 + 3 + 1) / 4 = 2.5
         expected_mu = 2.5 * mu_0
 
-        assert solver.imu.field_x[0, 0, 0] == pytest.approx(
-            1.0 / expected_mu
-        )
+        assert solver.imu.field_x[0, 0, 0] == pytest.approx(1.0 / expected_mu)
 
         # Conductive material must enable conductivity treatment.
         assert solver.use_conductivity
-
 
     def test_conformal_material_assignment_homogeneous(self):
         """Test conformal material assignment for a homogeneous solid."""

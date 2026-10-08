@@ -162,11 +162,8 @@ class GridFIT3D(PlotMixin):
         self.geometry_mode = geometry_mode.lower()
 
         if self.geometry_mode not in ("legacy", "conformal"):
-            raise ValueError(
-                "[!] geometry_mode must be 'legacy' or 'conformal'."
-            )
+            raise ValueError("[!] geometry_mode must be 'legacy' or 'conformal'.")
 
-        
         # Point-based STL masks used by the conformal geometry pipeline
         self.primal_point_masks = {}
         self.dual_point_masks = {}
@@ -298,9 +295,7 @@ class GridFIT3D(PlotMixin):
         self.subpixel_smoothing_bool = subpixel_smoothing_bool
 
         if self.subpixel_smoothing_threshold is None:
-            self.subpixel_smoothing_threshold = 1 / (
-                self.subpixel_smoothing_factor**3
-            )
+            self.subpixel_smoothing_threshold = 1 / (self.subpixel_smoothing_factor**3)
 
         if self.geometry_mode == "conformal" and self.use_subpixel_smoothing:
             warnings.warn(
@@ -544,7 +539,7 @@ class GridFIT3D(PlotMixin):
 
         This mask is used to construct the dual point mask and is not
         the legacy WAKIS cell mask stored in ``self.grid[key]``.
-        
+
         Parameters
         ----------
         point_mask : ndarray of bool
@@ -608,8 +603,7 @@ class GridFIT3D(PlotMixin):
         expected_shape = (self.Nx, self.Ny, self.Nz)
         if cell_mask.shape != expected_shape:
             raise ValueError(
-                f"Expected cell mask shape {expected_shape}, "
-                f"got {cell_mask.shape}."
+                f"Expected cell mask shape {expected_shape}, got {cell_mask.shape}."
             )
 
         return np.pad(
@@ -648,9 +642,7 @@ class GridFIT3D(PlotMixin):
             threshold=cell_threshold,
         )
 
-        dual_point_mask = self._cell_mask_to_dual_point_mask(
-            cell_center_mask
-        )
+        dual_point_mask = self._cell_mask_to_dual_point_mask(cell_center_mask)
 
         self.primal_point_masks[key] = primal_point_mask
         self.dual_point_masks[key] = dual_point_mask
@@ -660,7 +652,6 @@ class GridFIT3D(PlotMixin):
             self.Nx * self.Ny * self.Nz,
             order="C",
         )
-
 
     def _mark_cells_in_stl(self, method):
         if self.geometry_mode == "legacy":
@@ -812,7 +803,6 @@ class GridFIT3D(PlotMixin):
                     f"    * STL solid {key}: {np.sum(self.grid[key])} cells marked inside the solid."
                 )
 
-    
     def _mark_cells_in_stl_conformal(self, method):
         """
         Generate STL masks using the selected PyVista geometry method.
@@ -908,14 +898,10 @@ class GridFIT3D(PlotMixin):
                 # Negative signed distance corresponds to points
                 # inside the closed surface.
                 primal_point_mask = np.reshape(
-                    np.asarray(
-                        select.point_data["implicit_distance"]
-                    )
-                    <= 0.0,
+                    np.asarray(select.point_data["implicit_distance"]) <= 0.0,
                     (self.Nx + 1, self.Ny + 1, self.Nz + 1),
                     order="C",
                 )
-
 
             # ----------------------------------------------------------
             # voxelize rectilinear
@@ -964,7 +950,6 @@ class GridFIT3D(PlotMixin):
                     order="F",
                 )
 
-
             else:
                 raise ValueError(
                     f"[!] Error: stl_method {method} not recognized. "
@@ -996,7 +981,7 @@ class GridFIT3D(PlotMixin):
                     f"{np.sum(self.dual_point_masks[key])} dual points "
                     "marked inside the solid."
                 )
-         
+
     def _apply_subpixel_smoothing(
         self,
         key,
@@ -1587,10 +1572,8 @@ class GridFIT3D(PlotMixin):
                         threshold=0.5,
                     )
 
-                    self.dual_point_masks[key] = (
-                        self._cell_mask_to_dual_point_mask(
-                            cell_center_mask
-                        )
+                    self.dual_point_masks[key] = self._cell_mask_to_dual_point_mask(
+                        cell_center_mask
                     )
 
         # add verbosity
