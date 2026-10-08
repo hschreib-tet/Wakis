@@ -896,6 +896,114 @@ class TestGridFIT3DMeshing:
         assert not np.any(grid.interface_edge_masks["y"])
         assert not np.any(grid.interface_edge_masks["z"])
 
+    def test_interface_transition_types(self):
+        grid = GridFIT3D(
+            0.0,
+            4.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            4,
+            1,
+            1,
+            geometry_mode="conformal",
+            verbose=0,
+        )
+
+        # Artificial sequence along x:
+        #
+        # point index:   0       1       2       3       4
+        # region:        bg      n1      pec     n2      sibc
+        # type:          normal  normal  pec     normal  sibc
+        #
+        # edge classes:
+        # 0 -> 1 : normal-normal
+        # 1 -> 2 : normal-pec
+        # 2 -> 3 : pec-normal  -> normal-pec
+        # 3 -> 4 : normal-sibc
+
+        region_ids = np.zeros(
+            (5, 2, 2),
+            dtype=np.int32,
+        )
+
+        for i, region_id in enumerate([0, 1, 2, 3, 4]):
+            region_ids[i, :, :] = region_id
+
+        grid.primal_region_ids = region_ids
+
+        grid.region_id_to_key = {
+            0: None,
+            1: "normal_1",
+            2: "pec",
+            3: "normal_2",
+            4: "sibc",
+        }
+
+        grid.region_key_to_id = {
+            "normal_1": 1,
+            "pec": 2,
+            "normal_2": 3,
+            "sibc": 4,
+        }
+
+        grid.stl_material_types = {
+            "normal_1": "normal",
+            "pec": "pec",
+            "normal_2": "normal",
+            "sibc": "sibc",
+        }
+
+        grid._build_interface_edge_masks()
+
+        solver = SolverFIT3D(
+            grid,
+            bg=[1.0, 1.0, 0.0],
+            bg_material_type="normal",
+            use_stl=False,
+            verbose=0,
+        )
+
+        assert solver.region_material_types == {
+            0: "normal",
+            1: "normal",
+            2: "pec",
+            3: "normal",
+            4: "sibc",
+        }
+
+        masks = solver.interface_transition_masks["x"]
+
+        assert np.array_equal(
+            masks["normal_normal"][:, 0, 0],
+            np.array([True, False, False, False]),
+        )
+
+        assert np.array_equal(
+            masks["normal_pec"][:, 0, 0],
+            np.array([False, True, True, False]),
+        )
+
+        assert np.array_equal(
+            masks["normal_sibc"][:, 0, 0],
+            np.array([False, False, False, True]),
+        )
+
+        assert not np.any(masks["pec_pec"])
+        assert not np.any(masks["pec_sibc"])
+        assert not np.any(masks["sibc_sibc"])
+
+        classified = np.zeros_like(grid.interface_edge_masks["x"])
+
+        for mask in masks.values():
+            classified |= mask
+
+        assert np.array_equal(
+            classified,
+            grid.interface_edge_masks["x"],
+        )
+
     def test_long_wake_potential_and_impedance(self, use_gpu, plot_comparison):
         global grid
         # ------------ Beam source ----------------

@@ -181,6 +181,13 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             bg,
             bg_material_type,
         )
+        self.region_material_types = {}
+        self.interface_transition_masks = {}
+        if (
+            getattr(self.grid, "geometry_mode", "legacy") == "conformal"
+            and getattr(self.grid, "primal_region_ids", None) is not None
+        ):
+            self._build_interface_transition_masks()
         self.Nx = self.grid.Nx
         self.Ny = self.grid.Ny
         self.Nz = self.grid.Nz
@@ -500,6 +507,142 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             return "pec"
 
         return "normal"
+
+    def _build_region_material_types(self):
+        """
+        Associate every geometry region ID with its material treatment type.
+
+        Region 0 represents the background. STL region IDs are mapped through
+        ``grid.region_id_to_key`` and ``grid.stl_material_types``.
+        """
+        region_material_types = {
+            0: self.bg_material_type,
+        }
+
+        for region_id, key in self.grid.region_id_to_key.items():
+            if region_id == 0:
+                continue
+
+            if key not in self.grid.stl_material_types:
+                raise RuntimeError(f"No material type available for STL solid '{key}'.")
+
+            region_material_types[region_id] = self.grid.stl_material_types[key]
+
+        self.region_material_types = region_material_types
+
+    def _get_edge_region_ids(self, direction):
+        """
+        Return the start and end region IDs of all primary edges.
+
+        Parameters
+        ----------
+        direction : str
+            Primary edge direction: "x", "y", or "z".
+        """
+        region_ids = self.grid.primal_region_ids
+
+        if direction == "x":
+            return (
+                region_ids[:-1, :, :],
+                region_ids[1:, :, :],
+            )
+
+        if direction == "y":
+            return (
+                region_ids[:, :-1, :],
+                region_ids[:, 1:, :],
+            )
+
+        if direction == "z":
+            return (
+                region_ids[:, :, :-1],
+                region_ids[:, :, 1:],
+            )
+
+        raise ValueError(
+            f"Unknown edge direction '{direction}'. Expected 'x', 'y', or 'z'."
+        )
+
+    def _build_interface_transition_masks(self):
+        """
+        Classify primary interface edges by the material types on both sides.
+
+        The orientation of the transition is ignored here. For example,
+        normal-to-PEC and PEC-to-normal edges both belong to "normal_pec".
+
+        All region changes are retained in the grid-level interface mask.
+        This method only classifies them for subsequent material-dependent
+        interface treatment.
+        """
+        if self.grid.primal_region_ids is None:
+            raise RuntimeError(
+                "Primal region IDs must be available before classifying "
+                "interface transitions."
+            )
+
+        self._build_region_material_types()
+
+        type_codes = {
+            "normal": 0,
+            "pec": 1,
+            "sibc": 2,
+        }
+
+        max_region_id = max(self.region_material_types)
+
+        region_type_codes = np.empty(
+            max_region_id + 1,
+            dtype=np.int8,
+        )
+
+        for region_id, material_type in self.region_material_types.items():
+            region_type_codes[region_id] = type_codes[material_type]
+
+        normal = type_codes["normal"]
+        pec = type_codes["pec"]
+        sibc = type_codes["sibc"]
+
+        self.interface_transition_masks = {}
+
+        for direction in ("x", "y", "z"):
+            start_regions, end_regions = self._get_edge_region_ids(direction)
+
+            interface_mask = self.grid.interface_edge_masks[direction]
+
+            start_types = region_type_codes[start_regions]
+            end_types = region_type_codes[end_regions]
+
+            normal_normal = (
+                interface_mask & (start_types == normal) & (end_types == normal)
+            )
+
+            normal_pec = interface_mask & (
+                ((start_types == normal) & (end_types == pec))
+                | ((start_types == pec) & (end_types == normal))
+            )
+
+            normal_sibc = interface_mask & (
+                ((start_types == normal) & (end_types == sibc))
+                | ((start_types == sibc) & (end_types == normal))
+            )
+
+            pec_pec = interface_mask & (start_types == pec) & (end_types == pec)
+
+            pec_sibc = interface_mask & (
+                ((start_types == pec) & (end_types == sibc))
+                | ((start_types == sibc) & (end_types == pec))
+            )
+
+            sibc_sibc = interface_mask & (start_types == sibc) & (end_types == sibc)
+
+            self.interface_transition_masks[direction] = {
+                "normal_normal": normal_normal,
+                "normal_pec": normal_pec,
+                "normal_sibc": normal_sibc,
+                "pec_pec": pec_pec,
+                "pec_sibc": pec_sibc,
+                "sibc_sibc": sibc_sibc,
+            }
 
     def _move_CPML_to_mkl(self):
         self.dxy = mkl_sparse_mat(self.dxy)
