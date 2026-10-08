@@ -1073,6 +1073,601 @@ class TestGridFIT3DMeshing:
                 grid.interface_edge_masks[grid_type]["x"],
             )
 
+    def test_primal_and_dual_interface_intersections(
+        self,
+        tmp_path,
+    ):
+        interface_x = 0.40625
+
+        stl_file = tmp_path / "right_region.stl"
+
+        surface = pv.Box(
+            bounds=(
+                interface_x,
+                1.0,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            )
+        ).triangulate()
+
+        surface.save(stl_file)
+
+        grid = GridFIT3D(
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            4,
+            2,
+            2,
+            geometry_mode="conformal",
+            verbose=0,
+        )
+
+        grid.stl_solids = {
+            "right": str(stl_file),
+        }
+
+        grid.stl_rotate = {
+            "right": [0.0, 0.0, 0.0],
+        }
+
+        grid.stl_translate = {
+            "right": [0.0, 0.0, 0.0],
+        }
+
+        grid.stl_scale = {
+            "right": 1.0,
+        }
+
+        grid.stl_material_types = {
+            "right": "normal",
+        }
+
+        grid._build_region_maps()
+
+        # Build exact artificial region IDs from the known interface
+        # location independently on both grids.
+        primal_regions = np.zeros(
+            (
+                len(grid.x),
+                len(grid.y),
+                len(grid.z),
+            ),
+            dtype=np.int32,
+        )
+
+        dual_regions = np.zeros(
+            (
+                len(grid.tx),
+                len(grid.ty),
+                len(grid.tz),
+            ),
+            dtype=np.int32,
+        )
+
+        primal_regions[
+            np.asarray(grid.x) >= interface_x,
+            :,
+            :,
+        ] = 1
+
+        dual_regions[
+            np.asarray(grid.tx) >= interface_x,
+            :,
+            :,
+        ] = 1
+
+        grid.region_ids = {
+            "primal": primal_regions,
+            "dual": dual_regions,
+        }
+
+        grid.interface_edge_masks = {
+            "primal": grid._build_edge_transition_masks(primal_regions),
+            "dual": grid._build_edge_transition_masks(dual_regions),
+        }
+
+        grid._build_interface_intersections()
+
+        print(
+            "primal x intersections:",
+            grid.interface_intersections["primal"]["x"]["has_intersection"][:, 1, 1],
+        )
+
+        print(
+            "hit group keys:",
+            grid.interface_intersections["primal"]["x"]["hit_groups"].keys(),
+        )
+
+        surface_cache = {}
+
+        print(
+            "raw line hits:",
+            grid._trace_grid_line(
+                "primal",
+                "x",
+                (1, 1),
+                surface_cache,
+            ),
+        )
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            mask = grid.interface_edge_masks[grid_type]["x"]
+
+            # All x-interface edges have the same x index.
+            i = np.where(
+                np.any(
+                    mask,
+                    axis=(1, 2),
+                )
+            )[0][0]
+
+            # Use an interior transverse edge to avoid box corners.
+            index = (
+                int(i),
+                1,
+                1,
+            )
+
+            assert mask[index]
+
+            data = grid.interface_intersections[grid_type]["x"]
+
+            assert data["has_intersection"][index]
+
+            assert not data["multiple_intersections"][index]
+
+            groups = data["hit_groups"][index]
+
+            assert len(groups) == 1
+            assert len(groups[0]) >= 1
+
+            (
+                start_point,
+                end_point,
+                _,
+                _,
+            ) = grid._get_edge_geometry(
+                grid_type,
+                "x",
+                index,
+            )
+
+            expected_alpha = (interface_x - start_point[0]) / (
+                end_point[0] - start_point[0]
+            )
+
+            assert data["alpha"][index] == pytest.approx(
+                expected_alpha,
+                abs=1e-8,
+            )
+
+            assert data["surface_id"][index] == 1
+
+            assert data["cell_id"][index] >= 0
+
+            normal = data["normal"][index]
+
+            assert np.linalg.norm(normal) == pytest.approx(
+                1.0,
+                abs=1e-8,
+            )
+
+            assert abs(normal[0]) == pytest.approx(
+                1.0,
+                abs=1e-8,
+            )
+
+            assert normal[1] == pytest.approx(
+                0.0,
+                abs=1e-8,
+            )
+
+            assert normal[2] == pytest.approx(
+                0.0,
+                abs=1e-8,
+            )
+
+            group_alpha = np.mean([hit["alpha"] for hit in groups[0]])
+
+            assert group_alpha == pytest.approx(
+                expected_alpha,
+                abs=1e-8,
+            )
+
+    def test_thin_stl_layer_inside_single_edge(
+        self,
+        tmp_path,
+    ):
+        """
+        A thin STL layer entirely inside one grid edge must produce two
+        intersections even though both edge endpoints belong to the
+        background.
+        """
+
+        stl_file = tmp_path / "thin_layer.stl"
+
+        surface = pv.Box(
+            bounds=(
+                0.35,
+                0.40,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            )
+        ).triangulate()
+
+        surface.save(stl_file)
+
+        grid = GridFIT3D(
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            2,
+            2,
+            2,
+            stl_solids={
+                "layer": str(stl_file),
+            },
+            stl_materials={
+                "layer": [4.0, 1.0, 0.0],
+            },
+            stl_material_types={
+                "layer": "normal",
+            },
+            geometry_mode="conformal",
+            stl_method="voxelize_rectilinear",
+            verbose=0,
+        )
+
+        grid._build_interface_intersections()
+
+        # First x-edge runs from x=0 to x=0.5.
+        # The complete thin layer x=[0.35, 0.40] lies inside it.
+        index = (
+            0,
+            1,
+            1,
+        )
+
+        data = grid.interface_intersections["primal"]["x"]
+
+        assert data["has_intersection"][index]
+
+        assert data["multiple_intersections"][index]
+
+        groups = data["hit_groups"][index]
+
+        assert len(groups) == 2
+
+        alpha_1 = np.mean([hit["alpha"] for hit in groups[0]])
+
+        alpha_2 = np.mean([hit["alpha"] for hit in groups[1]])
+
+        assert alpha_1 == pytest.approx(
+            0.70,
+            abs=1e-6,
+        )
+
+        assert alpha_2 == pytest.approx(
+            0.80,
+            abs=1e-6,
+        )
+
+    def test_three_normal_material_regions_on_single_edge(
+        self,
+        tmp_path,
+    ):
+        """
+        A single grid edge crosses two normal-material interfaces:
+
+            background -> middle -> right
+
+        The two geometric interface positions must be preserved separately.
+        """
+
+        middle_file = tmp_path / "middle_region.stl"
+
+        right_file = tmp_path / "right_region.stl"
+
+        # Use binary-exact coordinates to avoid STL float32 noise.
+        x_1 = 0.375
+        x_2 = 0.4375
+
+        middle_surface = pv.Box(
+            bounds=(
+                x_1,
+                x_2,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            )
+        ).triangulate()
+
+        right_surface = pv.Box(
+            bounds=(
+                x_2,
+                1.0,
+                0.0,
+                1.0,
+                0.0,
+                1.0,
+            )
+        ).triangulate()
+
+        middle_surface.save(middle_file)
+
+        right_surface.save(right_file)
+
+        grid = GridFIT3D(
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            2,
+            2,
+            2,
+            stl_solids={
+                "middle": str(middle_file),
+                "right": str(right_file),
+            },
+            stl_materials={
+                "middle": [4.0, 1.0, 0.0],
+                "right": [9.0, 1.0, 0.0],
+            },
+            stl_material_types={
+                "middle": "normal",
+                "right": "normal",
+            },
+            geometry_mode="conformal",
+            stl_method="voxelize_rectilinear",
+            verbose=0,
+        )
+
+        grid._build_interface_intersections()
+
+        # First primal x-edge:
+        #
+        # x = 0 ------------------------------ 0.5
+        #               |           |
+        #             0.375       0.4375
+        #       background -> middle -> right
+        #
+        index = (
+            0,
+            1,
+            1,
+        )
+
+        data = grid.interface_intersections["primal"]["x"]
+
+        assert data["has_intersection"][index]
+
+        assert data["multiple_intersections"][index]
+
+        groups = data["hit_groups"][index]
+
+        assert len(groups) == 2
+
+        alpha_1 = np.mean([hit["alpha"] for hit in groups[0]])
+
+        alpha_2 = np.mean([hit["alpha"] for hit in groups[1]])
+
+        assert alpha_1 == pytest.approx(
+            0.75,
+            abs=1e-8,
+        )
+
+        assert alpha_2 == pytest.approx(
+            0.875,
+            abs=1e-8,
+        )
+
+        middle_id = grid.region_key_to_id["middle"]
+
+        right_id = grid.region_key_to_id["right"]
+
+        first_surface_ids = {hit["surface_id"] for hit in groups[0]}
+
+        second_surface_ids = {hit["surface_id"] for hit in groups[1]}
+
+        # At x = 0.375 only the middle STL starts.
+        assert first_surface_ids == {middle_id}
+
+        # At x = 0.4375 the middle STL ends and the right STL starts.
+        # Both surfaces therefore occur at the same geometric position.
+        assert second_surface_ids == {
+            middle_id,
+            right_id,
+        }
+
+    def test_real_stl_interface_intersections(self):
+        """
+        Diagnostic integration test for geometric interface intersections
+        on the existing cavity/shell STL geometry.
+
+        The test checks all detected primal and dual interface edges in
+        x-, y-, and z-direction and reports missing and ambiguous ray hits.
+        """
+
+        solid_1 = "tests/stl/007_vacuum_cavity.stl"
+        solid_2 = "tests/stl/007_lossymetal_shell.stl"
+
+        stl_solids = {
+            "cavity": solid_1,
+            "shell": solid_2,
+        }
+
+        stl_materials = {
+            "cavity": "vacuum",
+            "shell": [30.0, 1.0, 30.0],
+        }
+
+        stl_material_types = {
+            "cavity": "normal",
+            "shell": "normal",
+        }
+
+        solids = pv.read(solid_1) + pv.read(solid_2)
+
+        (
+            xmin,
+            xmax,
+            ymin,
+            ymax,
+            zmin,
+            zmax,
+        ) = solids.bounds
+
+        # Deliberately smaller than the full 60 x 60 x 140 regression grid.
+        # This is a geometry/intersection diagnostic, not a convergence test.
+        Nx = 20
+        Ny = 20
+        Nz = 40
+
+        grid = GridFIT3D(
+            xmin,
+            xmax,
+            ymin,
+            ymax,
+            zmin,
+            zmax,
+            Nx,
+            Ny,
+            Nz,
+            stl_solids=stl_solids,
+            stl_materials=stl_materials,
+            stl_material_types=stl_material_types,
+            stl_method="voxelize_rectilinear",
+            geometry_mode="conformal",
+            subpixel_smoothing=False,
+            stl_scale=1.0,
+            stl_rotate=[0.0, 0.0, 0.0],
+            stl_translate=[0.0, 0.0, 0.0],
+            verbose=0,
+        )
+
+        grid._build_interface_intersections()
+
+        total_expected_interfaces = 0
+        total_geometric_intersections = 0
+        total_missing_expected = 0
+        total_multiple = 0
+        total_hidden_intersections = 0
+
+        print()
+        print("Real STL interface intersection diagnostic")
+        print("------------------------------------------")
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            print(f"{grid_type}:")
+
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                interface_mask = grid.interface_edge_masks[grid_type][direction]
+
+                data = grid.interface_intersections[grid_type][direction]
+
+                has_intersection = data["has_intersection"]
+
+                multiple = data["multiple_intersections"]
+
+                # Endpoint classification says that this edge crosses
+                # a region boundary, but the exact STL tracing found none.
+                missing_expected = interface_mask & ~has_intersection
+
+                # Exact geometry found an STL intersection although the
+                # endpoint regions are identical.
+                hidden_intersections = has_intersection & ~interface_mask
+
+                n_expected = int(np.count_nonzero(interface_mask))
+
+                n_geometric = int(np.count_nonzero(has_intersection))
+
+                n_missing_expected = int(np.count_nonzero(missing_expected))
+
+                n_multiple = int(np.count_nonzero(multiple))
+
+                n_hidden = int(np.count_nonzero(hidden_intersections))
+
+                total_expected_interfaces += n_expected
+                total_geometric_intersections += n_geometric
+                total_missing_expected += n_missing_expected
+                total_multiple += n_multiple
+                total_hidden_intersections += n_hidden
+
+                print(
+                    f"  {direction}: "
+                    f"{n_expected:6d} endpoint interfaces, "
+                    f"{n_geometric:6d} geometric intersections, "
+                    f"{n_missing_expected:6d} expected-but-missing, "
+                    f"{n_hidden:6d} hidden intersections, "
+                    f"{n_multiple:6d} multiple"
+                )
+
+                # Every stored representative intersection must be valid.
+                valid = has_intersection
+
+                if np.any(valid):
+                    alpha = data["alpha"][valid]
+
+                    assert np.all(np.isfinite(alpha))
+
+                    assert np.all(alpha >= 0.0)
+
+                    assert np.all(alpha <= 1.0)
+
+                    assert np.all(data["surface_id"][valid] > 0)
+
+                    assert np.all(data["cell_id"][valid] >= 0)
+
+                    normals = data["normal"][valid]
+
+                    assert np.all(np.isfinite(normals))
+
+                    np.testing.assert_allclose(
+                        np.linalg.norm(
+                            normals,
+                            axis=1,
+                        ),
+                        1.0,
+                        atol=1e-10,
+                        rtol=1e-10,
+                    )
+
+        print("------------------------------------------")
+        print(
+            f"total: "
+            f"{total_expected_interfaces} endpoint interfaces, "
+            f"{total_geometric_intersections} geometric intersections, "
+            f"{total_missing_expected} expected-but-missing, "
+            f"{total_hidden_intersections} hidden intersections, "
+            f"{total_multiple} multiple"
+        )
+
+        assert total_geometric_intersections > 0
+
     def test_long_wake_potential_and_impedance(self, use_gpu, plot_comparison):
         global grid
         # ------------ Beam source ----------------

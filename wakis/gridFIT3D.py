@@ -194,6 +194,12 @@ class GridFIT3D(PlotMixin):
             "dual": {},
         }
 
+        # Geometric STL intersections with primal and dual interface edges
+        self.interface_intersections = {
+            "primal": {},
+            "dual": {},
+        }
+
         # Grid data
         # generate from file
         if load_from_h5 is not None:
@@ -939,6 +945,693 @@ class GridFIT3D(PlotMixin):
         raise ValueError(
             f"Unknown edge direction '{direction}'. Expected 'x', 'y', or 'z'."
         )
+
+    def _get_edge_geometry(self, grid_type, direction, index):
+        """
+        Return geometry and endpoint region IDs of one grid edge.
+
+        Parameters
+        ----------
+        grid_type : str
+            Either "primal" or "dual".
+        direction : str
+            Edge direction: "x", "y", or "z".
+        index : tuple of int
+            Edge index (i, j, k).
+
+        Returns
+        -------
+        start_point, end_point : ndarray
+            Cartesian edge endpoints.
+        start_region, end_region : int
+            Region IDs at the edge endpoints.
+        """
+        x, y, z = self._get_grid_coordinates(grid_type)
+        region_ids = self.region_ids[grid_type]
+
+        if region_ids is None:
+            raise RuntimeError(
+                f"{grid_type.capitalize()} region IDs have not been built."
+            )
+
+        i, j, k = (int(value) for value in index)
+
+        start_point = np.array(
+            [x[i], y[j], z[k]],
+            dtype=float,
+        )
+
+        start_region = int(region_ids[i, j, k])
+
+        if direction == "x":
+            end_point = np.array(
+                [x[i + 1], y[j], z[k]],
+                dtype=float,
+            )
+            end_region = int(region_ids[i + 1, j, k])
+
+        elif direction == "y":
+            end_point = np.array(
+                [x[i], y[j + 1], z[k]],
+                dtype=float,
+            )
+            end_region = int(region_ids[i, j + 1, k])
+
+        elif direction == "z":
+            end_point = np.array(
+                [x[i], y[j], z[k + 1]],
+                dtype=float,
+            )
+            end_region = int(region_ids[i, j, k + 1])
+
+        else:
+            raise ValueError(
+                f"Unknown edge direction '{direction}'. Expected 'x', 'y', or 'z'."
+            )
+
+        return (
+            start_point,
+            end_point,
+            start_region,
+            end_region,
+        )
+
+    def _locate_intersection_edge(
+        self,
+        grid_type,
+        direction,
+        point,
+        alpha_tolerance=1e-8,
+    ):
+        """
+        Map a geometric intersection point on a grid line to one grid edge
+        and compute its local edge coordinate alpha in [0, 1].
+        """
+        x, y, z = self._get_grid_coordinates(grid_type)
+
+        coordinates = {
+            "x": np.asarray(x, dtype=float),
+            "y": np.asarray(y, dtype=float),
+            "z": np.asarray(z, dtype=float),
+        }
+
+        axis = {
+            "x": 0,
+            "y": 1,
+            "z": 2,
+        }[direction]
+
+        coordinate = float(point[axis])
+        grid_coordinates = coordinates[direction]
+
+        edge_index = int(
+            np.searchsorted(
+                grid_coordinates,
+                coordinate,
+                side="right",
+            )
+            - 1
+        )
+
+        # A hit exactly on the last grid point belongs to the final edge.
+        edge_index = min(
+            edge_index,
+            len(grid_coordinates) - 2,
+        )
+
+        if edge_index < 0:
+            return None
+
+        start_coordinate = grid_coordinates[edge_index]
+        end_coordinate = grid_coordinates[edge_index + 1]
+
+        edge_length = end_coordinate - start_coordinate
+
+        if edge_length == 0.0:
+            return None
+
+        alpha = (coordinate - start_coordinate) / edge_length
+
+        if alpha < -alpha_tolerance or alpha > 1.0 + alpha_tolerance:
+            return None
+
+        alpha = float(
+            np.clip(
+                alpha,
+                0.0,
+                1.0,
+            )
+        )
+
+        return edge_index, alpha
+
+    @staticmethod
+    def _get_triangle_normal(surface, cell_id):
+        """
+        Compute the unit normal of one triangular STL facet.
+        """
+        cell = surface.get_cell(int(cell_id))
+        points = np.asarray(
+            cell.points,
+            dtype=float,
+        )
+
+        if points.shape != (3, 3):
+            raise RuntimeError(
+                f"Expected triangular STL cell, got "
+                f"{points.shape[0]} points for cell {cell_id}."
+            )
+
+        normal = np.cross(
+            points[1] - points[0],
+            points[2] - points[0],
+        )
+
+        norm = np.linalg.norm(normal)
+
+        if norm == 0.0:
+            raise RuntimeError(
+                f"Degenerate STL triangle encountered for cell {cell_id}."
+            )
+
+        return normal / norm
+
+    def _trace_interface_edge(
+        self,
+        grid_type,
+        direction,
+        index,
+        surface_cache,
+        alpha_tolerance=1e-8,
+    ):
+        """
+        Intersect one interface edge with the STL surfaces of its endpoint
+        regions.
+
+        The background region has no STL surface and is skipped.
+        """
+        (
+            start_point,
+            end_point,
+            start_region,
+            end_region,
+        ) = self._get_edge_geometry(
+            grid_type,
+            direction,
+            index,
+        )
+
+        edge_vector = end_point - start_point
+
+        edge_length_squared = float(np.dot(edge_vector, edge_vector))
+
+        if edge_length_squared == 0.0:
+            raise RuntimeError(
+                f"Zero-length {grid_type} {direction}-edge at index {index}."
+            )
+
+        candidate_surface_ids = []
+
+        for region_id in (
+            start_region,
+            end_region,
+        ):
+            if region_id != 0 and region_id not in candidate_surface_ids:
+                candidate_surface_ids.append(region_id)
+
+        hits = []
+
+        for surface_id in candidate_surface_ids:
+            key = self.region_id_to_key[surface_id]
+
+            if key not in surface_cache:
+                surface_cache[key] = self.read_stl(key)
+
+            surface = surface_cache[key]
+
+            points, cell_ids = surface.ray_trace(
+                start_point,
+                end_point,
+                first_point=False,
+            )
+
+            points = np.asarray(
+                points,
+                dtype=float,
+            )
+
+            cell_ids = np.asarray(
+                cell_ids,
+                dtype=int,
+            )
+
+            for point, cell_id in zip(
+                points,
+                cell_ids,
+            ):
+                alpha = float(
+                    np.dot(
+                        point - start_point,
+                        edge_vector,
+                    )
+                    / edge_length_squared
+                )
+
+                if alpha < -alpha_tolerance or alpha > 1.0 + alpha_tolerance:
+                    continue
+
+                alpha = float(np.clip(alpha, 0.0, 1.0))
+
+                normal = self._get_triangle_normal(
+                    surface,
+                    cell_id,
+                )
+
+                hits.append(
+                    {
+                        "alpha": alpha,
+                        "surface_id": surface_id,
+                        "cell_id": int(cell_id),
+                        "normal": normal,
+                    }
+                )
+
+        return hits
+
+    def _trace_grid_line(
+        self,
+        grid_type,
+        direction,
+        transverse_index,
+        surface_cache,
+        alpha_tolerance=1e-8,
+    ):
+        """
+        Trace one complete primal or dual grid line through all STL surfaces.
+
+        Returns all geometric intersections, already assigned to their
+        corresponding grid edges.
+        """
+        x, y, z = self._get_grid_coordinates(grid_type)
+
+        axis_coordinates = {
+            "x": np.asarray(x, dtype=float),
+            "y": np.asarray(y, dtype=float),
+            "z": np.asarray(z, dtype=float),
+        }[direction]
+
+        spacing = np.abs(np.diff(axis_coordinates))
+
+        positive_spacing = spacing[spacing > 0.0]
+
+        if positive_spacing.size == 0:
+            raise RuntimeError(
+                f"No finite {direction}-edge length available on the {grid_type} grid."
+            )
+
+        line_extension = np.min(positive_spacing)
+
+        if direction == "x":
+            j, k = transverse_index
+
+            start_point = np.array(
+                [
+                    x[0] - line_extension,
+                    y[j],
+                    z[k],
+                ],
+                dtype=float,
+            )
+
+            end_point = np.array(
+                [
+                    x[-1] + line_extension,
+                    y[j],
+                    z[k],
+                ],
+                dtype=float,
+            )
+
+        elif direction == "y":
+            i, k = transverse_index
+
+            start_point = np.array(
+                [
+                    x[i],
+                    y[0] - line_extension,
+                    z[k],
+                ],
+                dtype=float,
+            )
+
+            end_point = np.array(
+                [
+                    x[i],
+                    y[-1] + line_extension,
+                    z[k],
+                ],
+                dtype=float,
+            )
+
+        elif direction == "z":
+            i, j = transverse_index
+
+            start_point = np.array(
+                [
+                    x[i],
+                    y[j],
+                    z[0] - line_extension,
+                ],
+                dtype=float,
+            )
+
+            end_point = np.array(
+                [
+                    x[i],
+                    y[j],
+                    z[-1] + line_extension,
+                ],
+                dtype=float,
+            )
+
+        else:
+            raise ValueError(f"Unknown edge direction '{direction}'.")
+
+        edge_hits = {}
+
+        for surface_id, key in self.region_id_to_key.items():
+            if surface_id == 0:
+                continue
+
+            if key not in surface_cache:
+                surface_cache[key] = self.read_stl(key)
+
+            surface = surface_cache[key]
+
+            points, cell_ids = surface.ray_trace(
+                start_point,
+                end_point,
+                first_point=False,
+            )
+
+            for point, cell_id in zip(
+                np.asarray(points, dtype=float),
+                np.asarray(cell_ids, dtype=int),
+            ):
+                result = self._locate_intersection_edge(
+                    grid_type,
+                    direction,
+                    point,
+                    alpha_tolerance=alpha_tolerance,
+                )
+
+                if result is None:
+                    continue
+
+                edge_axis_index, alpha = result
+
+                if direction == "x":
+                    edge_index = (
+                        edge_axis_index,
+                        int(transverse_index[0]),
+                        int(transverse_index[1]),
+                    )
+
+                elif direction == "y":
+                    edge_index = (
+                        int(transverse_index[0]),
+                        edge_axis_index,
+                        int(transverse_index[1]),
+                    )
+
+                else:
+                    edge_index = (
+                        int(transverse_index[0]),
+                        int(transverse_index[1]),
+                        edge_axis_index,
+                    )
+
+                normal = self._get_triangle_normal(
+                    surface,
+                    cell_id,
+                )
+
+                hit = {
+                    "alpha": alpha,
+                    "surface_id": int(surface_id),
+                    "cell_id": int(cell_id),
+                    "normal": normal,
+                }
+
+                edge_hits.setdefault(
+                    edge_index,
+                    [],
+                ).append(hit)
+
+        return edge_hits
+
+    def _get_edge_shape_and_transverse_indices(
+        self,
+        grid_type,
+        direction,
+    ):
+        x, y, z = self._get_grid_coordinates(grid_type)
+
+        nx = len(x)
+        ny = len(y)
+        nz = len(z)
+
+        if direction == "x":
+            shape = (
+                nx - 1,
+                ny,
+                nz,
+            )
+
+            transverse_indices = ((j, k) for j in range(ny) for k in range(nz))
+
+        elif direction == "y":
+            shape = (
+                nx,
+                ny - 1,
+                nz,
+            )
+
+            transverse_indices = ((i, k) for i in range(nx) for k in range(nz))
+
+        elif direction == "z":
+            shape = (
+                nx,
+                ny,
+                nz - 1,
+            )
+
+            transverse_indices = ((i, j) for i in range(nx) for j in range(ny))
+
+        else:
+            raise ValueError(f"Unknown edge direction '{direction}'.")
+
+        return shape, transverse_indices
+
+    @staticmethod
+    def _group_intersection_hits(
+        hits,
+        alpha_tolerance=1e-8,
+    ):
+        """
+        Group ray-tracing hits at the same geometric position.
+        """
+        if not hits:
+            return []
+
+        hits = sorted(
+            hits,
+            key=lambda hit: hit["alpha"],
+        )
+
+        groups = [[hits[0]]]
+
+        for hit in hits[1:]:
+            reference_alpha = np.mean(
+                [grouped_hit["alpha"] for grouped_hit in groups[-1]]
+            )
+
+            if abs(hit["alpha"] - reference_alpha) <= alpha_tolerance:
+                groups[-1].append(hit)
+
+            else:
+                groups.append([hit])
+
+        return groups
+
+    def _select_representative_hit(
+        self,
+        hits,
+    ):
+        """
+        Select one representative STL facet from coincident hits.
+
+        SIBC and PEC surfaces are preferred because their local facet
+        normals are particularly relevant for boundary-condition treatment.
+        """
+
+        material_priority = {
+            "sibc": 0,
+            "pec": 1,
+            "normal": 2,
+        }
+
+        def priority(hit):
+            surface_id = hit["surface_id"]
+
+            key = self.region_id_to_key[surface_id]
+
+            material_type = self.stl_material_types[key]
+
+            return (
+                material_priority[material_type],
+                surface_id,
+                hit["cell_id"],
+            )
+
+        return min(
+            hits,
+            key=priority,
+        )
+
+    def _build_interface_intersections(
+        self,
+        alpha_tolerance=1e-8,
+    ):
+        """
+        Compute all STL intersections with primal and dual grid edges.
+
+        Intersections are obtained by tracing complete grid lines through all
+        STL surfaces. Therefore, intersections are also detected when an STL
+        region is thinner than one grid edge and both edge endpoints belong
+        to the same effective region.
+        """
+        surface_cache = {}
+
+        self.interface_intersections = {
+            "primal": {},
+            "dual": {},
+        }
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                (
+                    shape,
+                    transverse_indices,
+                ) = self._get_edge_shape_and_transverse_indices(
+                    grid_type,
+                    direction,
+                )
+
+                intersections = {
+                    "alpha": np.full(
+                        shape,
+                        np.nan,
+                        dtype=float,
+                    ),
+                    "surface_id": np.full(
+                        shape,
+                        -1,
+                        dtype=np.int32,
+                    ),
+                    "cell_id": np.full(
+                        shape,
+                        -1,
+                        dtype=np.int64,
+                    ),
+                    "normal": np.full(
+                        shape + (3,),
+                        np.nan,
+                        dtype=float,
+                    ),
+                    "has_intersection": np.zeros(
+                        shape,
+                        dtype=bool,
+                    ),
+                    "multiple_intersections": np.zeros(
+                        shape,
+                        dtype=bool,
+                    ),
+                    "hit_groups": {},
+                }
+
+                raw_hits = {}
+
+                for transverse_index in transverse_indices:
+                    line_hits = self._trace_grid_line(
+                        grid_type,
+                        direction,
+                        transverse_index,
+                        surface_cache,
+                        alpha_tolerance=alpha_tolerance,
+                    )
+
+                    for edge_index, hits in line_hits.items():
+                        raw_hits.setdefault(
+                            edge_index,
+                            [],
+                        ).extend(hits)
+
+                for edge_index, hits in raw_hits.items():
+                    hit_groups = self._group_intersection_hits(
+                        hits,
+                        alpha_tolerance=alpha_tolerance,
+                    )
+
+                    if not hit_groups:
+                        continue
+
+                    intersections["has_intersection"][edge_index] = True
+
+                    intersections["multiple_intersections"][edge_index] = (
+                        len(hit_groups) > 1
+                    )
+
+                    intersections["hit_groups"][edge_index] = hit_groups
+
+                    # Keep a representative hit for compatibility with the
+                    # existing single-interface data layout.
+                    representative = self._select_representative_hit(hit_groups[0])
+
+                    intersections["alpha"][edge_index] = representative["alpha"]
+
+                    intersections["surface_id"][edge_index] = representative[
+                        "surface_id"
+                    ]
+
+                    intersections["cell_id"][edge_index] = representative["cell_id"]
+
+                    intersections["normal"][edge_index] = representative["normal"]
+
+                self.interface_intersections[grid_type][direction] = intersections
+
+                if self.verbose:
+                    n_intersections = int(
+                        np.count_nonzero(intersections["has_intersection"])
+                    )
+
+                    n_multiple = int(
+                        np.count_nonzero(intersections["multiple_intersections"])
+                    )
+
+                    print(
+                        f"    * {grid_type} {direction}-edges: "
+                        f"{n_intersections} intersected, "
+                        f"{n_multiple} with multiple "
+                        "intersection positions"
+                    )
 
     def _mark_cells_in_stl(self, method):
         if self.geometry_mode == "legacy":
