@@ -826,7 +826,7 @@ class TestGridFIT3DMeshing:
 
         assert solver.bg_material_type == "sibc"
 
-    def test_primal_region_ids_and_interface_edges(self):
+    def test_primal_and_dual_region_topology(self):
         grid = GridFIT3D(
             0.0,
             3.0,
@@ -847,32 +847,59 @@ class TestGridFIT3DMeshing:
 
         shape = (4, 2, 2)
 
-        mask_1 = np.zeros(shape, dtype=bool)
-        mask_2 = np.zeros(shape, dtype=bool)
+        # --------------------------------------------------
+        # Primal point masks
+        #
+        # resulting x sequence:
+        #
+        # 0  1  2  2
+        # --------------------------------------------------
 
-        # material_1 occupies x-point indices 1 and 2
-        mask_1[1:3, :, :] = True
+        primal_mask_1 = np.zeros(
+            shape,
+            dtype=bool,
+        )
 
-        # material_2 occupies x-point indices 2 and 3
-        # and therefore overlaps material_1 at index 2.
-        mask_2[2:, :, :] = True
+        primal_mask_2 = np.zeros(
+            shape,
+            dtype=bool,
+        )
+
+        primal_mask_1[1:3, :, :] = True
+        primal_mask_2[2:, :, :] = True
 
         grid.primal_point_masks = {
-            "material_1": mask_1,
-            "material_2": mask_2,
+            "material_1": primal_mask_1,
+            "material_2": primal_mask_2,
         }
 
-        grid._build_primal_region_ids()
-        grid._build_interface_edge_masks()
-
-        # Later STL solids overwrite earlier solids:
+        # --------------------------------------------------
+        # Dual point masks
         #
-        # x index:     0  1  2  3
-        # region ID:   0  1  2  2
-        assert np.array_equal(
-            grid.primal_region_ids[:, 0, 0],
-            np.array([0, 1, 2, 2]),
+        # resulting x sequence:
+        #
+        # 0  0  1  2
+        # --------------------------------------------------
+
+        dual_mask_1 = np.zeros(
+            shape,
+            dtype=bool,
         )
+
+        dual_mask_2 = np.zeros(
+            shape,
+            dtype=bool,
+        )
+
+        dual_mask_1[2:, :, :] = True
+        dual_mask_2[3:, :, :] = True
+
+        grid.dual_point_masks = {
+            "material_1": dual_mask_1,
+            "material_2": dual_mask_2,
+        }
+
+        grid._build_interface_topology()
 
         assert grid.region_id_to_key == {
             0: None,
@@ -885,18 +912,34 @@ class TestGridFIT3DMeshing:
             "material_2": 2,
         }
 
-        # Interfaces occur between background/material_1
-        # and material_1/material_2.
         assert np.array_equal(
-            grid.interface_edge_masks["x"][:, 0, 0],
+            grid.region_ids["primal"][:, 0, 0],
+            np.array([0, 1, 2, 2]),
+        )
+
+        assert np.array_equal(
+            grid.region_ids["dual"][:, 0, 0],
+            np.array([0, 0, 1, 2]),
+        )
+
+        assert np.array_equal(
+            grid.interface_edge_masks["primal"]["x"][:, 0, 0],
             np.array([True, True, False]),
         )
 
-        # No variation in y or z.
-        assert not np.any(grid.interface_edge_masks["y"])
-        assert not np.any(grid.interface_edge_masks["z"])
+        assert np.array_equal(
+            grid.interface_edge_masks["dual"]["x"][:, 0, 0],
+            np.array([False, True, True]),
+        )
 
-    def test_interface_transition_types(self):
+        for grid_type in ("primal", "dual"):
+            assert not np.any(grid.interface_edge_masks[grid_type]["y"])
+
+            assert not np.any(grid.interface_edge_masks[grid_type]["z"])
+
+    def test_primal_and_dual_interface_transition_types(
+        self,
+    ):
         grid = GridFIT3D(
             0.0,
             4.0,
@@ -910,28 +953,6 @@ class TestGridFIT3DMeshing:
             geometry_mode="conformal",
             verbose=0,
         )
-
-        # Artificial sequence along x:
-        #
-        # point index:   0       1       2       3       4
-        # region:        bg      n1      pec     n2      sibc
-        # type:          normal  normal  pec     normal  sibc
-        #
-        # edge classes:
-        # 0 -> 1 : normal-normal
-        # 1 -> 2 : normal-pec
-        # 2 -> 3 : pec-normal  -> normal-pec
-        # 3 -> 4 : normal-sibc
-
-        region_ids = np.zeros(
-            (5, 2, 2),
-            dtype=np.int32,
-        )
-
-        for i, region_id in enumerate([0, 1, 2, 3, 4]):
-            region_ids[i, :, :] = region_id
-
-        grid.primal_region_ids = region_ids
 
         grid.region_id_to_key = {
             0: None,
@@ -955,7 +976,39 @@ class TestGridFIT3DMeshing:
             "sibc": "sibc",
         }
 
-        grid._build_interface_edge_masks()
+        shape = (5, 2, 2)
+
+        primal_regions = np.zeros(
+            shape,
+            dtype=np.int32,
+        )
+
+        dual_regions = np.zeros(
+            shape,
+            dtype=np.int32,
+        )
+
+        # Primal:
+        #
+        # normal -> normal -> PEC -> normal -> SIBC
+        for i, region_id in enumerate([0, 1, 2, 3, 4]):
+            primal_regions[i, :, :] = region_id
+
+        # Dual: same interfaces in reverse order
+        #
+        # SIBC -> normal -> PEC -> normal -> normal
+        for i, region_id in enumerate([4, 3, 2, 1, 0]):
+            dual_regions[i, :, :] = region_id
+
+        grid.region_ids = {
+            "primal": primal_regions,
+            "dual": dual_regions,
+        }
+
+        grid.interface_edge_masks = {
+            "primal": grid._build_edge_transition_masks(primal_regions),
+            "dual": grid._build_edge_transition_masks(dual_regions),
+        }
 
         solver = SolverFIT3D(
             grid,
@@ -973,36 +1026,52 @@ class TestGridFIT3DMeshing:
             4: "sibc",
         }
 
-        masks = solver.interface_transition_masks["x"]
+        primal = solver.interface_transition_masks["primal"]["x"]
 
         assert np.array_equal(
-            masks["normal_normal"][:, 0, 0],
+            primal["normal_normal"][:, 0, 0],
             np.array([True, False, False, False]),
         )
 
         assert np.array_equal(
-            masks["normal_pec"][:, 0, 0],
+            primal["normal_pec"][:, 0, 0],
             np.array([False, True, True, False]),
         )
 
         assert np.array_equal(
-            masks["normal_sibc"][:, 0, 0],
+            primal["normal_sibc"][:, 0, 0],
             np.array([False, False, False, True]),
         )
 
-        assert not np.any(masks["pec_pec"])
-        assert not np.any(masks["pec_sibc"])
-        assert not np.any(masks["sibc_sibc"])
-
-        classified = np.zeros_like(grid.interface_edge_masks["x"])
-
-        for mask in masks.values():
-            classified |= mask
+        dual = solver.interface_transition_masks["dual"]["x"]
 
         assert np.array_equal(
-            classified,
-            grid.interface_edge_masks["x"],
+            dual["normal_sibc"][:, 0, 0],
+            np.array([True, False, False, False]),
         )
+
+        assert np.array_equal(
+            dual["normal_pec"][:, 0, 0],
+            np.array([False, True, True, False]),
+        )
+
+        assert np.array_equal(
+            dual["normal_normal"][:, 0, 0],
+            np.array([False, False, False, True]),
+        )
+
+        for grid_type in ("primal", "dual"):
+            masks = solver.interface_transition_masks[grid_type]["x"]
+
+            classified = np.zeros_like(grid.interface_edge_masks[grid_type]["x"])
+
+            for mask in masks.values():
+                classified |= mask
+
+            assert np.array_equal(
+                classified,
+                grid.interface_edge_masks[grid_type]["x"],
+            )
 
     def test_long_wake_potential_and_impedance(self, use_gpu, plot_comparison):
         global grid
