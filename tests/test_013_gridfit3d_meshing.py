@@ -720,6 +720,70 @@ class TestGridFIT3DMeshing:
         ):
             solver._apply_stl_materials_conformal()
 
+    def test_stl_material_types(self):
+        solid_1 = "tests/stl/007_vacuum_cavity.stl"
+        solid_2 = "tests/stl/007_lossymetal_shell.stl"
+
+        stl_solids = {
+            "cavity": solid_1,
+            "shell": solid_2,
+        }
+
+        solids = pv.read(solid_1) + pv.read(solid_2)
+        xmin, xmax, ymin, ymax, zmin, zmax = solids.bounds
+
+        # Explicit SIBC type with missing entries defaulting to normal.
+        grid = GridFIT3D(
+            xmin,
+            xmax,
+            ymin,
+            ymax,
+            zmin,
+            zmax,
+            6,
+            6,
+            14,
+            stl_solids=stl_solids,
+            stl_materials={
+                "cavity": "vacuum",
+                "shell": [30.0, 1.0, 30.0],
+            },
+            stl_material_types={
+                "shell": "sibc",
+            },
+            verbose=0,
+        )
+
+        assert grid.stl_material_types == {
+            "cavity": "normal",
+            "shell": "sibc",
+        }
+
+        # Existing PEC definitions must remain identifiable without
+        # explicitly specifying stl_material_types.
+        grid = GridFIT3D(
+            xmin,
+            xmax,
+            ymin,
+            ymax,
+            zmin,
+            zmax,
+            6,
+            6,
+            14,
+            stl_solids=stl_solids,
+            stl_materials={
+                "cavity": "vacuum",
+                "shell": "pec",
+            },
+            verbose=0,
+        )
+
+        assert grid.stl_material_types == {
+            "cavity": "normal",
+            "shell": "pec",
+        }
+
     def test_long_wake_potential_and_impedance(self, use_gpu, plot_comparison):
         global grid
         # ------------ Beam source ----------------

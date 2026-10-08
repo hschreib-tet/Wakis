@@ -24,6 +24,8 @@ try:
 except ImportError:
     imported_mpi = False
 
+VALID_MATERIAL_TYPES = ("normal", "pec", "sibc")
+
 
 class GridFIT3D(PlotMixin):
     """
@@ -54,6 +56,7 @@ class GridFIT3D(PlotMixin):
         snap_solids=None,
         stl_solids=None,
         stl_materials=None,
+        stl_material_types=None,
         stl_rotate=[0.0, 0.0, 0.0],
         stl_translate=[0.0, 0.0, 0.0],
         stl_scale=1.0,
@@ -100,6 +103,11 @@ class GridFIT3D(PlotMixin):
         stl_materials : dict, optional
             Material properties associated with STL solids.
             {'Solid 1': [eps1, mu1], ...}
+        stl_material_types : dict, str, or None, optional
+            Material treatment associated with each STL solid. Valid values are
+            "normal", "pec", and "sibc". If None, materials default to "normal".
+            Existing PEC material definitions are detected automatically for
+            backward compatibility.
         stl_rotate : list or dict, optional
             Angle of rotation to apply to the STL models: [rot_x, rot_y, rot_z].
             If dict, must contain the same keys as stl_solids.
@@ -221,11 +229,12 @@ class GridFIT3D(PlotMixin):
         # stl info
         self.stl_solids = stl_solids
         self.stl_materials = stl_materials
+        self.stl_material_types = stl_material_types
         self.stl_rotate = stl_rotate
         self.stl_translate = stl_translate
         self.stl_scale = stl_scale
         self.stl_colors = stl_colors
-        self.update_logger(["stl_solids", "stl_materials"])
+        self.update_logger(["stl_solids", "stl_materials", "stl_material_types"])
         if stl_rotate != [0.0, 0.0, 0.0]:
             self.update_logger(["stl_rotate"])
         if stl_translate != [0.0, 0.0, 0.0]:
@@ -440,6 +449,7 @@ class GridFIT3D(PlotMixin):
                 use_mpi=False,
                 stl_solids=self.stl_solids,
                 stl_materials=self.stl_materials,
+                stl_material_types=self.stl_material_types,
                 stl_scale=self.stl_scale,
                 stl_rotate=self.stl_rotate,
                 stl_translate=self.stl_translate,
@@ -448,6 +458,79 @@ class GridFIT3D(PlotMixin):
                 stl_tol=self.stl_tol,
             )
         return _grid
+
+    def _prepare_stl_material_types(self):
+        """
+        Prepare and validate material treatment types for all STL solids.
+
+        Materials default to "normal". Existing PEC definitions are detected
+        automatically for backward compatibility.
+
+        Finite conductivity does not imply SIBC. SIBC treatment must always
+        be requested explicitly.
+        """
+        if self.stl_material_types is None:
+            material_types = {}
+
+        elif isinstance(self.stl_material_types, str):
+            material_types = {
+                key: self.stl_material_types.lower() for key in self.stl_solids
+            }
+
+        elif isinstance(self.stl_material_types, dict):
+            unknown_keys = set(self.stl_material_types) - set(self.stl_solids)
+
+            if unknown_keys:
+                raise ValueError(
+                    "stl_material_types contains unknown STL solids: "
+                    f"{sorted(unknown_keys)}"
+                )
+
+            material_types = {}
+
+            for key, material_type in self.stl_material_types.items():
+                if not isinstance(material_type, str):
+                    raise TypeError(
+                        "Each value in stl_material_types must be a string."
+                    )
+
+                material_types[key] = material_type.lower()
+
+        else:
+            raise TypeError(
+                "stl_material_types must be None, a string, or a dictionary."
+            )
+
+        # Fill missing entries.
+        for key in self.stl_solids:
+            if key in material_types:
+                continue
+
+            material = self.stl_materials[key]
+
+            # Preserve existing PEC definitions.
+            if isinstance(material, str):
+                if material.lower() == "pec":
+                    material_types[key] = "pec"
+                else:
+                    material_types[key] = "normal"
+
+            elif np.isinf(material[0]):
+                material_types[key] = "pec"
+
+            else:
+                material_types[key] = "normal"
+
+        # Validate final material types.
+        for key, material_type in material_types.items():
+            if material_type not in VALID_MATERIAL_TYPES:
+                raise ValueError(
+                    f"Unknown material type '{material_type}' "
+                    f"for STL solid '{key}'. "
+                    f"Expected one of {VALID_MATERIAL_TYPES}."
+                )
+
+        self.stl_material_types = material_types
 
     def _prepare_stl_dicts(self):
         """
@@ -513,6 +596,9 @@ class GridFIT3D(PlotMixin):
                 raise Exception(
                     "Attribute `stl_materials` must contain a string or a dictionary"
                 )
+
+        self._prepare_stl_material_types()
+
         # Material library lookup and conversion to [eps, mu, sigma] format
         for key in self.stl_solids.keys():
             if type(self.stl_materials[key]) is str:
@@ -1460,6 +1546,7 @@ class GridFIT3D(PlotMixin):
             for attr in [
                 "stl_solids",
                 "stl_materials",
+                "stl_material_types",
                 "stl_colors",
                 "stl_scale",
                 "stl_rotate",
@@ -1474,6 +1561,22 @@ class GridFIT3D(PlotMixin):
                     else:
                         grp.create_dataset(str(key), data=np.array(val))
 
+            if "stl_material_types" in hf:
+                self.stl_material_types = {}
+
+                grp = hf["stl_material_types"]
+
+                for key in grp.keys():
+                    value = grp[key][()]
+
+                    if isinstance(value, bytes):
+                        value = value.decode()
+
+                    self.stl_material_types[key] = value
+            else:
+                self.stl_material_types = None
+
+            self._prepare_stl_material_types()
             for key in self.stl_solids.keys():
                 # Existing cell mask
                 hf.create_dataset(
