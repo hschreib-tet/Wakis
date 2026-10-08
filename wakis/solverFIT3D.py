@@ -60,8 +60,8 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         pml_exp=4,
         source_type="direct",
         bg=[1.0, 1.0, 0.0],
-        bg_material_type=None,
         verbose=2,
+        bg_material_type=None,
     ):
         """
         3D time-domain electromagnetic solver based on the Finite Integration

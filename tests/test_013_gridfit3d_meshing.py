@@ -209,8 +209,7 @@ class TestGridFIT3DMeshing:
         1. the primal point mask is defined on all primal grid points,
         2. the cell mask stored in ``grid.grid[key]`` follows the
            5-of-8 corner-point rule,
-        3. the dual point mask is derived consistently from the
-           cell-center classification.
+        3. the dual point mask is classified directly on the dual FIT grid.
         """
 
         # Geometry & Materials
@@ -308,27 +307,30 @@ class TestGridFIT3DMeshing:
         # ----------------------------------------------------------
         # 3. Dual point mask
         # ----------------------------------------------------------
-        dual = grid.dual_point_masks["shell"]
+        dual = grid.dual_point_masks[
+            "shell"
+        ]
 
         assert dual.shape == (
-            Nx + 1,
-            Ny + 1,
-            Nz + 1,
+            len(grid.tx),
+            len(grid.ty),
+            len(grid.tz),
         )
 
-        expected_dual_mask = np.pad(
-            expected_cell_mask,
-            (
-                (0, 1),
-                (0, 1),
-                (0, 1),
-            ),
-            mode="edge",
+        assert dual.dtype == bool
+
+        assert np.any(dual)
+        assert np.any(~dual)
+
+        legacy_dual_mask = (
+            grid._cell_mask_to_dual_point_mask(
+                expected_cell_mask
+            )
         )
 
-        np.testing.assert_array_equal(
+        assert not np.array_equal(
             dual,
-            expected_dual_mask,
+            legacy_dual_mask,
         )
 
     def test_average_dual_points_to_primal_edges(self):
@@ -1174,28 +1176,6 @@ class TestGridFIT3DMeshing:
 
         grid._build_interface_intersections()
 
-        print(
-            "primal x intersections:",
-            grid.interface_intersections["primal"]["x"]["has_intersection"][:, 1, 1],
-        )
-
-        print(
-            "hit group keys:",
-            grid.interface_intersections["primal"]["x"]["hit_groups"].keys(),
-        )
-
-        surface_cache = {}
-
-        print(
-            "raw line hits:",
-            grid._trace_grid_line(
-                "primal",
-                "x",
-                (1, 1),
-                surface_cache,
-            ),
-        )
-
         for grid_type in (
             "primal",
             "dual",
@@ -1332,8 +1312,6 @@ class TestGridFIT3DMeshing:
             verbose=0,
         )
 
-        grid._build_interface_intersections()
-
         # First x-edge runs from x=0 to x=0.5.
         # The complete thin layer x=[0.35, 0.40] lies inside it.
         index = (
@@ -1438,8 +1416,6 @@ class TestGridFIT3DMeshing:
             stl_method="voxelize_rectilinear",
             verbose=0,
         )
-
-        grid._build_interface_intersections()
 
         # First primal x-edge:
         #
@@ -1562,8 +1538,6 @@ class TestGridFIT3DMeshing:
             verbose=0,
         )
 
-        grid._build_interface_intersections()
-
         total_expected_interfaces = 0
         total_geometric_intersections = 0
         total_missing_expected = 0
@@ -1667,6 +1641,159 @@ class TestGridFIT3DMeshing:
         )
 
         assert total_geometric_intersections > 0
+
+    def test_conformal_geometry_h5_roundtrip(
+        self,
+        tmp_path,
+    ):
+        """
+        Test HDF5 roundtrip of conformal geometry data.
+
+        Verifies that the primal and directly classified dual point masks,
+        STL ordering, material treatment types, and interface topology are
+        preserved when a conformal grid is saved and loaded again.
+        """
+        solid_z = pv.Box(
+            bounds=(
+                0.20,
+                0.45,
+                0.20,
+                0.80,
+                0.20,
+                0.80,
+            )
+        ).triangulate()
+
+        solid_a = pv.Box(
+            bounds=(
+                0.55,
+                0.80,
+                0.20,
+                0.80,
+                0.20,
+                0.80,
+            )
+        ).triangulate()
+
+        path_z = tmp_path / "z_region.stl"
+        path_a = tmp_path / "a_region.stl"
+
+        solid_z.save(path_z)
+        solid_a.save(path_a)
+
+        # Deliberately use a non-alphabetical order. The order defines
+        # region IDs and must therefore survive the HDF5 roundtrip.
+        stl_solids = {
+            "z_region": str(path_z),
+            "a_region": str(path_a),
+        }
+
+        stl_materials = {
+            "z_region": [4.0, 1.0, 0.0],
+            "a_region": [1.0, 1.0, 0.0],
+        }
+
+        stl_material_types = {
+            "z_region": "normal",
+            "a_region": "pec",
+        }
+
+        grid = GridFIT3D(
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            6,
+            6,
+            6,
+            stl_solids=stl_solids,
+            stl_materials=stl_materials,
+            stl_material_types=stl_material_types,
+            geometry_mode="conformal",
+            stl_method="interior_points",
+            verbose=0,
+        )
+
+        h5_path = tmp_path / "conformal_grid.h5"
+
+        grid.save_to_h5(
+            str(h5_path)
+        )
+
+        loaded = GridFIT3D(
+            load_from_h5=str(h5_path),
+            verbose=0,
+        )
+
+        # Geometry-pipeline metadata
+        assert loaded.geometry_mode == "conformal"
+        assert loaded.stl_method == "interior_points"
+        assert loaded.stl_tol == pytest.approx(grid.stl_tol)
+
+        # STL ordering is significant for region priority.
+        assert list(
+            loaded.stl_solids.keys()
+        ) == [
+            "z_region",
+            "a_region",
+        ]
+
+        # Material treatment types must survive the roundtrip.
+        assert loaded.stl_material_types == (
+            grid.stl_material_types
+        )
+
+        for key in stl_solids:
+            # Existing cell mask
+            assert np.array_equal(
+                np.asarray(grid.grid[key]),
+                np.asarray(loaded.grid[key]),
+            )
+
+            # Direct primal-point classification
+            assert np.array_equal(
+                grid.primal_point_masks[key],
+                loaded.primal_point_masks[key],
+            )
+
+            # Direct dual-point classification
+            assert np.array_equal(
+                grid.dual_point_masks[key],
+                loaded.dual_point_masks[key],
+            )
+
+        # Region IDs reconstructed from the loaded point masks
+        # must be identical.
+        assert np.array_equal(
+            grid.region_ids["primal"],
+            loaded.region_ids["primal"],
+        )
+
+        assert np.array_equal(
+            grid.region_ids["dual"],
+            loaded.region_ids["dual"],
+        )
+
+        # The endpoint-based interface topology must also survive.
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                assert np.array_equal(
+                    grid.interface_edge_masks[
+                        grid_type
+                    ][direction],
+                    loaded.interface_edge_masks[
+                        grid_type
+                    ][direction],
+                )
 
     def test_long_wake_potential_and_impedance(self, use_gpu, plot_comparison):
         global grid
