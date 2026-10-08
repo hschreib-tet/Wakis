@@ -16,7 +16,7 @@ from scipy.sparse import diags, hstack, vstack
 from .boundaries import BCsMixin
 from .field import Field
 from .logger import Logger
-from .materials import material_lib
+from .materials import VALID_MATERIAL_TYPES, material_lib
 from .plotting import PlotMixinSolver as PlotMixin
 from .routines import RoutinesMixin
 
@@ -60,6 +60,7 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         pml_exp=4,
         source_type="direct",
         bg=[1.0, 1.0, 0.0],
+        bg_material_type=None,
         verbose=2,
     ):
         """
@@ -118,6 +119,10 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             Background material [eps_r, mu_r, sigma] or a material key from
             the library. If a sigma value is provided conductivity handling is
             enabled.
+        bg_material_type : str or None, optional
+            Material treatment of the background. Valid values are "normal",
+            "pec", and "sibc". If None, the type is inferred from the existing
+            background material definition. Default is None.
         verbose : int or bool, optional
             Verbosity flag for initialization messages.
 
@@ -172,6 +177,10 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         # Grid
         self.grid = grid
         self.background = bg
+        self.bg_material_type = self._prepare_background_material_type(
+            bg,
+            bg_material_type,
+        )
         self.Nx = self.grid.Nx
         self.Ny = self.grid.Ny
         self.Nz = self.grid.Nz
@@ -189,7 +198,7 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         self.iA = self.grid.iA
         self.tL = self.grid.tL
         self.itA = self.grid.itA
-        self.update_logger(["grid", "background"])
+        self.update_logger(["grid", "background", "bg_material_type"])
 
         # Wake computation
         self.wake = wake
@@ -459,6 +468,38 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
 
         self.solverInitializationTime = time.time() - t0
         self.update_logger(["solverInitializationTime"])
+
+    def _prepare_background_material_type(self, bg, bg_material_type):
+        """
+        Prepare and validate the background material treatment type.
+
+        Existing PEC background definitions are detected automatically for
+        backward compatibility. SIBC treatment must be requested explicitly.
+        """
+        if bg_material_type is not None:
+            if not isinstance(bg_material_type, str):
+                raise TypeError("bg_material_type must be None or a string.")
+
+            material_type = bg_material_type.lower()
+
+            if material_type not in VALID_MATERIAL_TYPES:
+                raise ValueError(
+                    f"Unknown background material type '{material_type}'. "
+                    f"Expected one of {VALID_MATERIAL_TYPES}."
+                )
+
+            return material_type
+
+        if isinstance(bg, str):
+            if bg.lower() == "pec":
+                return "pec"
+
+            return "normal"
+
+        if np.isinf(bg[0]):
+            return "pec"
+
+        return "normal"
 
     def _move_CPML_to_mkl(self):
         self.dxy = mkl_sparse_mat(self.dxy)

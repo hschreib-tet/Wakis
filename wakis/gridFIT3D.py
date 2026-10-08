@@ -14,7 +14,11 @@ from scipy.optimize import least_squares
 
 from .field import Field
 from .logger import Logger
-from .materials import material_colors, material_lib
+from .materials import (
+    VALID_MATERIAL_TYPES,
+    material_colors,
+    material_lib,
+)
 from .plotting import PlotMixinGrid as PlotMixin
 
 try:
@@ -23,8 +27,6 @@ try:
     imported_mpi = True
 except ImportError:
     imported_mpi = False
-
-VALID_MATERIAL_TYPES = ("normal", "pec", "sibc")
 
 
 class GridFIT3D(PlotMixin):

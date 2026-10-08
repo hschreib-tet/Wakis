@@ -784,6 +784,48 @@ class TestGridFIT3DMeshing:
             "shell": "pec",
         }
 
+    def test_background_material_type(self):
+        grid = GridFIT3D(
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            2,
+            2,
+            2,
+            verbose=0,
+        )
+
+        # Default finite material -> normal
+        solver = SolverFIT3D(
+            grid,
+            bg=[1.0, 1.0, 0.0],
+            verbose=0,
+        )
+
+        assert solver.bg_material_type == "normal"
+
+        # Existing PEC definition -> pec
+        solver = SolverFIT3D(
+            grid,
+            bg="pec",
+            verbose=0,
+        )
+
+        assert solver.bg_material_type == "pec"
+
+        # SIBC must be requested explicitly
+        solver = SolverFIT3D(
+            grid,
+            bg=[1.0, 1.0, 0.0],
+            bg_material_type="sibc",
+            verbose=0,
+        )
+
+        assert solver.bg_material_type == "sibc"
+
     def test_long_wake_potential_and_impedance(self, use_gpu, plot_comparison):
         global grid
         # ------------ Beam source ----------------

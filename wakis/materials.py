@@ -20,6 +20,8 @@ to vacuum: eps = eps_r * eps_0 and mu = mu_r * mu_0. Conductivity is in S/m.
 
 import numpy as np
 
+VALID_MATERIAL_TYPES = ("normal", "pec", "sibc")
+
 # fmt: off
 material_lib = {
     'pec' : [np.inf, 1.],
