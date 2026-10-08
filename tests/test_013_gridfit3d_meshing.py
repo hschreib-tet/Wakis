@@ -826,6 +826,76 @@ class TestGridFIT3DMeshing:
 
         assert solver.bg_material_type == "sibc"
 
+    def test_primal_region_ids_and_interface_edges(self):
+        grid = GridFIT3D(
+            0.0,
+            3.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            3,
+            1,
+            1,
+            verbose=0,
+        )
+
+        grid.stl_solids = {
+            "material_1": "unused",
+            "material_2": "unused",
+        }
+
+        shape = (4, 2, 2)
+
+        mask_1 = np.zeros(shape, dtype=bool)
+        mask_2 = np.zeros(shape, dtype=bool)
+
+        # material_1 occupies x-point indices 1 and 2
+        mask_1[1:3, :, :] = True
+
+        # material_2 occupies x-point indices 2 and 3
+        # and therefore overlaps material_1 at index 2.
+        mask_2[2:, :, :] = True
+
+        grid.primal_point_masks = {
+            "material_1": mask_1,
+            "material_2": mask_2,
+        }
+
+        grid._build_primal_region_ids()
+        grid._build_interface_edge_masks()
+
+        # Later STL solids overwrite earlier solids:
+        #
+        # x index:     0  1  2  3
+        # region ID:   0  1  2  2
+        assert np.array_equal(
+            grid.primal_region_ids[:, 0, 0],
+            np.array([0, 1, 2, 2]),
+        )
+
+        assert grid.region_id_to_key == {
+            0: None,
+            1: "material_1",
+            2: "material_2",
+        }
+
+        assert grid.region_key_to_id == {
+            "material_1": 1,
+            "material_2": 2,
+        }
+
+        # Interfaces occur between background/material_1
+        # and material_1/material_2.
+        assert np.array_equal(
+            grid.interface_edge_masks["x"][:, 0, 0],
+            np.array([True, True, False]),
+        )
+
+        # No variation in y or z.
+        assert not np.any(grid.interface_edge_masks["y"])
+        assert not np.any(grid.interface_edge_masks["z"])
+
     def test_long_wake_potential_and_impedance(self, use_gpu, plot_comparison):
         global grid
         # ------------ Beam source ----------------

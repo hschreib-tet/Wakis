@@ -174,9 +174,18 @@ class GridFIT3D(PlotMixin):
         if self.geometry_mode not in ("legacy", "conformal"):
             raise ValueError("[!] geometry_mode must be 'legacy' or 'conformal'.")
 
-        # Point-based STL masks used by the conformal geometry pipeline
+        # Point-based STL data used by the conformal geometry pipeline
         self.primal_point_masks = {}
         self.dual_point_masks = {}
+
+        # Region IDs on primal grid points.
+        # Region 0 is always the background, STL solids use IDs 1, 2, ...
+        self.primal_region_ids = None
+        self.region_id_to_key = {0: None}
+        self.region_key_to_id = {}
+
+        # Primary edges whose endpoints belong to different regions
+        self.interface_edge_masks = {}
 
         # Grid data
         # generate from file
@@ -741,6 +750,80 @@ class GridFIT3D(PlotMixin):
             order="C",
         )
 
+    def _build_primal_region_ids(self):
+        """
+        Build a unique region ID on every primal grid point.
+
+        Region ID 0 is reserved for the background. STL solids are assigned
+        IDs 1, 2, ... following the order of ``self.stl_solids``.
+
+        If STL point masks overlap, later solids overwrite earlier solids.
+        """
+        expected_shape = (
+            self.Nx + 1,
+            self.Ny + 1,
+            self.Nz + 1,
+        )
+
+        region_ids = np.zeros(
+            expected_shape,
+            dtype=np.int32,
+        )
+
+        region_id_to_key = {0: None}
+        region_key_to_id = {}
+
+        for region_id, key in enumerate(
+            self.stl_solids.keys(),
+            start=1,
+        ):
+            if key not in self.primal_point_masks:
+                raise RuntimeError(
+                    f"No primal point mask available for STL solid '{key}'."
+                )
+
+            point_mask = np.asarray(
+                self.primal_point_masks[key],
+                dtype=bool,
+            )
+
+            if point_mask.shape != expected_shape:
+                raise ValueError(
+                    f"Expected primal point mask shape {expected_shape} "
+                    f"for STL solid '{key}', got {point_mask.shape}."
+                )
+
+            # Later STL solids intentionally overwrite earlier ones in
+            # overlapping regions.
+            region_ids[point_mask] = region_id
+
+            region_id_to_key[region_id] = key
+            region_key_to_id[key] = region_id
+
+        self.primal_region_ids = region_ids
+        self.region_id_to_key = region_id_to_key
+        self.region_key_to_id = region_key_to_id
+
+    def _build_interface_edge_masks(self):
+        """
+        Detect primary grid edges whose endpoints belong to different regions.
+
+        The resulting boolean masks have the natural shapes of the primary
+        x-, y-, and z-directed edges.
+        """
+        if self.primal_region_ids is None:
+            raise RuntimeError(
+                "Primal region IDs must be built before detecting interface edges."
+            )
+
+        region_ids = self.primal_region_ids
+
+        self.interface_edge_masks = {
+            "x": (region_ids[:-1, :, :] != region_ids[1:, :, :]),
+            "y": (region_ids[:, :-1, :] != region_ids[:, 1:, :]),
+            "z": (region_ids[:, :, :-1] != region_ids[:, :, 1:]),
+        }
+
     def _mark_cells_in_stl(self, method):
         if self.geometry_mode == "legacy":
             self._mark_cells_in_stl_legacy(method)
@@ -1069,6 +1152,9 @@ class GridFIT3D(PlotMixin):
                     f"{np.sum(self.dual_point_masks[key])} dual points "
                     "marked inside the solid."
                 )
+
+        self._build_primal_region_ids()
+        self._build_interface_edge_masks()
 
     def _apply_subpixel_smoothing(
         self,
@@ -1680,6 +1766,10 @@ class GridFIT3D(PlotMixin):
                     self.dual_point_masks[key] = self._cell_mask_to_dual_point_mask(
                         cell_center_mask
                     )
+
+            if all(key in self.primal_point_masks for key in self.stl_solids):
+                self._build_primal_region_ids()
+                self._build_interface_edge_masks()
 
         # add verbosity
         if self.verbose > 1:
