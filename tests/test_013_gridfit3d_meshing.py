@@ -307,9 +307,7 @@ class TestGridFIT3DMeshing:
         # ----------------------------------------------------------
         # 3. Dual point mask
         # ----------------------------------------------------------
-        dual = grid.dual_point_masks[
-            "shell"
-        ]
+        dual = grid.dual_point_masks["shell"]
 
         assert dual.shape == (
             len(grid.tx),
@@ -322,11 +320,7 @@ class TestGridFIT3DMeshing:
         assert np.any(dual)
         assert np.any(~dual)
 
-        legacy_dual_mask = (
-            grid._cell_mask_to_dual_point_mask(
-                expected_cell_mask
-            )
-        )
+        legacy_dual_mask = grid._cell_mask_to_dual_point_mask(expected_cell_mask)
 
         assert not np.array_equal(
             dual,
@@ -1075,6 +1069,314 @@ class TestGridFIT3DMeshing:
                 grid.interface_edge_masks[grid_type]["x"],
             )
 
+    def test_split_intersection_groups(self):
+        crossing_group = [
+            {
+                "alpha": 0.25,
+                "surface_id": 1,
+                "cell_id": 10,
+                "normal": np.array([1.0, 0.0, 0.0]),
+            }
+        ]
+
+        contact_group = [
+            {
+                "alpha": 0.50,
+                "surface_id": 1,
+                "cell_id": 11,
+                "normal": np.array([0.0, 1.0, 0.0]),
+            }
+        ]
+
+        mixed_group = [
+            {
+                "alpha": 0.75,
+                "surface_id": 1,
+                "cell_id": 12,
+                "normal": np.array([0.0, 1.0, 0.0]),
+            },
+            {
+                "alpha": 0.75,
+                "surface_id": 2,
+                "cell_id": 13,
+                "normal": np.array([0.5, 0.5, 0.0]),
+            },
+        ]
+
+        crossing_groups, contact_groups = GridFIT3D._split_intersection_groups(
+            [
+                crossing_group,
+                contact_group,
+                mixed_group,
+            ],
+            direction="x",
+        )
+
+        assert crossing_groups == [
+            crossing_group,
+            mixed_group,
+        ]
+
+        assert contact_groups == [
+            contact_group,
+        ]
+
+    def test_select_crossing_group(self):
+        group_left = [
+            {
+                "alpha": 0.20,
+                "surface_id": 1,
+                "cell_id": 10,
+                "normal": np.array([1.0, 0.0, 0.0]),
+            }
+        ]
+
+        group_center = [
+            {
+                "alpha": 0.55,
+                "surface_id": 1,
+                "cell_id": 11,
+                "normal": np.array([1.0, 0.0, 0.0]),
+            }
+        ]
+
+        selected = GridFIT3D._select_crossing_group(
+            [
+                group_left,
+                group_center,
+            ]
+        )
+
+        assert selected is group_center
+
+        # Equal distance from the edge midpoint:
+        # prefer the group with the higher surface ID.
+        group_a = [
+            {
+                "alpha": 0.40,
+                "surface_id": 1,
+                "cell_id": 12,
+                "normal": np.array([1.0, 0.0, 0.0]),
+            }
+        ]
+
+        group_b = [
+            {
+                "alpha": 0.60,
+                "surface_id": 2,
+                "cell_id": 13,
+                "normal": np.array([1.0, 0.0, 0.0]),
+            }
+        ]
+
+        selected = GridFIT3D._select_crossing_group(
+            [
+                group_a,
+                group_b,
+            ]
+        )
+        assert selected is group_b
+
+    def test_conformal_line_fractions(self):
+        grid = GridFIT3D(
+            0.0,
+            4.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            4,
+            1,
+            1,
+            geometry_mode="conformal",
+            verbose=0,
+        )
+
+        grid.region_id_to_key = {
+            0: None,
+            1: "normal",
+            2: "pec",
+            3: "sibc",
+        }
+
+        grid.region_key_to_id = {
+            "normal": 1,
+            "pec": 2,
+            "sibc": 3,
+        }
+
+        grid.stl_material_types = {
+            "normal": "normal",
+            "pec": "pec",
+            "sibc": "sibc",
+        }
+
+        # x-directed sequence:
+        #
+        # background(normal)
+        #     -> normal
+        #     -> PEC
+        #     -> normal
+        #     -> SIBC
+        regions = np.zeros(
+            (5, 2, 2),
+            dtype=np.int32,
+        )
+
+        for i, region_id in enumerate([0, 1, 2, 1, 3]):
+            regions[i, :, :] = region_id
+
+        grid.region_ids = {
+            "primal": regions.copy(),
+            "dual": regions.copy(),
+        }
+
+        grid.interface_edge_masks = {
+            "primal": (grid._build_edge_transition_masks(regions)),
+            "dual": (grid._build_edge_transition_masks(regions)),
+        }
+
+        grid.resolved_interface_edge_masks = {
+            "primal": {},
+            "dual": {},
+        }
+
+        grid.interface_intersections = {
+            "primal": {},
+            "dual": {},
+        }
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                mask = grid.interface_edge_masks[grid_type][direction]
+
+                alpha = np.full(
+                    mask.shape,
+                    np.nan,
+                    dtype=float,
+                )
+
+                grid.resolved_interface_edge_masks[grid_type][direction] = mask.copy()
+
+                grid.interface_intersections[grid_type][direction] = {
+                    "alpha": alpha,
+                }
+
+        # x-edge intersection positions:
+        #
+        # normal -> normal : alpha irrelevant for length
+        # normal -> PEC    : 0.25
+        # PEC -> normal    : 0.40
+        # normal -> SIBC   : 0.75
+        alpha_x = np.array(
+            [0.20, 0.25, 0.40, 0.75],
+            dtype=float,
+        )
+
+        alpha_x = np.broadcast_to(
+            alpha_x[:, None, None],
+            (4, 2, 2),
+        ).copy()
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            grid.interface_intersections[grid_type]["x"]["alpha"] = alpha_x
+
+        grid.stl_materials = {
+            "normal": [
+                4.0,
+                5.0,
+                8.0,
+            ],
+            "pec": [
+                np.inf,
+                1.0,
+                0.0,
+            ],
+            "sibc": [
+                1.0,
+                1.0,
+                1.0e6,
+            ],
+        }
+
+        solver = SolverFIT3D(
+            grid,
+            bg=[
+                2.0,
+                3.0,
+                4.0,
+            ],
+            bg_material_type="normal",
+            use_stl=False,
+            verbose=0,
+        )
+
+        fractions = solver.conformal_line_data["primal"]["x"][
+            "effective_length_fraction"
+        ][:, 0, 0]
+
+        np.testing.assert_allclose(
+            fractions,
+            np.array(
+                [
+                    1.0,
+                    0.25,
+                    0.60,
+                    0.75,
+                ]
+            ),
+        )
+
+        primal_materials = solver.conformal_line_materials["primal"]["x"]
+
+        dual_materials = solver.conformal_line_materials["dual"]["x"]
+
+        np.testing.assert_allclose(
+            primal_materials["eps_r"][:, 0, 0],
+            np.array(
+                [
+                    10.0 / 3.0,
+                    4.0,
+                    4.0,
+                    4.0,
+                ]
+            ),
+        )
+
+        np.testing.assert_allclose(
+            primal_materials["sigma"][:, 0, 0],
+            np.array(
+                [
+                    20.0 / 3.0,
+                    8.0,
+                    8.0,
+                    8.0,
+                ]
+            ),
+        )
+
+        np.testing.assert_allclose(
+            dual_materials["mu_r"][:, 0, 0],
+            np.array(
+                [
+                    75.0 / 17.0,
+                    5.0,
+                    5.0,
+                    5.0,
+                ]
+            ),
+        )
+
     def test_primal_and_dual_interface_intersections(
         self,
         tmp_path,
@@ -1203,6 +1505,15 @@ class TestGridFIT3DMeshing:
 
             assert data["has_intersection"][index]
 
+            assert data["has_crossing"][index]
+            assert not data["has_contact"][index]
+
+            assert not data["multiple_crossing_positions"][index]
+
+            assert len(data["crossing_groups"][index]) == 1
+
+            assert index not in data["contact_groups"]
+
             assert not data["multiple_intersections"][index]
 
             groups = data["hit_groups"][index]
@@ -1262,6 +1573,8 @@ class TestGridFIT3DMeshing:
                 expected_alpha,
                 abs=1e-8,
             )
+
+            assert grid.resolved_interface_edge_masks[grid_type]["x"][index]
 
     def test_thin_stl_layer_inside_single_edge(
         self,
@@ -1324,6 +1637,12 @@ class TestGridFIT3DMeshing:
 
         assert data["has_intersection"][index]
 
+        assert data["has_crossing"][index]
+
+        assert data["multiple_crossing_positions"][index]
+
+        assert len(data["crossing_groups"][index]) == 2
+
         assert data["multiple_intersections"][index]
 
         groups = data["hit_groups"][index]
@@ -1343,6 +1662,12 @@ class TestGridFIT3DMeshing:
             0.80,
             abs=1e-6,
         )
+
+        assert data["has_crossing"][index]
+
+        assert not grid.interface_edge_masks["primal"]["x"][index]
+
+        assert not grid.resolved_interface_edge_masks["primal"]["x"][index]
 
     def test_three_normal_material_regions_on_single_edge(
         self,
@@ -1471,6 +1796,15 @@ class TestGridFIT3DMeshing:
             middle_id,
             right_id,
         }
+
+        assert data["multiple_crossing_positions"][index]
+
+        assert grid.resolved_interface_edge_masks["primal"]["x"][index]
+
+        assert data["alpha"][index] == pytest.approx(
+            0.75,
+            abs=1e-8,
+        )
 
     def test_real_stl_interface_intersections(self):
         """
@@ -1718,9 +2052,7 @@ class TestGridFIT3DMeshing:
 
         h5_path = tmp_path / "conformal_grid.h5"
 
-        grid.save_to_h5(
-            str(h5_path)
-        )
+        grid.save_to_h5(str(h5_path))
 
         loaded = GridFIT3D(
             load_from_h5=str(h5_path),
@@ -1733,17 +2065,13 @@ class TestGridFIT3DMeshing:
         assert loaded.stl_tol == pytest.approx(grid.stl_tol)
 
         # STL ordering is significant for region priority.
-        assert list(
-            loaded.stl_solids.keys()
-        ) == [
+        assert list(loaded.stl_solids.keys()) == [
             "z_region",
             "a_region",
         ]
 
         # Material treatment types must survive the roundtrip.
-        assert loaded.stl_material_types == (
-            grid.stl_material_types
-        )
+        assert loaded.stl_material_types == (grid.stl_material_types)
 
         for key in stl_solids:
             # Existing cell mask
@@ -1787,12 +2115,8 @@ class TestGridFIT3DMeshing:
                 "z",
             ):
                 assert np.array_equal(
-                    grid.interface_edge_masks[
-                        grid_type
-                    ][direction],
-                    loaded.interface_edge_masks[
-                        grid_type
-                    ][direction],
+                    grid.interface_edge_masks[grid_type][direction],
+                    loaded.interface_edge_masks[grid_type][direction],
                 )
 
     def test_long_wake_potential_and_impedance(self, use_gpu, plot_comparison):

@@ -176,7 +176,6 @@ class GridFIT3D(PlotMixin):
         if self.geometry_mode not in ("legacy", "conformal"):
             raise ValueError("[!] geometry_mode must be 'legacy' or 'conformal'.")
 
-
         # Point-based STL masks on the primal and dual grids
         self.primal_point_masks = {}
         self.dual_point_masks = {}
@@ -815,34 +814,26 @@ class GridFIT3D(PlotMixin):
                 )
             )
 
-            point_cloud = pv.PolyData(
-                points
-            )
+            point_cloud = pv.PolyData(points)
 
             try:
-                selected = (
-                    point_cloud.select_interior_points(
-                        surf,
-                        method="cell_locator",
-                        locator_tolerance=stl_tolerance,
-                    )
+                selected = point_cloud.select_interior_points(
+                    surf,
+                    method="cell_locator",
+                    locator_tolerance=stl_tolerance,
                 )
 
             except Exception:
-                selected = (
-                    point_cloud.select_interior_points(
-                        surf,
-                        method="cell_locator",
-                        locator_tolerance=stl_tolerance,
-                        check_surface=False,
-                    )
+                selected = point_cloud.select_interior_points(
+                    surf,
+                    method="cell_locator",
+                    locator_tolerance=stl_tolerance,
+                    check_surface=False,
                 )
 
             return np.reshape(
                 np.asarray(
-                    selected.point_data[
-                        "selected_points"
-                    ],
+                    selected.point_data["selected_points"],
                     dtype=bool,
                 ),
                 shape,
@@ -868,23 +859,12 @@ class GridFIT3D(PlotMixin):
                 )
             )
 
-            point_cloud = pv.PolyData(
-                points
-            )
+            point_cloud = pv.PolyData(points)
 
-            selected = (
-                point_cloud.compute_implicit_distance(
-                    surf
-                )
-            )
+            selected = point_cloud.compute_implicit_distance(surf)
 
             return np.reshape(
-                np.asarray(
-                    selected.point_data[
-                        "implicit_distance"
-                    ]
-                )
-                <= 0.0,
+                np.asarray(selected.point_data["implicit_distance"]) <= 0.0,
                 shape,
                 order="C",
             )
@@ -912,9 +892,7 @@ class GridFIT3D(PlotMixin):
                 fallback_spacings,
             ):
                 if len(coordinates) > 1:
-                    differences = np.diff(
-                        coordinates
-                    )
+                    differences = np.diff(coordinates)
 
                     if not np.allclose(
                         differences,
@@ -926,14 +904,10 @@ class GridFIT3D(PlotMixin):
                             "classification coordinates."
                         )
 
-                    spacings.append(
-                        float(differences[0])
-                    )
+                    spacings.append(float(differences[0]))
 
                 else:
-                    spacings.append(
-                        float(fallback)
-                    )
+                    spacings.append(float(fallback))
 
             reference_volume = pv.ImageData(
                 dimensions=shape,
@@ -955,9 +929,7 @@ class GridFIT3D(PlotMixin):
                 dtype=bool,
             )
 
-            expected_size = int(
-                np.prod(shape)
-            )
+            expected_size = int(np.prod(shape))
 
             if voxel_mask.size != expected_size:
                 raise RuntimeError(
@@ -1000,27 +972,21 @@ class GridFIT3D(PlotMixin):
         the selected STL method. Points on the high-side boundary planes are
         classified separately using interior_points.
         """
-        x, y, z = self._get_grid_coordinates(
-            grid_type
-        )
+        x, y, z = self._get_grid_coordinates(grid_type)
 
         if grid_type == "primal":
-            return (
-                self._classify_coordinate_block_in_stl(
-                    surf,
-                    x,
-                    y,
-                    z,
-                    method,
-                    stl_tolerance,
-                    progress_bar=progress_bar,
-                )
+            return self._classify_coordinate_block_in_stl(
+                surf,
+                x,
+                y,
+                z,
+                method,
+                stl_tolerance,
+                progress_bar=progress_bar,
             )
 
         if grid_type != "dual":
-            raise ValueError(
-                f"Unknown grid type: {grid_type}"
-            )
+            raise ValueError(f"Unknown grid type: {grid_type}")
 
         # ----------------------------------------------------------
         # Regular inner dual grid
@@ -1164,20 +1130,14 @@ class GridFIT3D(PlotMixin):
             len(self.tz),
         )
 
-        if (
-            primal_point_mask.shape
-            != expected_primal_shape
-        ):
+        if primal_point_mask.shape != expected_primal_shape:
             raise ValueError(
                 "Expected primal point mask shape "
                 f"{expected_primal_shape}, "
                 f"got {primal_point_mask.shape}."
             )
 
-        if (
-            dual_point_mask.shape
-            != expected_dual_shape
-        ):
+        if dual_point_mask.shape != expected_dual_shape:
             raise ValueError(
                 "Expected dual point mask shape "
                 f"{expected_dual_shape}, "
@@ -1772,6 +1732,113 @@ class GridFIT3D(PlotMixin):
 
         return groups
 
+    @staticmethod
+    def _split_intersection_groups(
+        hit_groups,
+        direction,
+        normal_projection_tolerance=1e-8,
+    ):
+        """
+        Split grouped STL hits into crossings and tangential contacts.
+
+        A hit group is classified as a crossing if at least one facet normal
+        has a non-zero component along the grid-edge direction. If all facet
+        normals are perpendicular to the edge direction, the group is treated
+        as a tangential or coplanar contact.
+
+        Parameters
+        ----------
+        hit_groups : list
+            Groups of ray-tracing hits at identical geometric positions.
+        direction : str
+            Grid-edge direction: "x", "y", or "z".
+        normal_projection_tolerance : float, optional
+            Tolerance for the absolute projection of the unit facet normal
+            onto the grid-edge direction.
+
+        Returns
+        -------
+        crossing_groups : list
+            Hit groups representing actual crossings of an STL surface.
+        contact_groups : list
+            Hit groups representing tangential or coplanar contacts.
+        """
+        axis = {
+            "x": 0,
+            "y": 1,
+            "z": 2,
+        }
+
+        if direction not in axis:
+            raise ValueError(
+                f"Unknown edge direction '{direction}'. Expected 'x', 'y', or 'z'."
+            )
+
+        if not 0.0 <= normal_projection_tolerance <= 1.0:
+            raise ValueError("normal_projection_tolerance must be between 0 and 1.")
+
+        axis_index = axis[direction]
+
+        crossing_groups = []
+        contact_groups = []
+
+        for group in hit_groups:
+            is_crossing = any(
+                abs(
+                    float(
+                        np.asarray(
+                            hit["normal"],
+                            dtype=float,
+                        )[axis_index]
+                    )
+                )
+                > normal_projection_tolerance
+                for hit in group
+            )
+
+            if is_crossing:
+                crossing_groups.append(group)
+            else:
+                contact_groups.append(group)
+
+        return crossing_groups, contact_groups
+
+    @staticmethod
+    def _select_crossing_group(
+        crossing_groups,
+    ):
+        """
+        Select one representative crossing position on an edge.
+
+        If several distinct crossing positions exist, the position closest
+        to the edge midpoint is selected. If two positions are equally close
+        to the midpoint, the group containing the highest surface ID is
+        preferred.
+
+        The complete set of crossing groups is preserved separately for
+        diagnostics and future multi-interface treatment.
+        """
+        if not crossing_groups:
+            raise ValueError("Cannot select a crossing group from an empty list.")
+
+        if len(crossing_groups) == 1:
+            return crossing_groups[0]
+
+        def group_key(group):
+            alpha = float(np.mean([hit["alpha"] for hit in group]))
+
+            highest_surface_id = max(hit["surface_id"] for hit in group)
+
+            return (
+                abs(alpha - 0.5),
+                -highest_surface_id,
+            )
+
+        return min(
+            crossing_groups,
+            key=group_key,
+        )
+
     def _select_representative_hit(
         self,
         hits,
@@ -1864,6 +1931,7 @@ class GridFIT3D(PlotMixin):
                         np.nan,
                         dtype=float,
                     ),
+                    # Raw geometric ray-tracing information.
                     "has_intersection": np.zeros(
                         shape,
                         dtype=bool,
@@ -1873,6 +1941,21 @@ class GridFIT3D(PlotMixin):
                         dtype=bool,
                     ),
                     "hit_groups": {},
+                    # Classified interface information.
+                    "has_crossing": np.zeros(
+                        shape,
+                        dtype=bool,
+                    ),
+                    "has_contact": np.zeros(
+                        shape,
+                        dtype=bool,
+                    ),
+                    "multiple_crossing_positions": np.zeros(
+                        shape,
+                        dtype=bool,
+                    ),
+                    "crossing_groups": {},
+                    "contact_groups": {},
                 }
 
                 raw_hits = {}
@@ -1901,6 +1984,9 @@ class GridFIT3D(PlotMixin):
                     if not hit_groups:
                         continue
 
+                    # ----------------------------------------------------------
+                    # Raw geometric ray-tracing information
+                    # ----------------------------------------------------------
                     intersections["has_intersection"][edge_index] = True
 
                     intersections["multiple_intersections"][edge_index] = (
@@ -1909,19 +1995,52 @@ class GridFIT3D(PlotMixin):
 
                     intersections["hit_groups"][edge_index] = hit_groups
 
-                    # Keep a representative hit for compatibility with the
-                    # existing single-interface data layout.
-                    representative = self._select_representative_hit(hit_groups[0])
+                    # ----------------------------------------------------------
+                    # Crossing/contact classification
+                    # ----------------------------------------------------------
+                    (
+                        crossing_groups,
+                        contact_groups,
+                    ) = self._split_intersection_groups(
+                        hit_groups,
+                        direction,
+                    )
 
-                    intersections["alpha"][edge_index] = representative["alpha"]
+                    if crossing_groups:
+                        intersections["has_crossing"][edge_index] = True
 
-                    intersections["surface_id"][edge_index] = representative[
-                        "surface_id"
-                    ]
+                        intersections["crossing_groups"][edge_index] = crossing_groups
 
-                    intersections["cell_id"][edge_index] = representative["cell_id"]
+                        intersections["multiple_crossing_positions"][edge_index] = (
+                            len(crossing_groups) > 1
+                        )
 
-                    intersections["normal"][edge_index] = representative["normal"]
+                    if contact_groups:
+                        intersections["has_contact"][edge_index] = True
+
+                        intersections["contact_groups"][edge_index] = contact_groups
+
+                    # ----------------------------------------------------------
+                    # Representative physical crossing
+                    #
+                    # Dense alpha/surface/normal arrays describe an actual
+                    # crossing only. Pure tangential contacts therefore keep
+                    # their default NaN / -1 values.
+                    # ----------------------------------------------------------
+                    if crossing_groups:
+                        selected_group = self._select_crossing_group(crossing_groups)
+
+                        representative = self._select_representative_hit(selected_group)
+
+                        intersections["alpha"][edge_index] = representative["alpha"]
+
+                        intersections["surface_id"][edge_index] = representative[
+                            "surface_id"
+                        ]
+
+                        intersections["cell_id"][edge_index] = representative["cell_id"]
+
+                        intersections["normal"][edge_index] = representative["normal"]
 
                 self.interface_intersections[grid_type][direction] = intersections
 
@@ -1930,16 +2049,216 @@ class GridFIT3D(PlotMixin):
                         np.count_nonzero(intersections["has_intersection"])
                     )
 
-                    n_multiple = int(
-                        np.count_nonzero(intersections["multiple_intersections"])
+                    n_crossings = int(np.count_nonzero(intersections["has_crossing"]))
+
+                    n_contacts = int(np.count_nonzero(intersections["has_contact"]))
+
+                    n_multiple_crossings = int(
+                        np.count_nonzero(intersections["multiple_crossing_positions"])
                     )
 
                     print(
                         f"    * {grid_type} {direction}-edges: "
-                        f"{n_intersections} intersected, "
-                        f"{n_multiple} with multiple "
-                        "intersection positions"
+                        f"{n_intersections} geometric hits, "
+                        f"{n_crossings} crossings, "
+                        f"{n_contacts} contacts, "
+                        f"{n_multiple_crossings} with multiple "
+                        "crossing positions"
                     )
+        self._build_resolved_interface_edge_masks()
+
+    def _build_resolved_interface_edge_masks(self):
+        """
+        Build the interface masks used by the current conformal FIT
+        discretization.
+
+        An interface edge is considered resolved if
+
+        1. its endpoint region IDs indicate a material transition, and
+        2. at least one geometric STL crossing was found.
+
+        Hidden crossings are retained in the geometric intersection data but
+        are intentionally ignored by the current discretization. Endpoint
+        interfaces without a crossing are also excluded.
+        """
+        self.resolved_interface_edge_masks = {
+            "primal": {},
+            "dual": {},
+        }
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                endpoint_mask = self.interface_edge_masks[grid_type][direction]
+
+                has_crossing = self.interface_intersections[grid_type][direction][
+                    "has_crossing"
+                ]
+
+                self.resolved_interface_edge_masks[grid_type][direction] = (
+                    endpoint_mask & has_crossing
+                )
+
+    def _get_interface_diagnostics(self):
+        """
+        Summarize unresolved and approximated conformal-interface cases.
+        """
+        diagnostics = {
+            "endpoint_interfaces": 0,
+            "resolved_interfaces": 0,
+            "missing_crossings": 0,
+            "hidden_crossings": 0,
+            "multiple_crossing_edges": 0,
+            "multiple_resolved_edges": 0,
+            "repeated_stl_crossing_edges": [],
+        }
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                endpoint_mask = self.interface_edge_masks[grid_type][direction]
+
+                resolved_mask = self.resolved_interface_edge_masks[grid_type][direction]
+
+                data = self.interface_intersections[grid_type][direction]
+
+                has_crossing = data["has_crossing"]
+
+                multiple = data["multiple_crossing_positions"]
+
+                missing = endpoint_mask & ~has_crossing
+
+                hidden = ~endpoint_mask & has_crossing
+
+                diagnostics["endpoint_interfaces"] += int(
+                    np.count_nonzero(endpoint_mask)
+                )
+
+                diagnostics["resolved_interfaces"] += int(
+                    np.count_nonzero(resolved_mask)
+                )
+
+                diagnostics["missing_crossings"] += int(np.count_nonzero(missing))
+
+                diagnostics["hidden_crossings"] += int(np.count_nonzero(hidden))
+
+                diagnostics["multiple_crossing_edges"] += int(
+                    np.count_nonzero(multiple)
+                )
+
+                diagnostics["multiple_resolved_edges"] += int(
+                    np.count_nonzero(multiple & resolved_mask)
+                )
+
+                for index, groups in data["crossing_groups"].items():
+                    if len(groups) <= 1:
+                        continue
+
+                    surface_ids_per_group = [
+                        {hit["surface_id"] for hit in group} for group in groups
+                    ]
+
+                    all_surface_ids = set().union(*surface_ids_per_group)
+
+                    repeated_surface_ids = {
+                        surface_id
+                        for surface_id in all_surface_ids
+                        if sum(
+                            surface_id in group_ids
+                            for group_ids in surface_ids_per_group
+                        )
+                        > 1
+                    }
+
+                    if repeated_surface_ids:
+                        diagnostics["repeated_stl_crossing_edges"].append(
+                            {
+                                "grid_type": grid_type,
+                                "direction": direction,
+                                "index": tuple(int(v) for v in index),
+                                "surface_ids": tuple(sorted(repeated_surface_ids)),
+                            }
+                        )
+        return diagnostics
+
+    def _warn_interface_diagnostics(self):
+        """
+        Warn about conformal-interface cases that are currently ignored or
+        approximated.
+        """
+        diagnostics = self._get_interface_diagnostics()
+
+        messages = []
+
+        if diagnostics["missing_crossings"]:
+            messages.append(
+                f"{diagnostics['missing_crossings']} endpoint "
+                "interface edges have no geometric crossing and "
+                "will not receive a conformal correction."
+            )
+
+        if diagnostics["hidden_crossings"]:
+            messages.append(
+                f"{diagnostics['hidden_crossings']} edges contain "
+                "geometric crossings that are hidden from endpoint "
+                "topology and are ignored by the current conformal "
+                "discretization."
+            )
+
+        if diagnostics["multiple_crossing_edges"]:
+            messages.append(
+                f"{diagnostics['multiple_crossing_edges']} edges "
+                "contain multiple crossing positions. "
+                f"{diagnostics['multiple_resolved_edges']} of these "
+                "are currently used by the conformal discretization; "
+                "one representative crossing is selected on each edge."
+            )
+
+        repeated = diagnostics["repeated_stl_crossing_edges"]
+
+        if repeated:
+            messages.append(
+                f"{len(repeated)} edges cross the same STL at more "
+                "than one distinct position. The geometry on these "
+                "edges is not fully resolved by the current "
+                "single-crossing treatment."
+            )
+
+            for item in repeated[:5]:
+                surface_names = [
+                    self.region_id_to_key[surface_id]
+                    for surface_id in item["surface_ids"]
+                ]
+
+                messages.append(
+                    "  "
+                    f"{item['grid_type']} "
+                    f"{item['direction']}-edge "
+                    f"{item['index']}: "
+                    f"{', '.join(surface_names)}"
+                )
+
+            if len(repeated) > 5:
+                messages.append(f"  ... and {len(repeated) - 5} more.")
+
+        if messages:
+            warnings.warn(
+                "Conformal geometry diagnostics:\n" + "\n".join(messages),
+                UserWarning,
+                stacklevel=2,
+            )
 
     def _mark_cells_in_stl(self, method):
         if self.geometry_mode == "legacy":
@@ -2146,35 +2465,28 @@ class GridFIT3D(PlotMixin):
             surf = self.read_stl(key)
 
             if self.verbose:
-                print(
-                    f" * Marking grid points "
-                    f"inside STL solid '{key}'..."
-                )
+                print(f" * Marking grid points inside STL solid '{key}'...")
 
             # ----------------------------------------------------------
             # Primal grid-point classification
             # ----------------------------------------------------------
-            primal_point_mask = (
-                self._classify_grid_points_in_stl(
-                    surf=surf,
-                    grid_type="primal",
-                    method=method,
-                    stl_tolerance=stl_tolerance,
-                    progress_bar=progress_bar,
-                )
+            primal_point_mask = self._classify_grid_points_in_stl(
+                surf=surf,
+                grid_type="primal",
+                method=method,
+                stl_tolerance=stl_tolerance,
+                progress_bar=progress_bar,
             )
 
             # ----------------------------------------------------------
             # Dual grid-point classification
             # ----------------------------------------------------------
-            dual_point_mask = (
-                self._classify_grid_points_in_stl(
-                    surf=surf,
-                    grid_type="dual",
-                    method=method,
-                    stl_tolerance=stl_tolerance,
-                    progress_bar=progress_bar,
-                )
+            dual_point_mask = self._classify_grid_points_in_stl(
+                surf=surf,
+                grid_type="dual",
+                method=method,
+                stl_tolerance=stl_tolerance,
+                progress_bar=progress_bar,
             )
 
             # ----------------------------------------------------------
@@ -2190,10 +2502,7 @@ class GridFIT3D(PlotMixin):
             # ----------------------------------------------------------
             # Diagnostics
             # ----------------------------------------------------------
-            if (
-                self.verbose
-                and np.sum(self.grid[key]) == 0
-            ):
+            if self.verbose and np.sum(self.grid[key]) == 0:
                 print(
                     f"[!] Warning: no cells were marked "
                     f"inside STL solid '{key}'. "
@@ -2225,6 +2534,9 @@ class GridFIT3D(PlotMixin):
         # and is independent of the endpoint transition masks.
         # --------------------------------------------------------------
         self._build_interface_intersections()
+
+        # Produce Warnings for ignored interface cases (hidden crossings, missing crossings)
+        self._warn_interface_diagnostics()
 
     def _apply_subpixel_smoothing(
         self,
@@ -2800,19 +3112,14 @@ class GridFIT3D(PlotMixin):
                 if isinstance(geometry_mode, bytes):
                     geometry_mode = geometry_mode.decode()
 
-                self.geometry_mode = str(
-                    geometry_mode
-                ).lower()
+                self.geometry_mode = str(geometry_mode).lower()
 
             else:
                 # Backward compatibility:
                 # Files containing primal point masks were produced by
                 # the conformal geometry pipeline.
                 has_primal_point_masks = any(
-                    name.startswith(
-                        "grid_primal_points_"
-                    )
-                    for name in hf.keys()
+                    name.startswith("grid_primal_points_") for name in hf.keys()
                 )
 
                 if has_primal_point_masks:
@@ -2823,26 +3130,19 @@ class GridFIT3D(PlotMixin):
                 "conformal",
             ):
                 raise ValueError(
-                    "Invalid geometry_mode stored "
-                    f"in HDF5 file: {self.geometry_mode}"
+                    f"Invalid geometry_mode stored in HDF5 file: {self.geometry_mode}"
                 )
 
             if "stl_method" in hf.attrs:
                 stl_method = hf.attrs["stl_method"]
 
                 if isinstance(stl_method, bytes):
-                    stl_method = (
-                        stl_method.decode()
-                    )
+                    stl_method = stl_method.decode()
 
-                self.stl_method = str(
-                    stl_method
-                )
+                self.stl_method = str(stl_method)
 
             if "stl_tol" in hf.attrs:
-                self.stl_tol = float(
-                    hf.attrs["stl_tol"]
-                )
+                self.stl_tol = float(hf.attrs["stl_tol"])
 
             # ----------------------------------------------------------
             # Preserve STL ordering
@@ -2850,21 +3150,15 @@ class GridFIT3D(PlotMixin):
             if "stl_key_order" in hf:
                 stl_key_order = []
 
-                for value in hf[
-                    "stl_key_order"
-                ][()]:
+                for value in hf["stl_key_order"][()]:
                     if isinstance(value, bytes):
                         value = value.decode()
 
-                    stl_key_order.append(
-                        str(value)
-                    )
+                    stl_key_order.append(str(value))
 
             else:
                 # Backward compatibility with old files.
-                stl_key_order = list(
-                    hf["stl_solids"].keys()
-                )
+                stl_key_order = list(hf["stl_solids"].keys())
 
             # ----------------------------------------------------------
             # STL dictionaries
@@ -2903,9 +3197,7 @@ class GridFIT3D(PlotMixin):
             if "stl_material_types" in hf:
                 self.stl_material_types = {}
 
-                grp = hf[
-                    "stl_material_types"
-                ]
+                grp = hf["stl_material_types"]
 
                 for key in stl_key_order:
                     if key not in grp:
@@ -2916,9 +3208,7 @@ class GridFIT3D(PlotMixin):
                     if isinstance(value, bytes):
                         value = value.decode()
 
-                    self.stl_material_types[
-                        key
-                    ] = str(value)
+                    self.stl_material_types[key] = str(value)
 
             else:
                 # Old files did not contain explicit treatment types.
@@ -2956,22 +3246,16 @@ class GridFIT3D(PlotMixin):
                         dtype=bool,
                     )
 
-                    self.primal_point_masks[key] = (
-                        primal_point_mask
-                    )
+                    self.primal_point_masks[key] = primal_point_mask
 
                 # Newest files also contain the directly
                 # classified dual point mask.
-                dual_point_mask_name = (
-                    "grid_dual_points_" + key
-                )
+                dual_point_mask_name = "grid_dual_points_" + key
 
                 if dual_point_mask_name in hf:
-                    self.dual_point_masks[key] = (
-                        np.asarray(
-                            hf[dual_point_mask_name][()],
-                            dtype=bool,
-                        )
+                    self.dual_point_masks[key] = np.asarray(
+                        hf[dual_point_mask_name][()],
+                        dtype=bool,
                     )
 
                 elif point_mask_name in hf:
@@ -2979,17 +3263,13 @@ class GridFIT3D(PlotMixin):
                     # written after primal point masks were
                     # introduced but before direct dual-point
                     # classification was introduced.
-                    cell_center_mask = (
-                        self._point_mask_to_cell_mask(
-                            primal_point_mask,
-                            threshold=0.5,
-                        )
+                    cell_center_mask = self._point_mask_to_cell_mask(
+                        primal_point_mask,
+                        threshold=0.5,
                     )
 
-                    self.dual_point_masks[key] = (
-                        self._cell_mask_to_dual_point_mask(
-                            cell_center_mask
-                        )
+                    self.dual_point_masks[key] = self._cell_mask_to_dual_point_mask(
+                        cell_center_mask
                     )
 
             if all(key in self.primal_point_masks for key in self.stl_solids) and all(

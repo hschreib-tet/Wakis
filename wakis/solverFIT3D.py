@@ -187,12 +187,60 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             "primal": {},
             "dual": {},
         }
+        self.conformal_line_data = {
+            "primal": {},
+            "dual": {},
+        }
+        self.conformal_line_materials = {
+            "primal": {},
+            "dual": {},
+        }
+
         if (
             getattr(self.grid, "geometry_mode", "legacy") == "conformal"
             and getattr(self.grid, "region_ids", {}).get("primal") is not None
             and getattr(self.grid, "region_ids", {}).get("dual") is not None
         ):
             self._build_interface_transition_masks()
+        resolved_masks = getattr(
+            self.grid,
+            "resolved_interface_edge_masks",
+            None,
+        )
+
+        intersection_data = getattr(
+            self.grid,
+            "interface_intersections",
+            None,
+        )
+
+        if (
+            getattr(
+                self.grid,
+                "geometry_mode",
+                "legacy",
+            )
+            == "conformal"
+            and resolved_masks
+            and intersection_data
+            and all(
+                resolved_masks.get(grid_type)
+                for grid_type in (
+                    "primal",
+                    "dual",
+                )
+            )
+            and all(
+                intersection_data.get(grid_type)
+                for grid_type in (
+                    "primal",
+                    "dual",
+                )
+            )
+        ):
+            self._build_conformal_line_data()
+            self._build_conformal_line_materials()
+
         self.Nx = self.grid.Nx
         self.Ny = self.grid.Ny
         self.Nz = self.grid.Nz
@@ -621,6 +669,379 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
                     "pec_sibc": pec_sibc,
                     "sibc_sibc": sibc_sibc,
                 }
+
+    def _build_conformal_line_data(self):
+        """
+        Build solver-side line data for resolved conformal interfaces.
+
+        For normal-normal interfaces the complete edge remains active.
+
+        For normal-conductor interfaces, only the fraction of the edge inside
+        the normal material is retained:
+
+            normal -> conductor : fraction = alpha
+            conductor -> normal : fraction = 1 - alpha
+
+        Here, conductor means either PEC or SIBC.
+
+        The method does not modify FIT metric or material operators. It only
+        prepares the geometric line fractions required by later conformal
+        discretization steps.
+        """
+        if not self.region_material_types:
+            self._build_region_material_types()
+
+        type_codes = {
+            "normal": 0,
+            "pec": 1,
+            "sibc": 2,
+        }
+
+        max_region_id = max(self.region_material_types)
+
+        region_type_codes = np.empty(
+            max_region_id + 1,
+            dtype=np.int8,
+        )
+
+        for (
+            region_id,
+            material_type,
+        ) in self.region_material_types.items():
+            region_type_codes[region_id] = type_codes[material_type]
+
+        normal = type_codes["normal"]
+        pec = type_codes["pec"]
+        sibc = type_codes["sibc"]
+
+        self.conformal_line_data = {
+            "primal": {},
+            "dual": {},
+        }
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                (
+                    start_regions,
+                    end_regions,
+                ) = self.grid._get_edge_region_ids(
+                    grid_type,
+                    direction,
+                )
+
+                data = self.grid.interface_intersections[grid_type][direction]
+
+                alpha = np.asarray(
+                    data["alpha"],
+                    dtype=float,
+                )
+
+                resolved = np.asarray(
+                    self.grid.resolved_interface_edge_masks[grid_type][direction],
+                    dtype=bool,
+                )
+
+                if alpha.shape != resolved.shape:
+                    raise RuntimeError(
+                        "Conformal intersection and resolved-interface "
+                        f"shapes differ for {grid_type} "
+                        f"{direction}-edges."
+                    )
+
+                start_types = region_type_codes[start_regions]
+
+                end_types = region_type_codes[end_regions]
+
+                start_normal = start_types == normal
+
+                end_normal = end_types == normal
+
+                start_conductor = (start_types == pec) | (start_types == sibc)
+
+                end_conductor = (end_types == pec) | (end_types == sibc)
+
+                normal_normal = resolved & start_normal & end_normal
+
+                normal_to_conductor = resolved & start_normal & end_conductor
+
+                conductor_to_normal = resolved & start_conductor & end_normal
+
+                supported = normal_normal | normal_to_conductor | conductor_to_normal
+
+                # NaN deliberately marks edges for which no current
+                # conformal line treatment is defined.
+                effective_length_fraction = np.full(
+                    alpha.shape,
+                    np.nan,
+                    dtype=float,
+                )
+
+                effective_length_fraction[normal_normal] = 1.0
+
+                effective_length_fraction[normal_to_conductor] = alpha[
+                    normal_to_conductor
+                ]
+
+                effective_length_fraction[conductor_to_normal] = (
+                    1.0 - alpha[conductor_to_normal]
+                )
+
+                if np.any(~np.isfinite(effective_length_fraction[supported])):
+                    raise RuntimeError(
+                        "Non-finite conformal line fraction "
+                        f"for {grid_type} "
+                        f"{direction}-edges."
+                    )
+
+                if np.any(
+                    (effective_length_fraction[supported] < 0.0)
+                    | (effective_length_fraction[supported] > 1.0)
+                ):
+                    raise RuntimeError("Conformal line fraction outside [0, 1].")
+
+                self.conformal_line_data[grid_type][direction] = {
+                    "resolved": resolved,
+                    "supported": supported,
+                    "alpha": alpha,
+                    "start_region": start_regions,
+                    "end_region": end_regions,
+                    "normal_normal": normal_normal,
+                    "normal_to_conductor": (normal_to_conductor),
+                    "conductor_to_normal": (conductor_to_normal),
+                    "effective_length_fraction": (effective_length_fraction),
+                }
+
+    def _get_region_material_properties(self, region_id):
+        """
+        Return [eps_r, mu_r, sigma] for one geometry region.
+
+        Region 0 is the background. All other regions correspond to STL solids.
+        """
+        region_id = int(region_id)
+
+        if region_id == 0:
+            material = self.background
+
+            if isinstance(material, str):
+                mat = material_lib[material.lower()]
+
+                material = [
+                    mat[0],
+                    mat[1],
+                    mat[2] if len(mat) == 3 else 0.0,
+                ]
+
+            else:
+                material = list(material)
+
+                if len(material) == 2:
+                    material.append(0.0)
+
+        else:
+            key = self.grid.region_id_to_key[region_id]
+
+            material = self.grid.stl_materials[key]
+
+        return np.asarray(
+            material,
+            dtype=float,
+        )
+
+    def _build_region_material_properties(self):
+        """
+        Build numerical material-property tables indexed by region ID.
+        """
+        max_region_id = max(self.region_material_types)
+
+        eps_r = np.full(
+            max_region_id + 1,
+            np.nan,
+            dtype=float,
+        )
+
+        mu_r = np.full(
+            max_region_id + 1,
+            np.nan,
+            dtype=float,
+        )
+
+        sigma = np.full(
+            max_region_id + 1,
+            np.nan,
+            dtype=float,
+        )
+
+        for region_id in self.region_material_types:
+            properties = self._get_region_material_properties(region_id)
+
+            eps_r[region_id] = properties[0]
+            mu_r[region_id] = properties[1]
+            sigma[region_id] = properties[2]
+
+        self.region_material_properties = {
+            "eps_r": eps_r,
+            "mu_r": mu_r,
+            "sigma": sigma,
+        }
+
+    def _build_conformal_line_materials(self):
+        """
+        Build effective material values along resolved conformal edges.
+
+        Primal edges:
+            - normal-normal: harmonic eps_r and sigma
+            - normal-conductor: material properties of the normal segment
+
+        Dual edges:
+            - normal-normal: harmonic mu_r
+            - normal-conductor: mu_r of the normal segment
+
+        No FIT operators are modified here.
+        """
+        self._build_region_material_properties()
+
+        eps_r_regions = self.region_material_properties["eps_r"]
+
+        mu_r_regions = self.region_material_properties["mu_r"]
+
+        sigma_regions = self.region_material_properties["sigma"]
+
+        self.conformal_line_materials = {
+            "primal": {},
+            "dual": {},
+        }
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                line_data = self.conformal_line_data[grid_type][direction]
+
+                alpha = line_data["alpha"]
+
+                start_regions = line_data["start_region"]
+
+                end_regions = line_data["end_region"]
+
+                normal_normal = line_data["normal_normal"]
+
+                normal_to_conductor = line_data["normal_to_conductor"]
+
+                conductor_to_normal = line_data["conductor_to_normal"]
+
+                shape = alpha.shape
+
+                start_eps_r = eps_r_regions[start_regions]
+
+                end_eps_r = eps_r_regions[end_regions]
+
+                start_mu_r = mu_r_regions[start_regions]
+
+                end_mu_r = mu_r_regions[end_regions]
+
+                start_sigma = sigma_regions[start_regions]
+
+                end_sigma = sigma_regions[end_regions]
+
+                if grid_type == "primal":
+                    eps_r_eff = np.full(
+                        shape,
+                        np.nan,
+                        dtype=float,
+                    )
+
+                    sigma_eff = np.full(
+                        shape,
+                        np.nan,
+                        dtype=float,
+                    )
+
+                    # ------------------------------------------
+                    # Normal -> normal:
+                    # harmonic average along the edge
+                    # ------------------------------------------
+                    eps_r_eff[normal_normal] = 1.0 / (
+                        alpha[normal_normal] / start_eps_r[normal_normal]
+                        + (1.0 - alpha[normal_normal]) / end_eps_r[normal_normal]
+                    )
+
+                    # Conductivity:
+                    #
+                    # For the present non-dispersive approximation,
+                    # use the corresponding series (harmonic)
+                    # conductivity. If either region is insulating,
+                    # the effective DC conductivity is zero.
+                    both_conductive = (
+                        normal_normal & (start_sigma > 0.0) & (end_sigma > 0.0)
+                    )
+
+                    sigma_eff[normal_normal] = 0.0
+
+                    sigma_eff[both_conductive] = 1.0 / (
+                        alpha[both_conductive] / start_sigma[both_conductive]
+                        + (1.0 - alpha[both_conductive]) / end_sigma[both_conductive]
+                    )
+
+                    # ------------------------------------------
+                    # Normal -> PEC/SIBC
+                    # ------------------------------------------
+                    eps_r_eff[normal_to_conductor] = start_eps_r[normal_to_conductor]
+
+                    sigma_eff[normal_to_conductor] = start_sigma[normal_to_conductor]
+
+                    # ------------------------------------------
+                    # PEC/SIBC -> normal
+                    # ------------------------------------------
+                    eps_r_eff[conductor_to_normal] = end_eps_r[conductor_to_normal]
+
+                    sigma_eff[conductor_to_normal] = end_sigma[conductor_to_normal]
+
+                    self.conformal_line_materials[grid_type][direction] = {
+                        "eps_r": eps_r_eff,
+                        "sigma": sigma_eff,
+                    }
+
+                else:
+                    mu_r_eff = np.full(
+                        shape,
+                        np.nan,
+                        dtype=float,
+                    )
+
+                    # ------------------------------------------
+                    # Normal -> normal:
+                    # harmonic average along dual edge
+                    # ------------------------------------------
+                    mu_r_eff[normal_normal] = 1.0 / (
+                        alpha[normal_normal] / start_mu_r[normal_normal]
+                        + (1.0 - alpha[normal_normal]) / end_mu_r[normal_normal]
+                    )
+
+                    # ------------------------------------------
+                    # Normal -> PEC/SIBC
+                    # ------------------------------------------
+                    mu_r_eff[normal_to_conductor] = start_mu_r[normal_to_conductor]
+
+                    # ------------------------------------------
+                    # PEC/SIBC -> normal
+                    # ------------------------------------------
+                    mu_r_eff[conductor_to_normal] = end_mu_r[conductor_to_normal]
+
+                    self.conformal_line_materials[grid_type][direction] = {
+                        "mu_r": mu_r_eff,
+                    }
 
     def _move_CPML_to_mkl(self):
         self.dxy = mkl_sparse_mat(self.dxy)
