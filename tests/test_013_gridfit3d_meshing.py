@@ -1321,6 +1321,8 @@ class TestGridFIT3DMeshing:
             verbose=0,
         )
 
+        solver._build_conformal_effective_lengths()
+
         fractions = solver.conformal_line_data["primal"]["x"][
             "effective_length_fraction"
         ][:, 0, 0]
@@ -1376,6 +1378,1265 @@ class TestGridFIT3DMeshing:
                 ]
             ),
         )
+
+        expected_fraction = np.array(
+            [
+                1.0,
+                0.25,
+                0.60,
+                0.75,
+            ]
+        )
+
+        np.testing.assert_allclose(
+            solver.L_fraction.to_matrix("x")[
+                :,
+                0,
+                0,
+            ],
+            expected_fraction,
+        )
+
+        np.testing.assert_allclose(
+            solver.tL_fraction.to_matrix("x")[
+                :,
+                0,
+                0,
+            ],
+            expected_fraction,
+        )
+
+        np.testing.assert_allclose(
+            solver.L_eff.to_matrix("x")[
+                :,
+                0,
+                0,
+            ],
+            solver.L.to_matrix("x")[
+                :,
+                0,
+                0,
+            ]
+            * expected_fraction,
+        )
+
+        np.testing.assert_allclose(
+            solver.tL_eff.to_matrix("x")[
+                :,
+                0,
+                0,
+            ],
+            solver.tL.to_matrix("x")[
+                :,
+                0,
+                0,
+            ]
+            * expected_fraction,
+        )
+
+    def test_edge_array_to_field_component(self):
+        grid = GridFIT3D(
+            0.0,
+            2.0,
+            0.0,
+            3.0,
+            0.0,
+            4.0,
+            2,
+            3,
+            4,
+            verbose=0,
+        )
+
+        solver = SolverFIT3D(
+            grid,
+            use_stl=False,
+            verbose=0,
+        )
+
+        x_edges = np.arange(2 * 4 * 5).reshape(2, 4, 5)
+
+        y_edges = np.arange(3 * 3 * 5).reshape(3, 3, 5)
+
+        z_edges = np.arange(3 * 4 * 4).reshape(3, 4, 4)
+
+        np.testing.assert_array_equal(
+            solver._edge_array_to_field_component(
+                x_edges,
+                "x",
+            ),
+            x_edges[:, :-1, :-1],
+        )
+
+        np.testing.assert_array_equal(
+            solver._edge_array_to_field_component(
+                y_edges,
+                "y",
+            ),
+            y_edges[:-1, :, :-1],
+        )
+
+        np.testing.assert_array_equal(
+            solver._edge_array_to_field_component(
+                z_edges,
+                "z",
+            ),
+            z_edges[:-1, :-1, :],
+        )
+
+    def test_face_candidate_masks(self):
+        grid = GridFIT3D(
+            0.0,
+            2.0,
+            0.0,
+            2.0,
+            0.0,
+            2.0,
+            2,
+            2,
+            2,
+            geometry_mode="conformal",
+            verbose=0,
+        )
+
+        edge_shapes = {
+            "x": (2, 3, 3),
+            "y": (3, 2, 3),
+            "z": (3, 3, 2),
+        }
+
+        face_shapes = {
+            "x": (3, 2, 2),
+            "y": (2, 3, 2),
+            "z": (2, 2, 3),
+        }
+
+        cases = [
+            (
+                "x",
+                (0, 1, 1),
+                {
+                    "y": [
+                        (0, 1, 0),
+                        (0, 1, 1),
+                    ],
+                    "z": [
+                        (0, 0, 1),
+                        (0, 1, 1),
+                    ],
+                },
+            ),
+            (
+                "y",
+                (1, 0, 1),
+                {
+                    "x": [
+                        (1, 0, 0),
+                        (1, 0, 1),
+                    ],
+                    "z": [
+                        (0, 0, 1),
+                        (1, 0, 1),
+                    ],
+                },
+            ),
+            (
+                "z",
+                (1, 1, 0),
+                {
+                    "x": [
+                        (1, 0, 0),
+                        (1, 1, 0),
+                    ],
+                    "y": [
+                        (0, 1, 0),
+                        (1, 1, 0),
+                    ],
+                },
+            ),
+        ]
+
+        for (
+            edge_direction,
+            edge_index,
+            expected_faces,
+        ) in cases:
+            grid.resolved_interface_edge_masks = {
+                "primal": {
+                    direction: np.zeros(
+                        edge_shapes[direction],
+                        dtype=bool,
+                    )
+                    for direction in (
+                        "x",
+                        "y",
+                        "z",
+                    )
+                },
+                "dual": {
+                    direction: np.zeros(
+                        edge_shapes[direction],
+                        dtype=bool,
+                    )
+                    for direction in (
+                        "x",
+                        "y",
+                        "z",
+                    )
+                },
+            }
+
+            for grid_type in (
+                "primal",
+                "dual",
+            ):
+                grid.resolved_interface_edge_masks[grid_type][edge_direction][
+                    edge_index
+                ] = True
+
+            grid._build_face_candidate_masks()
+
+            for grid_type in (
+                "primal",
+                "dual",
+            ):
+                for face_direction in (
+                    "x",
+                    "y",
+                    "z",
+                ):
+                    expected = np.zeros(
+                        face_shapes[face_direction],
+                        dtype=bool,
+                    )
+
+                    for index in expected_faces.get(
+                        face_direction,
+                        [],
+                    ):
+                        expected[index] = True
+
+                    np.testing.assert_array_equal(
+                        grid.face_candidate_masks[grid_type][face_direction],
+                        expected,
+                    )
+
+    def test_face_boundary_intersections(self):
+        grid = GridFIT3D(
+            0.0,
+            2.0,
+            0.0,
+            2.0,
+            0.0,
+            2.0,
+            2,
+            2,
+            2,
+            geometry_mode="conformal",
+            verbose=0,
+        )
+
+        point_shape = (
+            3,
+            3,
+            3,
+        )
+
+        grid.region_ids = {
+            "primal": np.zeros(
+                point_shape,
+                dtype=np.int32,
+            ),
+            "dual": np.zeros(
+                point_shape,
+                dtype=np.int32,
+            ),
+        }
+
+        edge_shapes = {
+            "x": (
+                2,
+                3,
+                3,
+            ),
+            "y": (
+                3,
+                2,
+                3,
+            ),
+            "z": (
+                3,
+                3,
+                2,
+            ),
+        }
+
+        grid.resolved_interface_edge_masks = {
+            "primal": {},
+            "dual": {},
+        }
+
+        grid.interface_intersections = {
+            "primal": {},
+            "dual": {},
+        }
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                shape = edge_shapes[direction]
+
+                grid.resolved_interface_edge_masks[grid_type][direction] = np.zeros(
+                    shape,
+                    dtype=bool,
+                )
+
+                grid.interface_intersections[grid_type][direction] = {
+                    "alpha": np.full(
+                        shape,
+                        np.nan,
+                    ),
+                    "surface_id": np.full(
+                        shape,
+                        -1,
+                        dtype=np.int32,
+                    ),
+                    "cell_id": np.full(
+                        shape,
+                        -1,
+                        dtype=np.int64,
+                    ),
+                    "normal": np.full(
+                        shape + (3,),
+                        np.nan,
+                    ),
+                    "multiple_crossing_positions": (
+                        np.zeros(
+                            shape,
+                            dtype=bool,
+                        )
+                    ),
+                }
+
+        # --------------------------------------------------
+        # z-normal primal face:
+        #
+        #     y
+        #     ^
+        #     |
+        #   P1---------+
+        #    \         |
+        #     \        |
+        #      \       |
+        #       +------P0 --> x
+        #
+        # P0 lies exactly on a corner and therefore appears
+        # on two boundary edges.
+        # --------------------------------------------------
+
+        face_index = (
+            0,
+            0,
+            1,
+        )
+
+        # Bottom x-edge:
+        # alpha = 1 -> P0 = (1, 0, 1)
+        edge = (
+            0,
+            0,
+            1,
+        )
+
+        grid.resolved_interface_edge_masks["primal"]["x"][edge] = True
+
+        grid.interface_intersections["primal"]["x"]["alpha"][edge] = 1.0
+
+        grid.interface_intersections["primal"]["x"]["surface_id"][edge] = 1
+
+        grid.interface_intersections["primal"]["x"]["cell_id"][edge] = 10
+
+        grid.interface_intersections["primal"]["x"]["normal"][edge] = [
+            1.0,
+            1.0,
+            0.0,
+        ]
+
+        # Right y-edge:
+        # alpha = 0 -> same P0
+        edge = (
+            1,
+            0,
+            1,
+        )
+
+        grid.resolved_interface_edge_masks["primal"]["y"][edge] = True
+
+        grid.interface_intersections["primal"]["y"]["alpha"][edge] = 0.0
+
+        grid.interface_intersections["primal"]["y"]["surface_id"][edge] = 1
+
+        grid.interface_intersections["primal"]["y"]["cell_id"][edge] = 11
+
+        grid.interface_intersections["primal"]["y"]["normal"][edge] = [
+            1.0,
+            1.0,
+            0.0,
+        ]
+
+        # Top x-edge:
+        # alpha = 0.5 -> P1 = (0.5, 1, 1)
+        edge = (
+            0,
+            1,
+            1,
+        )
+
+        grid.resolved_interface_edge_masks["primal"]["x"][edge] = True
+
+        grid.interface_intersections["primal"]["x"]["alpha"][edge] = 0.5
+
+        grid.interface_intersections["primal"]["x"]["surface_id"][edge] = 1
+
+        grid.interface_intersections["primal"]["x"]["cell_id"][edge] = 12
+
+        grid.interface_intersections["primal"]["x"]["normal"][edge] = [
+            1.0,
+            1.0,
+            0.0,
+        ]
+
+        intersections = grid._get_face_boundary_intersections(
+            "primal",
+            "z",
+            face_index,
+        )
+
+        # Three raw edge hits, but only two unique
+        # geometric intersection points.
+        assert len(intersections) == 2
+
+        np.testing.assert_allclose(
+            intersections[0]["point"],
+            [
+                1.0,
+                0.0,
+                1.0,
+            ],
+        )
+
+        np.testing.assert_allclose(
+            intersections[1]["point"],
+            [
+                0.5,
+                1.0,
+                1.0,
+            ],
+        )
+
+        assert len(intersections[0]["hits"]) == 2
+
+        assert len(intersections[1]["hits"]) == 1
+
+        boundary_edges = grid._get_face_boundary_edges(
+            "primal",
+            "z",
+            face_index,
+        )
+
+        assert [edge["boundary_sign"] for edge in boundary_edges] == [
+            1,
+            1,
+            -1,
+            -1,
+        ]
+
+    def test_face_intersection_segment(self):
+        grid = GridFIT3D(
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            1,
+            1,
+            1,
+            geometry_mode="conformal",
+            verbose=0,
+        )
+
+        shape = (
+            2,
+            2,
+            2,
+        )
+
+        grid.region_ids = {
+            "primal": np.zeros(
+                shape,
+                dtype=np.int32,
+            ),
+            "dual": np.zeros(
+                shape,
+                dtype=np.int32,
+            ),
+        }
+
+        edge_shapes = {
+            "x": (1, 2, 2),
+            "y": (2, 1, 2),
+            "z": (2, 2, 1),
+        }
+
+        grid.resolved_interface_edge_masks = {
+            "primal": {},
+            "dual": {},
+        }
+
+        grid.interface_intersections = {
+            "primal": {},
+            "dual": {},
+        }
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                edge_shape = edge_shapes[direction]
+
+                grid.resolved_interface_edge_masks[grid_type][direction] = np.zeros(
+                    edge_shape,
+                    dtype=bool,
+                )
+
+                grid.interface_intersections[grid_type][direction] = {
+                    "alpha": np.full(
+                        edge_shape,
+                        np.nan,
+                    ),
+                    "surface_id": np.full(
+                        edge_shape,
+                        -1,
+                        dtype=np.int32,
+                    ),
+                    "cell_id": np.full(
+                        edge_shape,
+                        -1,
+                        dtype=np.int64,
+                    ),
+                    "normal": np.full(
+                        edge_shape + (3,),
+                        np.nan,
+                    ),
+                    "multiple_crossing_positions": np.zeros(
+                        edge_shape,
+                        dtype=bool,
+                    ),
+                }
+
+        # z-normal xy face at z = 0.
+        #
+        # Interface:
+        #
+        # y
+        # ^
+        # |      P1
+        # |------x
+        # |     /
+        # |    /
+        # x---+------> x
+        # P0
+        #
+        # P0 = (0, 0.25, 0)
+        # P1 = (1, 0.75, 0)
+
+        y_edge_left = (
+            0,
+            0,
+            0,
+        )
+
+        y_edge_right = (
+            1,
+            0,
+            0,
+        )
+
+        for edge, alpha in (
+            (
+                y_edge_left,
+                0.25,
+            ),
+            (
+                y_edge_right,
+                0.75,
+            ),
+        ):
+            grid.resolved_interface_edge_masks["primal"]["y"][edge] = True
+
+            grid.interface_intersections["primal"]["y"]["alpha"][edge] = alpha
+
+            grid.interface_intersections["primal"]["y"]["surface_id"][edge] = 1
+
+            grid.interface_intersections["primal"]["y"]["cell_id"][edge] = 0
+
+            grid.interface_intersections["primal"]["y"]["normal"][edge] = [
+                -0.5,
+                1.0,
+                0.0,
+            ]
+
+        segment = grid._get_face_intersection_segment(
+            "primal",
+            "z",
+            (
+                0,
+                0,
+                0,
+            ),
+        )
+
+        assert segment["resolved"]
+
+        np.testing.assert_allclose(
+            segment["p0"],
+            [
+                1.0,
+                0.75,
+                0.0,
+            ],
+        )
+
+        np.testing.assert_allclose(
+            segment["p1"],
+            [
+                0.0,
+                0.25,
+                0.0,
+            ],
+        )
+
+        expected_vector = np.array(
+            [
+                -1.0,
+                -0.5,
+                0.0,
+            ]
+        )
+
+        np.testing.assert_allclose(
+            segment["vector"],
+            expected_vector,
+        )
+
+        expected_length = np.sqrt(1.0 + 0.25)
+
+        assert segment["length"] == pytest.approx(expected_length)
+
+        np.testing.assert_allclose(
+            segment["tangent"],
+            expected_vector / expected_length,
+        )
+
+        assert segment["surface_id"] == 1
+
+        np.testing.assert_allclose(
+            np.linalg.norm(segment["normal"]),
+            1.0,
+        )
+
+    def test_split_face_by_interface(self):
+        grid = GridFIT3D(
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            1,
+            1,
+            1,
+            geometry_mode="conformal",
+            verbose=0,
+        )
+
+        regions = np.zeros(
+            (
+                2,
+                2,
+                2,
+            ),
+            dtype=np.int32,
+        )
+
+        # Lower y-side -> region 0
+        # Upper y-side -> region 1
+        regions[:, 1, :] = 1
+
+        grid.region_ids = {
+            "primal": regions.copy(),
+            "dual": regions.copy(),
+        }
+
+        edge_shapes = {
+            "x": (1, 2, 2),
+            "y": (2, 1, 2),
+            "z": (2, 2, 1),
+        }
+
+        grid.resolved_interface_edge_masks = {
+            "primal": {},
+            "dual": {},
+        }
+
+        grid.interface_intersections = {
+            "primal": {},
+            "dual": {},
+        }
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                shape = edge_shapes[direction]
+
+                grid.resolved_interface_edge_masks[grid_type][direction] = np.zeros(
+                    shape,
+                    dtype=bool,
+                )
+
+                grid.interface_intersections[grid_type][direction] = {
+                    "alpha": np.full(
+                        shape,
+                        np.nan,
+                    ),
+                    "surface_id": np.full(
+                        shape,
+                        -1,
+                        dtype=np.int32,
+                    ),
+                    "cell_id": np.full(
+                        shape,
+                        -1,
+                        dtype=np.int64,
+                    ),
+                    "normal": np.full(
+                        shape + (3,),
+                        np.nan,
+                    ),
+                    "multiple_crossing_positions": np.zeros(
+                        shape,
+                        dtype=bool,
+                    ),
+                }
+
+        # Left y-edge:
+        # (0, 0.2, 0)
+        left_edge = (
+            0,
+            0,
+            0,
+        )
+
+        # Right y-edge:
+        # (1, 0.6, 0)
+        right_edge = (
+            1,
+            0,
+            0,
+        )
+
+        for edge, alpha in (
+            (
+                left_edge,
+                0.2,
+            ),
+            (
+                right_edge,
+                0.6,
+            ),
+        ):
+            grid.resolved_interface_edge_masks["primal"]["y"][edge] = True
+
+            grid.interface_intersections["primal"]["y"]["alpha"][edge] = alpha
+
+            grid.interface_intersections["primal"]["y"]["surface_id"][edge] = 1
+
+            grid.interface_intersections["primal"]["y"]["cell_id"][edge] = 0
+
+            grid.interface_intersections["primal"]["y"]["normal"][edge] = [
+                -0.4,
+                1.0,
+                0.0,
+            ]
+
+        split = grid._split_face_by_interface(
+            "primal",
+            "z",
+            (
+                0,
+                0,
+                0,
+            ),
+        )
+
+        assert split["resolved"]
+
+        assert split["face_area"] == pytest.approx(1.0)
+
+        polygons = {polygon["region_id"]: polygon for polygon in split["polygons"]}
+
+        assert set(polygons.keys()) == {
+            0,
+            1,
+        }
+
+        # Lower region
+        assert polygons[0]["area"] == pytest.approx(0.4)
+
+        assert polygons[0]["area_fraction"] == pytest.approx(0.4)
+
+        # Upper region
+        assert polygons[1]["area"] == pytest.approx(0.6)
+
+        assert polygons[1]["area_fraction"] == pytest.approx(0.6)
+
+        assert sum(polygon["area"] for polygon in split["polygons"]) == pytest.approx(
+            1.0
+        )
+
+        np.testing.assert_allclose(
+            polygons[0]["cut_vector"],
+            -polygons[1]["cut_vector"],
+        )
+
+        assert polygons[0]["cut_length"] == pytest.approx(polygons[1]["cut_length"])
+
+        grid._build_face_candidate_masks()
+        grid._build_interface_face_data()
+
+        face_data = grid.interface_face_data["primal"]["z"]
+
+        index = (
+            0,
+            0,
+            0,
+        )
+
+        assert face_data["candidate"][index]
+
+        assert face_data["segment_resolved"][index]
+
+        assert face_data["resolved"][index]
+
+        assert face_data["face_area"][index] == pytest.approx(1.0)
+
+        assert face_data["region_areas"][index][0] == pytest.approx(0.4)
+
+        assert face_data["region_areas"][index][1] == pytest.approx(0.6)
+
+        assert face_data["region_area_fractions"][index][0] == pytest.approx(0.4)
+
+        assert face_data["region_area_fractions"][index][1] == pytest.approx(0.6)
+
+        segment = face_data["segments"][index]
+
+        assert segment["length"] > 0.0
+
+        assert len(face_data["polygons"][index]) == 2
+
+        # No dual intersections were inserted into
+        # this synthetic test.
+        for direction in (
+            "x",
+            "y",
+            "z",
+        ):
+            assert not np.any(grid.interface_face_data["dual"][direction]["resolved"])
+
+    def test_face_array_to_field_component(
+        self,
+    ):
+        grid = GridFIT3D(
+            0.0,
+            2.0,
+            0.0,
+            3.0,
+            0.0,
+            4.0,
+            2,
+            3,
+            4,
+            verbose=0,
+        )
+
+        solver = SolverFIT3D(
+            grid,
+            use_stl=False,
+            verbose=0,
+        )
+
+        x_faces = np.arange(3 * 3 * 4).reshape(
+            3,
+            3,
+            4,
+        )
+
+        y_faces = np.arange(2 * 4 * 4).reshape(
+            2,
+            4,
+            4,
+        )
+
+        z_faces = np.arange(2 * 3 * 5).reshape(
+            2,
+            3,
+            5,
+        )
+
+        np.testing.assert_array_equal(
+            solver._face_array_to_field_component(
+                x_faces,
+                "x",
+            ),
+            x_faces[:-1, :, :],
+        )
+
+        np.testing.assert_array_equal(
+            solver._face_array_to_field_component(
+                y_faces,
+                "y",
+            ),
+            y_faces[:, :-1, :],
+        )
+
+        np.testing.assert_array_equal(
+            solver._face_array_to_field_component(
+                z_faces,
+                "z",
+            ),
+            z_faces[:, :, :-1],
+        )
+
+    def test_conformal_face_fractions(self):
+        grid = GridFIT3D(
+            0.0,
+            3.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            3,
+            1,
+            1,
+            geometry_mode="conformal",
+            verbose=0,
+        )
+
+        # --------------------------------------------------
+        # Region definitions
+        #
+        # 0: background normal
+        # 1: STL normal
+        # 2: PEC
+        # --------------------------------------------------
+        grid.region_id_to_key = {
+            0: None,
+            1: "normal",
+            2: "pec",
+        }
+
+        grid.region_key_to_id = {
+            "normal": 1,
+            "pec": 2,
+        }
+
+        grid.stl_material_types = {
+            "normal": "normal",
+            "pec": "pec",
+        }
+
+        grid.stl_materials = {
+            "normal": [
+                4.0,  # eps_r
+                5.0,  # mu_r
+                8.0,  # sigma
+            ],
+            "pec": [
+                np.inf,
+                1.0,
+                0.0,
+            ],
+        }
+
+        # Region IDs only need to exist for Solver initialization.
+        point_shape = (
+            4,
+            2,
+            2,
+        )
+
+        grid.region_ids = {
+            "primal": np.zeros(
+                point_shape,
+                dtype=np.int32,
+            ),
+            "dual": np.zeros(
+                point_shape,
+                dtype=np.int32,
+            ),
+        }
+
+        grid.interface_edge_masks = {
+            "primal": grid._build_edge_transition_masks(grid.region_ids["primal"]),
+            "dual": grid._build_edge_transition_masks(grid.region_ids["dual"]),
+        }
+
+        # --------------------------------------------------
+        # Full face-array shapes
+        # --------------------------------------------------
+        face_shapes = {
+            "x": (
+                4,
+                1,
+                1,
+            ),
+            "y": (
+                3,
+                2,
+                1,
+            ),
+            "z": (
+                3,
+                1,
+                2,
+            ),
+        }
+
+        grid.interface_face_data = {
+            "primal": {},
+            "dual": {},
+        }
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                shape = face_shapes[direction]
+
+                grid.interface_face_data[grid_type][direction] = {
+                    "resolved": np.zeros(
+                        shape,
+                        dtype=bool,
+                    ),
+                    "region_area_fractions": {},
+                }
+
+        # --------------------------------------------------
+        # Three z-normal faces on the low-z plane
+        # --------------------------------------------------
+        face_nn = (
+            0,
+            0,
+            0,
+        )
+
+        face_normal_pec = (
+            1,
+            0,
+            0,
+        )
+
+        face_pec_normal = (
+            2,
+            0,
+            0,
+        )
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            data = grid.interface_face_data[grid_type]["z"]
+
+            # normal-normal
+            data["resolved"][face_nn] = True
+
+            data["region_area_fractions"][face_nn] = {
+                0: 0.4,
+                1: 0.6,
+            }
+
+            # normal-PEC
+            data["resolved"][face_normal_pec] = True
+
+            data["region_area_fractions"][face_normal_pec] = {
+                1: 0.25,
+                2: 0.75,
+            }
+
+            # PEC-normal:
+            # same physical area fractions, but deliberately
+            # reversed region ordering.
+            data["resolved"][face_pec_normal] = True
+
+            data["region_area_fractions"][face_pec_normal] = {
+                2: 0.75,
+                1: 0.25,
+            }
+
+        solver = SolverFIT3D(
+            grid,
+            bg=[
+                2.0,
+                3.0,
+                4.0,
+            ],
+            bg_material_type="normal",
+            use_stl=False,
+            verbose=0,
+        )
+
+        # use_stl=False intentionally prevents automatic application.
+        solver._build_conformal_face_data()
+        solver._build_conformal_face_materials()
+        solver._build_conformal_effective_areas()
+
+        # --------------------------------------------------
+        # Check classification
+        # --------------------------------------------------
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            data = solver.conformal_face_data[grid_type]["z"]
+
+            assert data["normal_normal"][face_nn]
+
+            assert not data["normal_pec"][face_nn]
+
+            assert data["normal_pec"][face_normal_pec]
+
+            assert data["normal_pec"][face_pec_normal]
+
+            assert data["supported"][face_nn]
+
+            assert data["supported"][face_normal_pec]
+
+            assert data["supported"][face_pec_normal]
+
+            assert data["effective_area_fraction"][face_nn] == pytest.approx(1.0)
+
+            assert data["effective_area_fraction"][face_normal_pec] == pytest.approx(
+                0.25
+            )
+
+            assert data["effective_area_fraction"][face_pec_normal] == pytest.approx(
+                0.25
+            )
+
+        # --------------------------------------------------
+        # Check mapped Field fractions
+        #
+        # z-face Field stores the low-side z faces, therefore
+        # these three entries are directly represented.
+        # --------------------------------------------------
+        np.testing.assert_allclose(
+            solver.A_fraction.to_matrix("z")[:, 0, 0],
+            [
+                1.0,
+                0.25,
+                0.25,
+            ],
+        )
+
+        np.testing.assert_allclose(
+            solver.tA_fraction.to_matrix("z")[:, 0, 0],
+            [
+                1.0,
+                0.25,
+                0.25,
+            ],
+        )
+
+        # --------------------------------------------------
+        # Effective areas must be base area * fraction.
+        # Do not assume primal and dual base areas are equal.
+        # --------------------------------------------------
+        primal_base_area = np.divide(
+            1.0,
+            solver.iA.to_matrix("z")[:, 0, 0],
+        )
+
+        dual_base_area = np.divide(
+            1.0,
+            solver.itA.to_matrix("z")[:, 0, 0],
+        )
+
+        expected_fraction = np.array(
+            [
+                1.0,
+                0.25,
+                0.25,
+            ]
+        )
+
+        np.testing.assert_allclose(
+            solver.A_eff.to_matrix("z")[:, 0, 0],
+            primal_base_area * expected_fraction,
+        )
+
+        np.testing.assert_allclose(
+            solver.tA_eff.to_matrix("z")[:, 0, 0],
+            dual_base_area * expected_fraction,
+        )
+
+        primal_materials = solver.conformal_face_materials["primal"]["z"]
+
+        dual_materials = solver.conformal_face_materials["dual"]["z"]
+
+        # normal-normal
+        assert primal_materials["mu_r"][face_nn] == pytest.approx(4.2)
+
+        assert dual_materials["eps_r"][face_nn] == pytest.approx(3.2)
+
+        assert dual_materials["sigma"][face_nn] == pytest.approx(6.4)
+
+        # normal-PEC
+        assert primal_materials["mu_r"][face_normal_pec] == pytest.approx(5.0)
+
+        assert dual_materials["eps_r"][face_normal_pec] == pytest.approx(4.0)
+
+        assert dual_materials["sigma"][face_normal_pec] == pytest.approx(8.0)
+
+        # PEC-normal: must give exactly the same material values.
+        assert primal_materials["mu_r"][face_pec_normal] == pytest.approx(5.0)
+
+        assert dual_materials["eps_r"][face_pec_normal] == pytest.approx(4.0)
+
+        assert dual_materials["sigma"][face_pec_normal] == pytest.approx(8.0)
 
     def test_primal_and_dual_interface_intersections(
         self,

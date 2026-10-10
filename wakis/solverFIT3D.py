@@ -196,6 +196,16 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             "dual": {},
         }
 
+        self.conformal_face_data = {
+            "primal": {},
+            "dual": {},
+        }
+
+        self.conformal_face_materials = {
+            "primal": {},
+            "dual": {},
+        }
+
         if (
             getattr(self.grid, "geometry_mode", "legacy") == "conformal"
             and getattr(self.grid, "region_ids", {}).get("primal") is not None
@@ -258,6 +268,41 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         self.iA = self.grid.iA
         self.tL = self.grid.tL
         self.itA = self.grid.itA
+
+        self.L_fraction = None
+        self.tL_fraction = None
+        self.L_eff = None
+        self.tL_eff = None
+
+        self.A_fraction = None
+        self.tA_fraction = None
+        self.A_eff = None
+        self.tA_eff = None
+
+        if (
+            use_stl
+            and self.conformal_line_data["primal"]
+            and self.conformal_line_data["dual"]
+        ):
+            self._build_conformal_effective_lengths()
+
+        if (
+            use_stl
+            and getattr(
+                self.grid,
+                "interface_face_data",
+                {},
+            ).get("primal")
+            and getattr(
+                self.grid,
+                "interface_face_data",
+                {},
+            ).get("dual")
+        ):
+            self._build_conformal_face_data()
+            self._build_conformal_face_materials()
+            self._build_conformal_effective_areas()
+
         self.update_logger(["grid", "background", "bg_material_type"])
 
         # Wake computation
@@ -818,6 +863,279 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
                     "effective_length_fraction": (effective_length_fraction),
                 }
 
+    def _build_conformal_face_data(self):
+        """
+        Interpret geometric interface-face data in terms of material types.
+
+        The grid provides geometric region-area fractions. This method
+        determines which portions belong to volumetric normal materials.
+
+        No FIT operators are modified here.
+        """
+        if not self.region_material_types:
+            self._build_region_material_types()
+
+        self.conformal_face_data = {
+            "primal": {},
+            "dual": {},
+        }
+
+        conductor_types = {
+            "pec",
+            "sibc",
+        }
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                geometry = self.grid.interface_face_data[grid_type][direction]
+
+                resolved = np.asarray(
+                    geometry["resolved"],
+                    dtype=bool,
+                )
+
+                supported = np.zeros_like(
+                    resolved,
+                    dtype=bool,
+                )
+
+                normal_normal = np.zeros_like(
+                    resolved,
+                    dtype=bool,
+                )
+
+                normal_pec = np.zeros_like(
+                    resolved,
+                    dtype=bool,
+                )
+
+                normal_sibc = np.zeros_like(
+                    resolved,
+                    dtype=bool,
+                )
+
+                effective_area_fraction = np.full(
+                    resolved.shape,
+                    np.nan,
+                    dtype=float,
+                )
+
+                normal_region_ids = {}
+                conductor_region_ids = {}
+
+                for index, fractions in geometry["region_area_fractions"].items():
+                    if not resolved[index]:
+                        continue
+
+                    region_ids = list(fractions.keys())
+
+                    if len(region_ids) != 2:
+                        continue
+
+                    normal_regions = []
+                    conductor_regions = []
+
+                    for region_id in region_ids:
+                        material_type = self.region_material_types[int(region_id)]
+
+                        if material_type == "normal":
+                            normal_regions.append(int(region_id))
+
+                        elif material_type in conductor_types:
+                            conductor_regions.append(int(region_id))
+
+                    # ----------------------------------------------
+                    # normal <-> normal
+                    #
+                    # Entire geometrical face remains active.
+                    # ----------------------------------------------
+                    if len(normal_regions) == 2:
+                        supported[index] = True
+                        normal_normal[index] = True
+
+                        effective_area_fraction[index] = 1.0
+
+                        normal_region_ids[index] = tuple(normal_regions)
+
+                        continue
+
+                    # ----------------------------------------------
+                    # normal <-> PEC/SIBC
+                    #
+                    # Only the normal portion remains volumetrically
+                    # active.
+                    # ----------------------------------------------
+                    if len(normal_regions) == 1 and len(conductor_regions) == 1:
+                        normal_region = normal_regions[0]
+
+                        conductor_region = conductor_regions[0]
+
+                        supported[index] = True
+
+                        effective_area_fraction[index] = float(fractions[normal_region])
+
+                        normal_region_ids[index] = (normal_region,)
+
+                        conductor_region_ids[index] = (conductor_region,)
+
+                        conductor_type = self.region_material_types[conductor_region]
+
+                        if conductor_type == "pec":
+                            normal_pec[index] = True
+
+                        elif conductor_type == "sibc":
+                            normal_sibc[index] = True
+
+                self.conformal_face_data[grid_type][direction] = {
+                    "resolved": resolved.copy(),
+                    "supported": supported,
+                    "normal_normal": (normal_normal),
+                    "normal_pec": normal_pec,
+                    "normal_sibc": normal_sibc,
+                    "effective_area_fraction": (effective_area_fraction),
+                    "normal_region_ids": (normal_region_ids),
+                    "conductor_region_ids": (conductor_region_ids),
+                }
+
+    def _build_conformal_face_materials(self):
+        """
+        Build effective material properties on resolved conformal faces.
+
+        Material properties are averaged only over the active normal
+        portion of each face. Geometric area reduction is handled
+        separately through A_eff / tA_eff.
+
+        Primal faces:
+            mu_r
+
+        Dual faces:
+            eps_r, sigma
+        """
+        self.conformal_face_materials = {
+            "primal": {},
+            "dual": {},
+        }
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                face_data = self.conformal_face_data[grid_type][direction]
+
+                geometry = self.grid.interface_face_data[grid_type][direction]
+
+                supported = face_data["supported"]
+
+                shape = supported.shape
+
+                if grid_type == "primal":
+                    mu_r_eff = np.full(
+                        shape,
+                        np.nan,
+                        dtype=float,
+                    )
+
+                else:
+                    eps_r_eff = np.full(
+                        shape,
+                        np.nan,
+                        dtype=float,
+                    )
+
+                    sigma_eff = np.full(
+                        shape,
+                        np.nan,
+                        dtype=float,
+                    )
+
+                for index_array in np.argwhere(supported):
+                    index = tuple(int(value) for value in index_array)
+
+                    fractions = geometry["region_area_fractions"][index]
+
+                    normal_regions = face_data["normal_region_ids"][index]
+
+                    normal_fraction = sum(
+                        float(fractions[region_id]) for region_id in normal_regions
+                    )
+
+                    if normal_fraction <= 0.0:
+                        raise RuntimeError(
+                            f"Supported {grid_type} "
+                            f"{direction}-face {index} "
+                            "has no positive normal-material area."
+                        )
+
+                    expected_fraction = float(
+                        face_data["effective_area_fraction"][index]
+                    )
+
+                    if not np.isclose(
+                        normal_fraction,
+                        expected_fraction,
+                        rtol=1e-10,
+                        atol=1e-12,
+                    ):
+                        raise RuntimeError(
+                            f"Inconsistent active area fraction on "
+                            f"{grid_type} {direction}-face "
+                            f"{index}: geometry gives "
+                            f"{normal_fraction}, face data gives "
+                            f"{expected_fraction}."
+                        )
+
+                    if grid_type == "primal":
+                        value = 0.0
+
+                        for region_id in normal_regions:
+                            weight = float(fractions[region_id]) / normal_fraction
+
+                            material = self._get_region_material_properties(region_id)
+
+                            value += weight * material[1]
+
+                        mu_r_eff[index] = value
+
+                    else:
+                        eps_value = 0.0
+                        sigma_value = 0.0
+
+                        for region_id in normal_regions:
+                            weight = float(fractions[region_id]) / normal_fraction
+
+                            material = self._get_region_material_properties(region_id)
+
+                            eps_value += weight * material[0]
+
+                            sigma_value += weight * material[2]
+
+                        eps_r_eff[index] = eps_value
+
+                        sigma_eff[index] = sigma_value
+
+                if grid_type == "primal":
+                    self.conformal_face_materials[grid_type][direction] = {
+                        "mu_r": mu_r_eff,
+                    }
+
+                else:
+                    self.conformal_face_materials[grid_type][direction] = {
+                        "eps_r": eps_r_eff,
+                        "sigma": sigma_eff,
+                    }
+
     def _get_region_material_properties(self, region_id):
         """
         Return [eps_r, mu_r, sigma] for one geometry region.
@@ -1042,6 +1360,324 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
                     self.conformal_line_materials[grid_type][direction] = {
                         "mu_r": mu_r_eff,
                     }
+
+    def _edge_array_to_field_component(
+        self,
+        edge_values,
+        direction,
+    ):
+        """
+        Map a full primal/dual edge array to the edge DOFs stored by Field.
+
+        The full edge arrays include high-side boundary edges, whereas the
+        solver stores Nx * Ny * Nz DOFs per component. Low-side boundary
+        DOFs are included; high-side boundary DOFs are not.
+        """
+        edge_values = np.asarray(edge_values)
+
+        expected_shapes = {
+            "x": (
+                self.Nx,
+                self.Ny + 1,
+                self.Nz + 1,
+            ),
+            "y": (
+                self.Nx + 1,
+                self.Ny,
+                self.Nz + 1,
+            ),
+            "z": (
+                self.Nx + 1,
+                self.Ny + 1,
+                self.Nz,
+            ),
+        }
+
+        if direction not in expected_shapes:
+            raise ValueError(f"Unknown edge direction '{direction}'.")
+
+        if edge_values.shape != expected_shapes[direction]:
+            raise ValueError(
+                f"Expected {direction}-edge array shape "
+                f"{expected_shapes[direction]}, "
+                f"got {edge_values.shape}."
+            )
+
+        if direction == "x":
+            return edge_values[
+                :,
+                : self.Ny,
+                : self.Nz,
+            ]
+
+        if direction == "y":
+            return edge_values[
+                : self.Nx,
+                :,
+                : self.Nz,
+            ]
+
+        return edge_values[
+            : self.Nx,
+            : self.Ny,
+            :,
+        ]
+
+    def _face_array_to_field_component(
+        self,
+        face_values,
+        direction,
+    ):
+        """
+        Map a full grid-face array to the face DOFs stored in Field.
+
+        Full face-array shapes are:
+            x: (Nx + 1, Ny, Nz)
+            y: (Nx, Ny + 1, Nz)
+            z: (Nx, Ny, Nz + 1)
+
+        Field stores Nx * Ny * Nz values for every component and
+        therefore contains the low-side faces.
+        """
+        face_values = np.asarray(face_values)
+
+        expected_shapes = {
+            "x": (
+                self.Nx + 1,
+                self.Ny,
+                self.Nz,
+            ),
+            "y": (
+                self.Nx,
+                self.Ny + 1,
+                self.Nz,
+            ),
+            "z": (
+                self.Nx,
+                self.Ny,
+                self.Nz + 1,
+            ),
+        }
+
+        if direction not in expected_shapes:
+            raise ValueError(f"Unknown face direction '{direction}'.")
+
+        expected_shape = expected_shapes[direction]
+
+        if face_values.shape != expected_shape:
+            raise ValueError(
+                f"Expected {direction}-face array "
+                f"shape {expected_shape}, "
+                f"got {face_values.shape}."
+            )
+
+        if direction == "x":
+            return face_values[
+                : self.Nx,
+                :,
+                :,
+            ]
+
+        if direction == "y":
+            return face_values[
+                :,
+                : self.Ny,
+                :,
+            ]
+
+        return face_values[
+            :,
+            :,
+            : self.Nz,
+        ]
+
+    def _build_conformal_effective_lengths(self):
+        """
+        Build effective primal and dual edge lengths for the current
+        conformal single-crossing treatment.
+
+        Normal-normal edges retain their full length.
+
+        Normal-PEC/SIBC edges retain only the fraction of the edge in the
+        normal region.
+
+        Hidden, missing, and currently unsupported interface cases retain
+        their original grid length.
+
+        The original grid metrics self.L and self.tL are not modified.
+        """
+        self.L_fraction = Field(
+            self.Nx,
+            self.Ny,
+            self.Nz,
+        )
+
+        self.tL_fraction = Field(
+            self.Nx,
+            self.Ny,
+            self.Nz,
+        )
+
+        self.L_eff = Field(
+            self.Nx,
+            self.Ny,
+            self.Nz,
+        )
+
+        self.tL_eff = Field(
+            self.Nx,
+            self.Ny,
+            self.Nz,
+        )
+
+        for (
+            grid_type,
+            base_lengths,
+            fraction_field,
+            effective_lengths,
+        ) in (
+            (
+                "primal",
+                self.L,
+                self.L_fraction,
+                self.L_eff,
+            ),
+            (
+                "dual",
+                self.tL,
+                self.tL_fraction,
+                self.tL_eff,
+            ),
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                line_data = self.conformal_line_data[grid_type][direction]
+
+                full_fraction = np.ones(
+                    line_data["effective_length_fraction"].shape,
+                    dtype=float,
+                )
+
+                supported = line_data["supported"]
+
+                full_fraction[supported] = line_data["effective_length_fraction"][
+                    supported
+                ]
+
+                field_fraction = self._edge_array_to_field_component(
+                    full_fraction,
+                    direction,
+                )
+
+                base_component = base_lengths.to_matrix(direction)
+
+                setattr(
+                    fraction_field,
+                    f"field_{direction}",
+                    field_fraction.copy(),
+                )
+
+                setattr(
+                    effective_lengths,
+                    f"field_{direction}",
+                    (base_component * field_fraction),
+                )
+
+    def _build_conformal_effective_areas(self):
+        """
+        Build effective primal and dual face areas from conformal
+        interface-area fractions.
+
+        Original grid metrics self.iA and self.itA remain unchanged.
+        """
+        self.A_fraction = Field(
+            self.Nx,
+            self.Ny,
+            self.Nz,
+        )
+
+        self.tA_fraction = Field(
+            self.Nx,
+            self.Ny,
+            self.Nz,
+        )
+
+        self.A_eff = Field(
+            self.Nx,
+            self.Ny,
+            self.Nz,
+        )
+
+        self.tA_eff = Field(
+            self.Nx,
+            self.Ny,
+            self.Nz,
+        )
+
+        configurations = (
+            (
+                "primal",
+                self.A_fraction,
+                self.A_eff,
+                self.iA,
+            ),
+            (
+                "dual",
+                self.tA_fraction,
+                self.tA_eff,
+                self.itA,
+            ),
+        )
+
+        for (
+            grid_type,
+            fraction_field,
+            effective_area_field,
+            inverse_area_field,
+        ) in configurations:
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                data = self.conformal_face_data[grid_type][direction]
+
+                # Unsupported/unresolved faces retain their
+                # original area for now.
+                full_fraction = np.ones(
+                    data["supported"].shape,
+                    dtype=float,
+                )
+
+                supported = data["supported"]
+
+                full_fraction[supported] = data["effective_area_fraction"][supported]
+
+                field_fraction = self._face_array_to_field_component(
+                    full_fraction,
+                    direction,
+                )
+
+                # Grid stores inverse face areas.
+                base_area = np.divide(
+                    1.0,
+                    inverse_area_field.to_matrix(direction),
+                )
+
+                setattr(
+                    fraction_field,
+                    f"field_{direction}",
+                    field_fraction.copy(),
+                )
+
+                setattr(
+                    effective_area_field,
+                    f"field_{direction}",
+                    (base_area * field_fraction),
+                )
 
     def _move_CPML_to_mkl(self):
         self.dxy = mkl_sparse_mat(self.dxy)
