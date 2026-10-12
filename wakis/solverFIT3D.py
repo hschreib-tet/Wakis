@@ -206,6 +206,12 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             "dual": {},
         }
 
+        self.conformal_diagonal_materials = {
+            "eps_r": {},
+            "mu_r": {},
+            "sigma": {},
+        }
+
         if (
             getattr(self.grid, "geometry_mode", "legacy") == "conformal"
             and getattr(self.grid, "region_ids", {}).get("primal") is not None
@@ -303,6 +309,77 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             self._build_conformal_face_materials()
             self._build_conformal_effective_areas()
 
+            if (
+                self.conformal_line_materials["primal"]
+                and self.conformal_line_materials["dual"]
+            ):
+                self._build_conformal_diagonal_materials()
+
+        if (
+            use_stl
+            and getattr(
+                self.grid,
+                "geometry_mode",
+                "legacy",
+            )
+            == "conformal"
+            and self.L_eff is not None
+            and self.tL_eff is not None
+            and self.A_eff is not None
+            and self.tA_eff is not None
+        ):
+            # ----------------------------------------------------------
+            # Activate conformal geometry metrics.
+            #
+            # From this point on, self.L, self.tL, self.iA and self.itA
+            # represent the metrics actually used by the solver.
+            # ----------------------------------------------------------
+
+            self.L = Field(
+                self.Nx,
+                self.Ny,
+                self.Nz,
+            )
+
+            self.tL = Field(
+                self.Nx,
+                self.Ny,
+                self.Nz,
+            )
+
+            self.L.fromarray(self.L_eff.toarray().copy())
+
+            self.tL.fromarray(self.tL_eff.toarray().copy())
+
+            A_values = self.A_eff.toarray()
+            tA_values = self.tA_eff.toarray()
+
+            if np.any(A_values <= 0.0):
+                raise RuntimeError(
+                    "Conformal primal effective face area must be positive."
+                )
+
+            if np.any(tA_values <= 0.0):
+                raise RuntimeError(
+                    "Conformal dual effective face area must be positive."
+                )
+
+            self.iA = Field(
+                self.Nx,
+                self.Ny,
+                self.Nz,
+            )
+
+            self.itA = Field(
+                self.Nx,
+                self.Ny,
+                self.Nz,
+            )
+
+            self.iA.fromarray(1.0 / A_values)
+
+            self.itA.fromarray(1.0 / tA_values)
+
         self.update_logger(["grid", "background", "bg_material_type"])
 
         # Wake computation
@@ -346,12 +423,30 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         self.Pz = diags([-1, 1], [0, self.Nx * self.Ny], shape=(N, N), dtype=np.int8)
 
         # original grid
-        self.Ds = diags(self.L.toarray(), shape=(3 * N, 3 * N), dtype=self.dtype)
-        self.iDa = diags(self.iA.toarray(), shape=(3 * N, 3 * N), dtype=self.dtype)
+        self.Ds = diags(
+            self.L.toarray(),
+            shape=(3 * N, 3 * N),
+            dtype=self.dtype,
+        )
+
+        self.iDa = diags(
+            self.iA.toarray(),
+            shape=(3 * N, 3 * N),
+            dtype=self.dtype,
+        )
 
         # tilde grid
-        self.tDs = diags(self.tL.toarray(), shape=(3 * N, 3 * N), dtype=self.dtype)
-        self.itDa = diags(self.itA.toarray(), shape=(3 * N, 3 * N), dtype=self.dtype)
+        self.tDs = diags(
+            self.tL.toarray(),
+            shape=(3 * N, 3 * N),
+            dtype=self.dtype,
+        )
+
+        self.itDa = diags(
+            self.itA.toarray(),
+            shape=(3 * N, 3 * N),
+            dtype=self.dtype,
+        )
 
         # Curl matrix
         self.C = vstack(
@@ -1491,6 +1586,589 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             : self.Nz,
         ]
 
+    def _dual_face_array_to_primal_edge_component(
+        self,
+        face_values,
+        direction,
+        fill_value=np.nan,
+    ):
+        """
+        Map dual-face data to the associated stored primal-edge DOFs.
+
+        For interior primal edges the associated dual face is shifted by one
+        index in the two directions transverse to the edge:
+
+            Ex(i,j,k) <-> dual x-face (i,   j-1, k-1)
+            Ey(i,j,k) <-> dual y-face (i-1, j,   k-1)
+            Ez(i,j,k) <-> dual z-face (i-1, j-1, k)
+
+        Low-side boundary edges do not have a complete dual face inside the
+        physical domain. They are therefore left at ``fill_value`` here.
+        """
+        face_values = np.asarray(face_values)
+
+        expected_shapes = {
+            "x": (
+                self.Nx + 1,
+                self.Ny,
+                self.Nz,
+            ),
+            "y": (
+                self.Nx,
+                self.Ny + 1,
+                self.Nz,
+            ),
+            "z": (
+                self.Nx,
+                self.Ny,
+                self.Nz + 1,
+            ),
+        }
+
+        if direction not in expected_shapes:
+            raise ValueError(f"Unknown face direction '{direction}'.")
+
+        if face_values.shape != expected_shapes[direction]:
+            raise ValueError(
+                f"Expected dual {direction}-face array shape "
+                f"{expected_shapes[direction]}, "
+                f"got {face_values.shape}."
+            )
+
+        dtype = np.result_type(
+            face_values.dtype,
+            np.asarray(fill_value).dtype,
+        )
+
+        result = np.full(
+            (
+                self.Nx,
+                self.Ny,
+                self.Nz,
+            ),
+            fill_value,
+            dtype=dtype,
+        )
+
+        if direction == "x":
+            result[:, 1:, 1:] = face_values[
+                : self.Nx,
+                : self.Ny - 1,
+                : self.Nz - 1,
+            ]
+
+        elif direction == "y":
+            result[1:, :, 1:] = face_values[
+                : self.Nx - 1,
+                : self.Ny,
+                : self.Nz - 1,
+            ]
+
+        else:
+            result[1:, 1:, :] = face_values[
+                : self.Nx - 1,
+                : self.Ny - 1,
+                : self.Nz,
+            ]
+
+        return result
+
+    def _primal_face_array_to_dual_edge_component(
+        self,
+        face_values,
+        direction,
+    ):
+        """
+        Map primal-face data to the associated stored dual-edge DOFs.
+
+            Hx(i,j,k) <-> primal x-face (i+1, j,   k)
+            Hy(i,j,k) <-> primal y-face (i,   j+1, k)
+            Hz(i,j,k) <-> primal z-face (i,   j,   k+1)
+        """
+        face_values = np.asarray(face_values)
+
+        expected_shapes = {
+            "x": (
+                self.Nx + 1,
+                self.Ny,
+                self.Nz,
+            ),
+            "y": (
+                self.Nx,
+                self.Ny + 1,
+                self.Nz,
+            ),
+            "z": (
+                self.Nx,
+                self.Ny,
+                self.Nz + 1,
+            ),
+        }
+
+        if direction not in expected_shapes:
+            raise ValueError(f"Unknown face direction '{direction}'.")
+
+        if face_values.shape != expected_shapes[direction]:
+            raise ValueError(
+                f"Expected primal {direction}-face array shape "
+                f"{expected_shapes[direction]}, "
+                f"got {face_values.shape}."
+            )
+
+        if direction == "x":
+            return face_values[
+                1 : self.Nx + 1,
+                :,
+                :,
+            ]
+
+        if direction == "y":
+            return face_values[
+                :,
+                1 : self.Ny + 1,
+                :,
+            ]
+
+        return face_values[
+            :,
+            :,
+            1 : self.Nz + 1,
+        ]
+
+    @staticmethod
+    def _combine_conformal_diagonal_component(
+        perpendicular,
+        parallel,
+        line_mask,
+        face_mask,
+        line_n2,
+        face_n2,
+        normal_tol=1e-12,
+    ):
+        """
+        Combine normal and tangential effective material values into one
+        diagonal Cartesian material component.
+
+        The diagonal approximation is
+
+            m_ii = n_i^2 * m_perp
+                + (1 - n_i^2) * m_parallel
+
+        where
+
+            m_perp     : harmonic line value,
+            m_parallel : arithmetic face value.
+
+        Purely normal and purely tangential cases are treated explicitly so
+        that missing values in the unused contribution do not produce NaNs.
+        """
+        perpendicular = np.asarray(
+            perpendicular,
+            dtype=float,
+        )
+
+        parallel = np.asarray(
+            parallel,
+            dtype=float,
+        )
+
+        line_mask = np.asarray(
+            line_mask,
+            dtype=bool,
+        )
+
+        face_mask = np.asarray(
+            face_mask,
+            dtype=bool,
+        )
+
+        line_n2 = np.asarray(
+            line_n2,
+            dtype=float,
+        )
+
+        face_n2 = np.asarray(
+            face_n2,
+            dtype=float,
+        )
+
+        if not (
+            perpendicular.shape
+            == parallel.shape
+            == line_mask.shape
+            == face_mask.shape
+            == line_n2.shape
+            == face_n2.shape
+        ):
+            raise ValueError(
+                "Conformal diagonal material arrays must have identical shapes."
+            )
+
+        result = np.full(
+            perpendicular.shape,
+            np.nan,
+            dtype=float,
+        )
+
+        # Prefer the normal obtained directly from the edge intersection.
+        # For tangential edges without an edge crossing, use the normal
+        # reconstructed from the associated cut face.
+        n2 = np.where(
+            np.isfinite(line_n2),
+            line_n2,
+            face_n2,
+        )
+
+        finite_n2 = np.isfinite(n2)
+
+        # Numerical noise may produce values slightly outside [0, 1].
+        n2 = np.clip(
+            n2,
+            0.0,
+            1.0,
+        )
+
+        # ----------------------------------------------------------
+        # General case:
+        # both normal and tangential material values are available.
+        # ----------------------------------------------------------
+        combined = (
+            line_mask
+            & face_mask
+            & finite_n2
+            & np.isfinite(perpendicular)
+            & np.isfinite(parallel)
+        )
+
+        result[combined] = (
+            n2[combined] * perpendicular[combined]
+            + (1.0 - n2[combined]) * parallel[combined]
+        )
+
+        # ----------------------------------------------------------
+        # Pure normal component:
+        #
+        # n_i^2 = 1 -> m_ii = m_perp
+        #
+        # No face contribution is required.
+        # ----------------------------------------------------------
+        pure_normal = (
+            line_mask
+            & finite_n2
+            & np.isfinite(perpendicular)
+            & ((1.0 - n2) <= normal_tol)
+        )
+
+        result[pure_normal] = perpendicular[pure_normal]
+
+        # ----------------------------------------------------------
+        # Pure tangential component:
+        #
+        # n_i^2 = 0 -> m_ii = m_parallel
+        #
+        # No line crossing is required.
+        # ----------------------------------------------------------
+        pure_tangential = (
+            face_mask & finite_n2 & np.isfinite(parallel) & (n2 <= normal_tol)
+        )
+
+        result[pure_tangential] = parallel[pure_tangential]
+
+        return result
+
+    def _build_conformal_diagonal_materials(
+        self,
+        normal_tol=1e-12,
+    ):
+        """
+        Build diagonal effective material components for resolved
+        normal-normal interfaces.
+
+        Electric material components use
+
+            primal edge  -> normal/harmonic contribution
+            dual face    -> tangential/arithmetic contribution
+
+        Magnetic material components use
+
+            dual edge    -> normal/harmonic contribution
+            primal face  -> tangential/arithmetic contribution
+
+        The resulting arrays have shape (Nx, Ny, Nz) and contain NaN
+        where no complete conformal normal-normal treatment is available.
+        """
+        self.conformal_diagonal_materials = {
+            "eps_r": {},
+            "mu_r": {},
+            "sigma": {},
+        }
+
+        axis_index = {
+            "x": 0,
+            "y": 1,
+            "z": 2,
+        }
+
+        for direction in (
+            "x",
+            "y",
+            "z",
+        ):
+            axis = axis_index[direction]
+
+            # ======================================================
+            # Electric material:
+            #
+            # primal edge <-> dual face
+            # ======================================================
+
+            primal_line_data = self.conformal_line_data["primal"][direction]
+
+            primal_line_materials = self.conformal_line_materials["primal"][direction]
+
+            dual_face_data = self.conformal_face_data["dual"][direction]
+
+            dual_face_materials = self.conformal_face_materials["dual"][direction]
+
+            # ------------------------------------------------------
+            # Normal / harmonic contribution
+            # ------------------------------------------------------
+
+            eps_perp = self._edge_array_to_field_component(
+                primal_line_materials["eps_r"],
+                direction,
+            )
+
+            sigma_perp = self._edge_array_to_field_component(
+                primal_line_materials["sigma"],
+                direction,
+            )
+
+            electric_line_mask = self._edge_array_to_field_component(
+                primal_line_data["normal_normal"],
+                direction,
+            ).astype(bool)
+
+            line_normals = np.asarray(
+                self.grid.interface_intersections["primal"][direction]["normal"],
+                dtype=float,
+            )
+
+            line_norm = np.linalg.norm(
+                line_normals,
+                axis=-1,
+            )
+
+            electric_line_n2_full = np.full(
+                line_norm.shape,
+                np.nan,
+                dtype=float,
+            )
+
+            valid_line_normal = np.isfinite(line_norm) & (line_norm > 0.0)
+
+            electric_line_n2_full[valid_line_normal] = (
+                line_normals[..., axis][valid_line_normal]
+                / line_norm[valid_line_normal]
+            ) ** 2
+
+            electric_line_n2 = self._edge_array_to_field_component(
+                electric_line_n2_full,
+                direction,
+            )
+
+            # ------------------------------------------------------
+            # Tangential / arithmetic contribution
+            # ------------------------------------------------------
+
+            eps_parallel = self._dual_face_array_to_primal_edge_component(
+                dual_face_materials["eps_r"],
+                direction,
+            )
+
+            sigma_parallel = self._dual_face_array_to_primal_edge_component(
+                dual_face_materials["sigma"],
+                direction,
+            )
+
+            electric_face_mask = self._dual_face_array_to_primal_edge_component(
+                dual_face_data["normal_normal"],
+                direction,
+                fill_value=False,
+            ).astype(bool)
+
+            dual_face_geometry = self.grid.interface_face_data["dual"][direction]
+
+            face_n2_full = np.full(
+                dual_face_data["normal_normal"].shape,
+                np.nan,
+                dtype=float,
+            )
+
+            for index, segment in dual_face_geometry["segments"].items():
+                if not dual_face_data["normal_normal"][index]:
+                    continue
+
+                normal = np.asarray(
+                    segment["normal"],
+                    dtype=float,
+                )
+
+                norm = np.linalg.norm(normal)
+
+                if not np.isfinite(norm) or norm <= 0.0:
+                    continue
+
+                face_n2_full[index] = (normal[axis] / norm) ** 2
+
+            electric_face_n2 = self._dual_face_array_to_primal_edge_component(
+                face_n2_full,
+                direction,
+            )
+
+            # ------------------------------------------------------
+            # Final diagonal electric material components
+            # ------------------------------------------------------
+
+            self.conformal_diagonal_materials["eps_r"][direction] = (
+                self._combine_conformal_diagonal_component(
+                    eps_perp,
+                    eps_parallel,
+                    electric_line_mask,
+                    electric_face_mask,
+                    electric_line_n2,
+                    electric_face_n2,
+                    normal_tol=normal_tol,
+                )
+            )
+
+            self.conformal_diagonal_materials["sigma"][direction] = (
+                self._combine_conformal_diagonal_component(
+                    sigma_perp,
+                    sigma_parallel,
+                    electric_line_mask,
+                    electric_face_mask,
+                    electric_line_n2,
+                    electric_face_n2,
+                    normal_tol=normal_tol,
+                )
+            )
+
+            # ======================================================
+            # Magnetic material:
+            #
+            # dual edge <-> primal face
+            # ======================================================
+
+            dual_line_data = self.conformal_line_data["dual"][direction]
+
+            dual_line_materials = self.conformal_line_materials["dual"][direction]
+
+            primal_face_data = self.conformal_face_data["primal"][direction]
+
+            primal_face_materials = self.conformal_face_materials["primal"][direction]
+
+            # ------------------------------------------------------
+            # Normal / harmonic contribution
+            # ------------------------------------------------------
+
+            mu_perp = self._edge_array_to_field_component(
+                dual_line_materials["mu_r"],
+                direction,
+            )
+
+            magnetic_line_mask = self._edge_array_to_field_component(
+                dual_line_data["normal_normal"],
+                direction,
+            ).astype(bool)
+
+            line_normals = np.asarray(
+                self.grid.interface_intersections["dual"][direction]["normal"],
+                dtype=float,
+            )
+
+            line_norm = np.linalg.norm(
+                line_normals,
+                axis=-1,
+            )
+
+            magnetic_line_n2_full = np.full(
+                line_norm.shape,
+                np.nan,
+                dtype=float,
+            )
+
+            valid_line_normal = np.isfinite(line_norm) & (line_norm > 0.0)
+
+            magnetic_line_n2_full[valid_line_normal] = (
+                line_normals[..., axis][valid_line_normal]
+                / line_norm[valid_line_normal]
+            ) ** 2
+
+            magnetic_line_n2 = self._edge_array_to_field_component(
+                magnetic_line_n2_full,
+                direction,
+            )
+
+            # ------------------------------------------------------
+            # Tangential / arithmetic contribution
+            # ------------------------------------------------------
+
+            mu_parallel = self._primal_face_array_to_dual_edge_component(
+                primal_face_materials["mu_r"],
+                direction,
+            )
+
+            magnetic_face_mask = self._primal_face_array_to_dual_edge_component(
+                primal_face_data["normal_normal"],
+                direction,
+            ).astype(bool)
+
+            primal_face_geometry = self.grid.interface_face_data["primal"][direction]
+
+            face_n2_full = np.full(
+                primal_face_data["normal_normal"].shape,
+                np.nan,
+                dtype=float,
+            )
+
+            for index, segment in primal_face_geometry["segments"].items():
+                if not primal_face_data["normal_normal"][index]:
+                    continue
+
+                normal = np.asarray(
+                    segment["normal"],
+                    dtype=float,
+                )
+
+                norm = np.linalg.norm(normal)
+
+                if not np.isfinite(norm) or norm <= 0.0:
+                    continue
+
+                face_n2_full[index] = (normal[axis] / norm) ** 2
+
+            magnetic_face_n2 = self._primal_face_array_to_dual_edge_component(
+                face_n2_full,
+                direction,
+            )
+
+            # ------------------------------------------------------
+            # Final diagonal magnetic material component
+            # ------------------------------------------------------
+
+            self.conformal_diagonal_materials["mu_r"][direction] = (
+                self._combine_conformal_diagonal_component(
+                    mu_perp,
+                    mu_parallel,
+                    magnetic_line_mask,
+                    magnetic_face_mask,
+                    magnetic_line_n2,
+                    magnetic_face_n2,
+                    normal_tol=normal_tol,
+                )
+            )
+
     def _build_conformal_effective_lengths(self):
         """
         Build effective primal and dual edge lengths for the current
@@ -2137,19 +2815,138 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
 
         mu_x, mu_y, mu_z = self._average_primal_points_to_dual_edges(mu_primal)
 
+        # ----------------------------------------------------------
+        # Replace the point-averaged material values by the
+        # conformal diagonal approximation wherever a resolved
+        # normal-normal interface treatment is available.
+        #
+        # All other DOFs retain the point-averaged values above.
+        # ----------------------------------------------------------
+
+        eps_components = {
+            "x": eps_x,
+            "y": eps_y,
+            "z": eps_z,
+        }
+
+        mu_components = {
+            "x": mu_x,
+            "y": mu_y,
+            "z": mu_z,
+        }
+
+        sigma_components = {
+            "x": sigma_x,
+            "y": sigma_y,
+            "z": sigma_z,
+        }
+
+        diagonal_materials = getattr(
+            self,
+            "conformal_diagonal_materials",
+            None,
+        )
+
+        if diagonal_materials:
+            expected_shape = (
+                self.Nx,
+                self.Ny,
+                self.Nz,
+            )
+
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                # --------------------------------------------------
+                # Permittivity
+                # --------------------------------------------------
+                eps_r_diag = diagonal_materials["eps_r"].get(
+                    direction,
+                    None,
+                )
+
+                if eps_r_diag is not None:
+                    eps_r_diag = np.asarray(
+                        eps_r_diag,
+                        dtype=float,
+                    )
+
+                    if eps_r_diag.shape != expected_shape:
+                        raise RuntimeError(
+                            f"Conformal eps_r {direction}-component "
+                            f"has shape {eps_r_diag.shape}, "
+                            f"expected {expected_shape}."
+                        )
+
+                    valid_eps = np.isfinite(eps_r_diag) & (eps_r_diag > 0.0)
+
+                    eps_components[direction][valid_eps] = eps_r_diag[valid_eps] * eps_0
+
+                # --------------------------------------------------
+                # Permeability
+                # --------------------------------------------------
+                mu_r_diag = diagonal_materials["mu_r"].get(
+                    direction,
+                    None,
+                )
+
+                if mu_r_diag is not None:
+                    mu_r_diag = np.asarray(
+                        mu_r_diag,
+                        dtype=float,
+                    )
+
+                    if mu_r_diag.shape != expected_shape:
+                        raise RuntimeError(
+                            f"Conformal mu_r {direction}-component "
+                            f"has shape {mu_r_diag.shape}, "
+                            f"expected {expected_shape}."
+                        )
+
+                    valid_mu = np.isfinite(mu_r_diag) & (mu_r_diag > 0.0)
+
+                    mu_components[direction][valid_mu] = mu_r_diag[valid_mu] * mu_0
+
+                # --------------------------------------------------
+                # Conductivity
+                # --------------------------------------------------
+                sigma_diag = diagonal_materials["sigma"].get(
+                    direction,
+                    None,
+                )
+
+                if sigma_diag is not None:
+                    sigma_diag = np.asarray(
+                        sigma_diag,
+                        dtype=float,
+                    )
+
+                    if sigma_diag.shape != expected_shape:
+                        raise RuntimeError(
+                            f"Conformal sigma {direction}-component "
+                            f"has shape {sigma_diag.shape}, "
+                            f"expected {expected_shape}."
+                        )
+
+                    valid_sigma = np.isfinite(sigma_diag) & (sigma_diag >= 0.0)
+
+                    sigma_components[direction][valid_sigma] = sigma_diag[valid_sigma]
+
         # Convert physical material values to the quantities used
         # in the explicit FIT update equations.
-        self.ieps.field_x = 1.0 / eps_x
-        self.ieps.field_y = 1.0 / eps_y
-        self.ieps.field_z = 1.0 / eps_z
+        self.ieps.field_x = 1.0 / eps_components["x"]
+        self.ieps.field_y = 1.0 / eps_components["y"]
+        self.ieps.field_z = 1.0 / eps_components["z"]
 
-        self.imu.field_x = 1.0 / mu_x
-        self.imu.field_y = 1.0 / mu_y
-        self.imu.field_z = 1.0 / mu_z
+        self.imu.field_x = 1.0 / mu_components["x"]
+        self.imu.field_y = 1.0 / mu_components["y"]
+        self.imu.field_z = 1.0 / mu_components["z"]
 
-        self.sigma.field_x = sigma_x
-        self.sigma.field_y = sigma_y
-        self.sigma.field_z = sigma_z
+        self.sigma.field_x = sigma_components["x"]
+        self.sigma.field_y = sigma_components["y"]
+        self.sigma.field_z = sigma_components["z"]
 
     def _apply_SIBC(self, key):
         eps = self.stl_materials[key][0] * eps_0

@@ -25,3 +25,4 @@ dist/
 wakis.egg-info/
 .coverage
 .vscode/
+notebooks/pillbox_upper_dielectric.stl

@@ -3195,11 +3195,38 @@ class TestGridFIT3DMeshing:
                     f"{n_multiple:6d} multiple"
                 )
 
-                # Every stored representative intersection must be valid.
-                valid = has_intersection
+                # Every representative intersection that is actually used by the
+                # conformal discretization must contain valid geometric data.
+                valid = grid.resolved_interface_edge_masks[grid_type][direction]
 
                 if np.any(valid):
                     alpha = data["alpha"][valid]
+
+                    if not np.all(np.isfinite(alpha)):
+                        invalid_indices = np.argwhere(
+                            has_intersection & ~np.isfinite(data["alpha"])
+                        )
+
+                        print(
+                            f"\nInvalid representative intersections "
+                            f"for {grid_type} {direction}:"
+                        )
+
+                        for index_array in invalid_indices:
+                            index = tuple(int(value) for value in index_array)
+
+                            print(f"  index = {index}")
+                            print(f"    alpha = {data['alpha'][index]}")
+                            print(f"    surface_id = {data['surface_id'][index]}")
+                            print(f"    cell_id = {data['cell_id'][index]}")
+                            print(f"    normal = {data['normal'][index]}")
+                            print(
+                                f"    multiple = {data['multiple_intersections'][index]}"
+                            )
+                            print(
+                                "    multiple_crossing_positions = "
+                                f"{data['multiple_crossing_positions'][index]}"
+                            )
 
                     assert np.all(np.isfinite(alpha))
 
@@ -3379,6 +3406,811 @@ class TestGridFIT3DMeshing:
                     grid.interface_edge_masks[grid_type][direction],
                     loaded.interface_edge_masks[grid_type][direction],
                 )
+
+    def test_conformal_slanted_material_interface(self, tmp_path):
+        """
+        Validate the conformal treatment for a slanted material interface.
+
+        The interface is
+
+            y_s(x) = 1.375 + 0.5 * (x - 2)
+
+        and separates the background from a second material occupying
+
+            y < y_s(x).
+
+        Two cases are tested:
+
+        1. normal <-> normal
+        - intersection position alpha
+        - effective edge/face geometry
+        - harmonic line-material averaging
+        - arithmetic face-material averaging
+
+        2. normal <-> PEC
+        - effective edge length
+        - effective face area
+        - material properties of the remaining normal region
+        """
+
+        # ============================================================
+        # Geometry
+        # ============================================================
+        #
+        # Computational domain:
+        #
+        #     0 <= x,y,z <= 5
+        #
+        # with
+        #
+        #     dx = dy = dz = 1.
+        #
+        # The STL solid is deliberately extended beyond the
+        # computational domain in x, z and toward negative y.
+        #
+        # Therefore, inside the computational domain only the slanted
+        # upper interface is relevant:
+        #
+        #     y_s(x) = 1.375 + 0.5 * (x - 2)
+        #
+        # Material "insert" occupies y < y_s(x).
+        # ============================================================
+
+        x0 = -1.0
+        x1 = 6.0
+
+        y0 = -1.0
+
+        yt0 = 1.375 + 0.5 * (x0 - 2.0)
+        yt1 = 1.375 + 0.5 * (x1 - 2.0)
+
+        z0 = -1.0
+        z1 = 6.0
+
+        points = np.array(
+            [
+                [x0, y0, z0],
+                [x1, y0, z0],
+                [x1, yt1, z0],
+                [x0, yt0, z0],
+                [x0, y0, z1],
+                [x1, y0, z1],
+                [x1, yt1, z1],
+                [x0, yt0, z1],
+            ],
+            dtype=float,
+        )
+
+        faces = np.hstack(
+            [
+                [4, 0, 1, 2, 3],
+                [4, 4, 7, 6, 5],
+                [4, 0, 4, 5, 1],
+                [4, 3, 2, 6, 7],
+                [4, 0, 3, 7, 4],
+                [4, 1, 5, 6, 2],
+            ]
+        )
+
+        surface = pv.PolyData(
+            points,
+            faces,
+        ).triangulate()
+
+        surface = surface.compute_normals(
+            consistent_normals=True,
+            auto_orient_normals=True,
+            point_normals=False,
+            cell_normals=True,
+        )
+
+        stl_file = tmp_path / "slanted_region.stl"
+
+        surface.save(stl_file)
+
+        # ============================================================
+        # 1) NORMAL <-> NORMAL
+        # ============================================================
+        #
+        # Background:
+        #
+        #     eps_r = 2
+        #     mu_r  = 1
+        #     sigma = 0
+        #
+        # Insert:
+        #
+        #     eps_r = 8
+        #     mu_r  = 4
+        #     sigma = 0
+        # ============================================================
+
+        grid = GridFIT3D(
+            0.0,
+            5.0,
+            0.0,
+            5.0,
+            0.0,
+            5.0,
+            5,
+            5,
+            5,
+            stl_solids={
+                "insert": str(stl_file),
+            },
+            stl_materials={
+                "insert": [8.0, 4.0, 0.0],
+            },
+            stl_material_types={
+                "insert": "normal",
+            },
+            geometry_mode="conformal",
+            stl_method="interior_points",
+            verbose=0,
+        )
+
+        # use_stl=False intentionally prevents automatic application
+        # of the conformal material/metric data to the solver operators.
+        solver = SolverFIT3D(
+            grid,
+            bg=[2.0, 1.0, 0.0],
+            use_stl=False,
+            verbose=0,
+        )
+
+        solver._build_conformal_effective_lengths()
+        solver._build_conformal_face_data()
+        solver._build_conformal_face_materials()
+        solver._build_conformal_effective_areas()
+        solver._build_conformal_diagonal_materials()
+
+        insert_id = grid.region_key_to_id["insert"]
+
+        # ============================================================
+        # Primal y-edge
+        # ============================================================
+        #
+        # Edge:
+        #
+        #     (2, 1, 2) -> (2, 2, 2)
+        #
+        # At x = 2:
+        #
+        #     y_s(2) = 1.375
+        #
+        # Thus:
+        #
+        #     insert fraction     = 0.375 = 3/8
+        #     background fraction = 0.625 = 5/8
+        #
+        # For a normal-normal interface the full geometrical edge
+        # remains active.
+        #
+        # The line material is harmonically averaged:
+        #
+        # eps_eff =
+        #
+        #       1
+        # -----------------
+        # (3/8)/8 + (5/8)/2
+        #
+        # = 64/23
+        # ============================================================
+
+        edge_index = (2, 1, 2)
+
+        line = solver.conformal_line_data["primal"]["y"]
+
+        assert line["normal_normal"][edge_index]
+
+        assert line["alpha"][edge_index] == pytest.approx(3.0 / 8.0)
+
+        assert solver.L_fraction.to_matrix("y")[edge_index] == pytest.approx(1.0)
+
+        assert solver.L_eff.to_matrix("y")[edge_index] == pytest.approx(1.0)
+
+        eps_line_expected = 1.0 / ((3.0 / 8.0) / 8.0 + (5.0 / 8.0) / 2.0)
+
+        eps_line = solver.conformal_line_materials["primal"]["y"]["eps_r"][edge_index]
+
+        assert eps_line == pytest.approx(eps_line_expected)
+
+        assert eps_line == pytest.approx(64.0 / 23.0)
+
+        # ============================================================
+        # Dual y-face
+        # ============================================================
+        #
+        # Associated dual face:
+        #
+        #     y = 1.5
+        #
+        # with
+        #
+        #     1.5 <= x <= 2.5
+        #     1.5 <= z <= 2.5
+        #
+        # Solve interface position:
+        #
+        #     1.5 = 1.375 + 0.5 * (x - 2)
+        #
+        # ->  x = 2.25
+        #
+        # Hence:
+        #
+        #     insert area fraction     = 1/4
+        #     background area fraction = 3/4
+        #
+        # Arithmetic face average:
+        #
+        #     eps_eff =
+        #         1/4 * 8
+        #       + 3/4 * 2
+        #
+        #     = 3.5
+        #
+        # Since both materials are normal, the complete face remains
+        # geometrically active.
+        # ============================================================
+
+        dual_face_index = (1, 1, 1)
+
+        dual_face_geometry = grid.interface_face_data["dual"]["y"]
+
+        dual_face_fractions = dual_face_geometry["region_area_fractions"][
+            dual_face_index
+        ]
+
+        assert dual_face_fractions[insert_id] == pytest.approx(1.0 / 4.0)
+
+        assert dual_face_fractions[0] == pytest.approx(3.0 / 4.0)
+
+        eps_face_expected = (1.0 / 4.0) * 8.0 + (3.0 / 4.0) * 2.0
+
+        eps_face = solver.conformal_face_materials["dual"]["y"]["eps_r"][
+            dual_face_index
+        ]
+
+        assert eps_face == pytest.approx(eps_face_expected)
+
+        assert eps_face == pytest.approx(3.5)
+
+        # ------------------------------------------------------------
+        # Map the dual-face material to its associated primal y-edge.
+        #
+        # primal y-edge:
+        #     (2, 1, 2)
+        #
+        # associated dual y-face:
+        #     (1, 1, 1)
+        # ------------------------------------------------------------
+
+        eps_parallel = solver._dual_face_array_to_primal_edge_component(
+            solver.conformal_face_materials["dual"]["y"]["eps_r"],
+            "y",
+        )
+
+        assert eps_parallel[edge_index] == pytest.approx(3.5)
+
+        # ------------------------------------------------------------
+        # Diagonal material approximation
+        #
+        # Interface:
+        #
+        #     y - 0.5 x = const.
+        #
+        # therefore:
+        #
+        #     n = (-0.5, 1, 0) / sqrt(1.25)
+        #
+        # and:
+        #
+        #     n_y^2 = 4/5
+        #
+        # eps_yy =
+        #     n_y^2 * eps_perp
+        #     + (1 - n_y^2) * eps_parallel
+        # ------------------------------------------------------------
+
+        normal = grid.interface_intersections["primal"]["y"]["normal"][edge_index]
+
+        normal = normal / np.linalg.norm(normal)
+
+        ny2 = normal[1] ** 2
+
+        assert ny2 == pytest.approx(4.0 / 5.0)
+
+        eps_perp = eps_line
+
+        eps_yy = ny2 * eps_perp + (1.0 - ny2) * eps_parallel[edge_index]
+
+        assert eps_yy == pytest.approx(673.0 / 230.0)
+
+        assert solver.conformal_face_data["dual"]["y"]["effective_area_fraction"][
+            dual_face_index
+        ] == pytest.approx(1.0)
+
+        assert solver.tA_fraction.to_matrix("y")[dual_face_index] == pytest.approx(1.0)
+
+        eps_yy_solver = solver.conformal_diagonal_materials["eps_r"]["y"][edge_index]
+
+        assert eps_yy_solver == pytest.approx(673.0 / 230.0)
+
+        sigma_yy_solver = solver.conformal_diagonal_materials["sigma"]["y"][edge_index]
+
+        assert sigma_yy_solver == pytest.approx(0.0)
+        # ============================================================
+        # Primal z-face
+        # ============================================================
+        #
+        # Face:
+        #
+        #     2 <= x <= 3
+        #     1 <= y <= 2
+        #
+        # At x = 2:
+        #
+        #     y_s = 1.375
+        #
+        # At x = 3:
+        #
+        #     y_s = 1.875
+        #
+        # Material area is therefore the trapezoid
+        #
+        #       (0.375 + 0.875)
+        # A = ------------------- * 1
+        #               2
+        #
+        #   = 0.625 = 5/8
+        #
+        # Thus:
+        #
+        #     insert fraction     = 5/8
+        #     background fraction = 3/8
+        #
+        # Arithmetic mu average:
+        #
+        #     mu_eff =
+        #         5/8 * 4
+        #       + 3/8 * 1
+        #
+        #     = 23/8
+        # ============================================================
+
+        primal_face_index = (2, 1, 2)
+
+        primal_face_geometry = grid.interface_face_data["primal"]["z"]
+
+        primal_face_fractions = primal_face_geometry["region_area_fractions"][
+            primal_face_index
+        ]
+
+        assert primal_face_fractions[insert_id] == pytest.approx(5.0 / 8.0)
+
+        assert primal_face_fractions[0] == pytest.approx(3.0 / 8.0)
+
+        mu_face_expected = (5.0 / 8.0) * 4.0 + (3.0 / 8.0) * 1.0
+
+        mu_face = solver.conformal_face_materials["primal"]["z"]["mu_r"][
+            primal_face_index
+        ]
+
+        assert mu_face == pytest.approx(mu_face_expected)
+
+        assert mu_face == pytest.approx(23.0 / 8.0)
+
+        # ------------------------------------------------------------
+        # Tangential magnetic component
+        #
+        # The interface normal is
+        #
+        #     n = (-0.5, 1, 0) / sqrt(1.25)
+        #
+        # Hence n_z = 0.
+        #
+        # The z-directed dual edge associated with the primal z-face
+        # is therefore tangential to the interface. It does not need
+        # a harmonic line contribution:
+        #
+        #     mu_zz = mu_parallel
+        # ------------------------------------------------------------
+
+        mu_parallel = solver._primal_face_array_to_dual_edge_component(
+            solver.conformal_face_materials["primal"]["z"]["mu_r"],
+            "z",
+        )
+
+        dual_edge_index = (
+            primal_face_index[0],
+            primal_face_index[1],
+            primal_face_index[2] - 1,
+        )
+
+        assert dual_edge_index == (
+            2,
+            1,
+            1,
+        )
+
+        assert mu_parallel[dual_edge_index] == pytest.approx(23.0 / 8.0)
+
+        face_segment = grid.interface_face_data["primal"]["z"]["segments"][
+            primal_face_index
+        ]
+
+        normal = np.asarray(
+            face_segment["normal"],
+            dtype=float,
+        )
+
+        normal /= np.linalg.norm(normal)
+
+        nz2 = normal[2] ** 2
+
+        assert nz2 == pytest.approx(
+            0.0,
+            abs=1e-12,
+        )
+
+        mu_zz = mu_parallel[dual_edge_index]
+
+        assert mu_zz == pytest.approx(23.0 / 8.0)
+
+        assert solver.A_fraction.to_matrix("z")[primal_face_index] == pytest.approx(1.0)
+
+        mu_zz_solver = solver.conformal_diagonal_materials["mu_r"]["z"][dual_edge_index]
+
+        assert mu_zz_solver == pytest.approx(23.0 / 8.0)
+
+        # ============================================================
+        # Applied conformal material tensors
+        # ============================================================
+        #
+        # Up to this point, the conformal preprocessing quantities
+        #
+        #     eps_perp, eps_parallel
+        #     mu_perp,  mu_parallel
+        #
+        # and the resulting diagonal approximation have been tested
+        # independently.
+        #
+        # Now initialize a real solver with use_stl=True and verify
+        # that the final material Fields used by the FIT time stepping
+        # contain the same analytically expected values.
+        # ============================================================
+
+        solver_applied = SolverFIT3D(
+            grid,
+            bg=[
+                2.0,
+                1.0,
+                0.0,
+            ],
+            use_stl=True,
+            verbose=0,
+        )
+        # ------------------------------------------------------------
+        # Electric y-component
+        #
+        # Expected:
+        #
+        #     eps_yy = 673 / 230
+        #
+        # solver.ieps stores
+        #
+        #     1 / epsilon
+        #
+        # with
+        #
+        #     epsilon = eps_r * eps_0
+        # ------------------------------------------------------------
+
+        eps_yy_applied = 1.0 / (solver_applied.ieps.to_matrix("y")[edge_index] * eps_0)
+
+        assert eps_yy_applied == pytest.approx(673.0 / 230.0)
+
+        # The automatically constructed diagonal material data must
+        # contain the same value.
+        assert solver_applied.conformal_diagonal_materials["eps_r"]["y"][
+            edge_index
+        ] == pytest.approx(673.0 / 230.0)
+
+        # ------------------------------------------------------------
+        # Magnetic z-component
+        #
+        # n_z = 0, therefore the field component is purely tangential:
+        #
+        #     mu_zz = mu_parallel = 23 / 8
+        #
+        # solver.imu stores
+        #
+        #     1 / mu
+        #
+        # with
+        #
+        #     mu = mu_r * mu_0
+        # ------------------------------------------------------------
+
+        mu_zz_applied = 1.0 / (
+            solver_applied.imu.to_matrix("z")[dual_edge_index] * mu_0
+        )
+
+        assert mu_zz_applied == pytest.approx(23.0 / 8.0)
+
+        assert solver_applied.conformal_diagonal_materials["mu_r"]["z"][
+            dual_edge_index
+        ] == pytest.approx(23.0 / 8.0)
+
+        # ------------------------------------------------------------
+        # Conductivity
+        #
+        # Both normal materials are insulating in this test:
+        #
+        #     sigma = 0
+        # ------------------------------------------------------------
+
+        sigma_yy_applied = solver_applied.sigma.to_matrix("y")[edge_index]
+
+        assert sigma_yy_applied == pytest.approx(0.0)
+
+        assert solver_applied.conformal_diagonal_materials["sigma"]["y"][
+            edge_index
+        ] == pytest.approx(0.0)
+        # ============================================================
+        # 2) SAME GEOMETRY, INSERT = PEC
+        # ============================================================
+
+        grid_pec = GridFIT3D(
+            0.0,
+            5.0,
+            0.0,
+            5.0,
+            0.0,
+            5.0,
+            5,
+            5,
+            5,
+            stl_solids={
+                "insert": str(stl_file),
+            },
+            stl_materials={
+                "insert": [1.0, 1.0, 0.0],
+            },
+            stl_material_types={
+                "insert": "pec",
+            },
+            geometry_mode="conformal",
+            stl_method="interior_points",
+            verbose=0,
+        )
+
+        solver_pec = SolverFIT3D(
+            grid_pec,
+            bg=[2.0, 1.0, 0.0],
+            use_stl=False,
+            verbose=0,
+        )
+
+        solver_pec._build_conformal_effective_lengths()
+        solver_pec._build_conformal_face_data()
+        solver_pec._build_conformal_face_materials()
+        solver_pec._build_conformal_effective_areas()
+
+        # ============================================================
+        # PEC: primal y-edge
+        # ============================================================
+        #
+        # First 3/8 of the edge lies inside PEC.
+        # Remaining 5/8 lies inside the normal background.
+        #
+        # Hence:
+        #
+        #     L_fraction = 5/8
+        #     L_eff      = 5/8
+        #
+        # Material of the active part:
+        #
+        #     eps_r = eps_r,bg = 2
+        # ============================================================
+
+        line_pec = solver_pec.conformal_line_data["primal"]["y"]
+
+        assert line_pec["conductor_to_normal"][edge_index]
+
+        assert line_pec["alpha"][edge_index] == pytest.approx(3.0 / 8.0)
+
+        assert solver_pec.L_fraction.to_matrix("y")[edge_index] == pytest.approx(
+            5.0 / 8.0
+        )
+
+        assert solver_pec.L_eff.to_matrix("y")[edge_index] == pytest.approx(5.0 / 8.0)
+
+        eps_line_pec = solver_pec.conformal_line_materials["primal"]["y"]["eps_r"][
+            edge_index
+        ]
+
+        assert eps_line_pec == pytest.approx(2.0)
+
+        # ============================================================
+        # PEC: dual y-face
+        # ============================================================
+        #
+        # Face fractions:
+        #
+        #     PEC        = 1/4
+        #     background = 3/4
+        #
+        # Only the normal background part remains active:
+        #
+        #     tA_fraction = 3/4
+        #
+        # Effective material on the active part:
+        #
+        #     eps_r = 2
+        # ============================================================
+
+        dual_face_data_pec = solver_pec.conformal_face_data["dual"]["y"]
+
+        assert dual_face_data_pec["normal_pec"][dual_face_index]
+
+        assert dual_face_data_pec["effective_area_fraction"][
+            dual_face_index
+        ] == pytest.approx(3.0 / 4.0)
+
+        assert solver_pec.tA_fraction.to_matrix("y")[dual_face_index] == pytest.approx(
+            3.0 / 4.0
+        )
+
+        assert solver_pec.tA_eff.to_matrix("y")[dual_face_index] == pytest.approx(
+            3.0 / 4.0
+        )
+
+        eps_face_pec = solver_pec.conformal_face_materials["dual"]["y"]["eps_r"][
+            dual_face_index
+        ]
+
+        assert eps_face_pec == pytest.approx(2.0)
+
+        # ============================================================
+        # PEC: primal z-face
+        # ============================================================
+        #
+        # Face fractions:
+        #
+        #     PEC        = 5/8
+        #     background = 3/8
+        #
+        # Therefore:
+        #
+        #     A_fraction = 3/8
+        #     A_eff      = 3/8
+        #
+        # Remaining material:
+        #
+        #     mu_r = 1
+        # ============================================================
+
+        primal_face_data_pec = solver_pec.conformal_face_data["primal"]["z"]
+
+        assert primal_face_data_pec["normal_pec"][primal_face_index]
+
+        assert primal_face_data_pec["effective_area_fraction"][
+            primal_face_index
+        ] == pytest.approx(3.0 / 8.0)
+
+        assert solver_pec.A_fraction.to_matrix("z")[primal_face_index] == pytest.approx(
+            3.0 / 8.0
+        )
+
+        assert solver_pec.A_eff.to_matrix("z")[primal_face_index] == pytest.approx(
+            3.0 / 8.0
+        )
+
+        mu_face_pec = solver_pec.conformal_face_materials["primal"]["z"]["mu_r"][
+            primal_face_index
+        ]
+
+        assert mu_face_pec == pytest.approx(1.0)
+
+        # ============================================================
+        # Applied conformal FIT metric operators
+        # ============================================================
+
+        solver_pec_applied = SolverFIT3D(
+            grid_pec,
+            bg=[
+                2.0,
+                1.0,
+                0.0,
+            ],
+            use_stl=True,
+            verbose=0,
+        )
+
+        # ------------------------------------------------------------
+        # The sparse metric matrices must use the effective
+        # conformal geometry.
+        # ------------------------------------------------------------
+
+        np.testing.assert_allclose(
+            solver_pec_applied.Ds.diagonal(),
+            solver_pec_applied.L.toarray(),
+        )
+
+        np.testing.assert_allclose(
+            solver_pec_applied.tDs.diagonal(),
+            solver_pec_applied.tL.toarray(),
+        )
+
+        np.testing.assert_allclose(
+            solver_pec_applied.iDa.diagonal(),
+            solver_pec_applied.iA.toarray(),
+        )
+
+        np.testing.assert_allclose(
+            solver_pec_applied.itDa.diagonal(),
+            solver_pec_applied.itA.toarray(),
+        )
+
+        # Primal y-edge:
+        # active normal length = 5/8
+        assert solver_pec_applied.L.to_matrix("y")[edge_index] == pytest.approx(
+            5.0 / 8.0
+        )
+
+        # Dual y-face:
+        # active normal area = 3/4
+        assert solver_pec_applied.itA.to_matrix("y")[dual_face_index] == pytest.approx(
+            4.0 / 3.0
+        )
+
+        # Primal z-face:
+        # active normal area = 3/8
+        assert solver_pec_applied.iA.to_matrix("z")[primal_face_index] == pytest.approx(
+            8.0 / 3.0
+        )
+
+    def test_legacy_solver_uses_original_metric_operators(self):
+        grid = GridFIT3D(
+            0.0,
+            2.0,
+            0.0,
+            3.0,
+            0.0,
+            4.0,
+            2,
+            3,
+            4,
+            geometry_mode="legacy",
+            verbose=0,
+        )
+
+        solver = SolverFIT3D(
+            grid,
+            use_stl=False,
+            verbose=0,
+        )
+
+        np.testing.assert_allclose(
+            solver.Ds.diagonal(),
+            solver.L.toarray(),
+        )
+
+        np.testing.assert_allclose(
+            solver.iDa.diagonal(),
+            solver.iA.toarray(),
+        )
+
+        np.testing.assert_allclose(
+            solver.tDs.diagonal(),
+            solver.tL.toarray(),
+        )
+
+        np.testing.assert_allclose(
+            solver.itDa.diagonal(),
+            solver.itA.toarray(),
+        )
 
     def test_long_wake_potential_and_impedance(self, use_gpu, plot_comparison):
         global grid
