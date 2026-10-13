@@ -61,7 +61,6 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         source_type="direct",
         bg=[1.0, 1.0, 0.0],
         verbose=2,
-        bg_material_type=None,
     ):
         """
         3D time-domain electromagnetic solver based on the Finite Integration
@@ -119,10 +118,6 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             Background material [eps_r, mu_r, sigma] or a material key from
             the library. If a sigma value is provided conductivity handling is
             enabled.
-        bg_material_type : str or None, optional
-            Material treatment of the background. Valid values are "normal",
-            "pec", and "sibc". If None, the type is inferred from the existing
-            background material definition. Default is None.
         verbose : int or bool, optional
             Verbosity flag for initialization messages.
 
@@ -177,10 +172,20 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         # Grid
         self.grid = grid
         self.background = bg
-        self.bg_material_type = self._prepare_background_material_type(
-            bg,
-            bg_material_type,
+
+        self.bg_material_type = getattr(
+            self.grid,
+            "bg_material_type",
+            None,
         )
+
+        if self.bg_material_type is None:
+            # Backward compatibility for grids created before
+            # bg_material_type was introduced.
+            self.bg_material_type = self._infer_background_material_type(bg)
+
+        self._validate_background_material(bg)
+
         self.region_material_types = {}
 
         self.interface_transition_masks = {
@@ -669,29 +674,29 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         self.solverInitializationTime = time.time() - t0
         self.update_logger(["solverInitializationTime"])
 
-    def _prepare_background_material_type(self, bg, bg_material_type):
+    def _infer_background_material_type(
+        self,
+        bg,
+    ):
         """
-        Prepare and validate the background material treatment type.
+        Infer the material treatment that is unambiguously implied by
+        the supplied background material.
 
-        Existing PEC background definitions are detected automatically for
-        backward compatibility. SIBC treatment must be requested explicitly.
+        This is primarily retained for backward compatibility. New grids
+        should define ``grid.bg_material_type`` explicitly.
         """
-        if bg_material_type is not None:
-            if not isinstance(bg_material_type, str):
-                raise TypeError("bg_material_type must be None or a string.")
-
-            material_type = bg_material_type.lower()
-
-            if material_type not in VALID_MATERIAL_TYPES:
-                raise ValueError(
-                    f"Unknown background material type '{material_type}'. "
-                    f"Expected one of {VALID_MATERIAL_TYPES}."
-                )
-
-            return material_type
-
         if isinstance(bg, str):
-            if bg.lower() == "pec":
+            material_key = bg.lower()
+
+            if material_key == "pec":
+                return "pec"
+
+            if material_key not in material_lib:
+                raise ValueError(f"Unknown background material {bg!r}.")
+
+            material = material_lib[material_key]
+
+            if np.isinf(material[0]):
                 return "pec"
 
             return "normal"
@@ -700,6 +705,45 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             return "pec"
 
         return "normal"
+
+    def _validate_background_material(
+        self,
+        bg,
+    ):
+        """
+        Check that the solver background material is compatible with
+        the material treatment declared by the grid.
+        """
+        declared_type = self.bg_material_type
+
+        if declared_type not in (VALID_MATERIAL_TYPES):
+            raise ValueError(
+                "Invalid grid background material "
+                f"type {declared_type!r}. "
+                f"Expected one of "
+                f"{VALID_MATERIAL_TYPES}."
+            )
+
+        inferred_type = self._infer_background_material_type(bg)
+
+        # PEC is unambiguous from the constitutive material:
+        # eps_r = infinity / material key "pec".
+        if declared_type == "pec" and inferred_type != "pec":
+            raise ValueError(
+                "The grid declares the background "
+                "as PEC, but the material passed "
+                f"to SolverFIT3D is {bg!r} and "
+                "does not represent a PEC."
+            )
+
+        if declared_type != "pec" and inferred_type == "pec":
+            raise ValueError(
+                "The material passed to "
+                "SolverFIT3D represents a PEC, "
+                "but the grid declares the "
+                "background material type as "
+                f"{declared_type!r}."
+            )
 
     def _build_region_material_types(self):
         """

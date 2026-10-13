@@ -674,6 +674,133 @@ class TestGridFIT3DMeshing:
 
         assert solver.use_conductivity
 
+    def test_conformal_material_assignment_pec(self):
+        """
+        A PEC region must deactivate the corresponding electric DOFs.
+
+        PEC is represented by eps_r = infinity. After conformal
+        dual-point averaging this must result in
+
+            ieps = 1 / eps = 0.
+        """
+        Nx = 2
+        Ny = 2
+        Nz = 2
+
+        shape_points = (
+            Nx + 1,
+            Ny + 1,
+            Nz + 1,
+        )
+
+        shape_cells = (
+            Nx,
+            Ny,
+            Nz,
+        )
+
+        primal_mask = np.ones(
+            shape_points,
+            dtype=bool,
+        )
+
+        dual_mask = np.ones(
+            shape_points,
+            dtype=bool,
+        )
+
+        grid = SimpleNamespace(
+            stl_solids={
+                "pec": None,
+            },
+            stl_materials={
+                "pec": [
+                    np.inf,
+                    1.0,
+                    0.0,
+                ],
+            },
+            stl_colors={
+                "pec": None,
+            },
+            primal_point_masks={
+                "pec": primal_mask,
+            },
+            dual_point_masks={
+                "pec": dual_mask,
+            },
+        )
+
+        solver = SolverFIT3D.__new__(SolverFIT3D)
+
+        solver.Nx = Nx
+        solver.Ny = Ny
+        solver.Nz = Nz
+        solver.grid = grid
+
+        solver.dtype = np.float64
+
+        solver.eps_bg = eps_0
+        solver.mu_bg = mu_0
+        solver.sigma_bg = 0.0
+
+        solver.use_sibc = False
+        solver.use_conductivity = False
+        solver.verbose = 0
+
+        solver.ieps = SimpleNamespace(
+            field_x=np.zeros(shape_cells),
+            field_y=np.zeros(shape_cells),
+            field_z=np.zeros(shape_cells),
+        )
+
+        solver.imu = SimpleNamespace(
+            field_x=np.zeros(shape_cells),
+            field_y=np.zeros(shape_cells),
+            field_z=np.zeros(shape_cells),
+        )
+
+        solver.sigma = SimpleNamespace(
+            field_x=np.zeros(shape_cells),
+            field_y=np.zeros(shape_cells),
+            field_z=np.zeros(shape_cells),
+        )
+
+        solver._apply_stl_materials_conformal()
+
+        for field in (
+            solver.ieps.field_x,
+            solver.ieps.field_y,
+            solver.ieps.field_z,
+        ):
+            np.testing.assert_array_equal(
+                field,
+                np.zeros_like(field),
+            )
+
+        # PEC does not alter mu in the present material model.
+        expected_imu = 1.0 / mu_0
+
+        for field in (
+            solver.imu.field_x,
+            solver.imu.field_y,
+            solver.imu.field_z,
+        ):
+            np.testing.assert_allclose(
+                field,
+                expected_imu,
+            )
+
+        for field in (
+            solver.sigma.field_x,
+            solver.sigma.field_y,
+            solver.sigma.field_z,
+        ):
+            np.testing.assert_array_equal(
+                field,
+                np.zeros_like(field),
+            )
+
     def test_conformal_material_assignment_rejects_sibc(self):
         """Test that SIBC is explicitly rejected for conformal geometry."""
 
@@ -781,6 +908,13 @@ class TestGridFIT3DMeshing:
         }
 
     def test_background_material_type(self):
+        # --------------------------------------------------
+        # Backward compatibility:
+        #
+        # If the grid does not explicitly define the
+        # background treatment, the solver infers the
+        # unambiguous type from the supplied material.
+        # --------------------------------------------------
         grid = GridFIT3D(
             0.0,
             1.0,
@@ -794,7 +928,6 @@ class TestGridFIT3DMeshing:
             verbose=0,
         )
 
-        # Default finite material -> normal
         solver = SolverFIT3D(
             grid,
             bg=[1.0, 1.0, 0.0],
@@ -803,7 +936,6 @@ class TestGridFIT3DMeshing:
 
         assert solver.bg_material_type == "normal"
 
-        # Existing PEC definition -> pec
         solver = SolverFIT3D(
             grid,
             bg="pec",
@@ -812,15 +944,84 @@ class TestGridFIT3DMeshing:
 
         assert solver.bg_material_type == "pec"
 
-        # SIBC must be requested explicitly
-        solver = SolverFIT3D(
-            grid,
-            bg=[1.0, 1.0, 0.0],
+        # --------------------------------------------------
+        # Explicit treatment type belongs to GridFIT3D.
+        #
+        # SIBC cannot be inferred from finite constitutive
+        # parameters and must therefore be declared by the grid.
+        # --------------------------------------------------
+        grid_sibc = GridFIT3D(
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            2,
+            2,
+            2,
             bg_material_type="sibc",
             verbose=0,
         )
 
+        solver = SolverFIT3D(
+            grid_sibc,
+            bg=[1.0, 1.0, 0.0],
+            verbose=0,
+        )
+
         assert solver.bg_material_type == "sibc"
+
+        # --------------------------------------------------
+        # Inconsistent PEC declarations must be rejected.
+        # --------------------------------------------------
+        grid_normal = GridFIT3D(
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            2,
+            2,
+            2,
+            bg_material_type="normal",
+            verbose=0,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="background",
+        ):
+            SolverFIT3D(
+                grid_normal,
+                bg="pec",
+                verbose=0,
+            )
+
+        grid_pec = GridFIT3D(
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            2,
+            2,
+            2,
+            bg_material_type="pec",
+            verbose=0,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="background",
+        ):
+            SolverFIT3D(
+                grid_pec,
+                bg=[1.0, 1.0, 0.0],
+                verbose=0,
+            )
 
     def test_primal_and_dual_region_topology(self):
         grid = GridFIT3D(
@@ -947,6 +1148,7 @@ class TestGridFIT3DMeshing:
             1,
             1,
             geometry_mode="conformal",
+            bg_material_type="normal",
             verbose=0,
         )
 
@@ -1009,7 +1211,6 @@ class TestGridFIT3DMeshing:
         solver = SolverFIT3D(
             grid,
             bg=[1.0, 1.0, 0.0],
-            bg_material_type="normal",
             use_stl=False,
             verbose=0,
         )
@@ -1189,6 +1390,7 @@ class TestGridFIT3DMeshing:
             1,
             1,
             geometry_mode="conformal",
+            bg_material_type="normal",
             verbose=0,
         )
 
@@ -1316,7 +1518,6 @@ class TestGridFIT3DMeshing:
                 3.0,
                 4.0,
             ],
-            bg_material_type="normal",
             use_stl=False,
             verbose=0,
         )
@@ -1484,6 +1685,458 @@ class TestGridFIT3DMeshing:
             z_edges[:-1, :-1, :],
         )
 
+    def test_conformal_pec_snapping_small_normal_edge(self):
+        """
+        A small active normal fraction at a normal-PEC interface is
+        snapped onto the adjacent grid point.
+
+        Initial x-topology:
+
+            normal ---- normal --x-- PEC
+                                alpha = 0.01
+
+        With a snapping threshold of 0.05, the middle point becomes PEC:
+
+            normal ---- PEC -------- PEC
+
+        The original interior cut disappears. The neighboring x-edge
+        becomes an endpoint contact at alpha=1. The same snapped PEC
+        point also creates endpoint contacts on adjacent y- and z-edges,
+        but none of these endpoint contacts may trigger a cut face.
+        """
+        grid = GridFIT3D(
+            0.0,
+            2.0,
+            0.0,
+            1.0,
+            0.0,
+            1.0,
+            2,
+            1,
+            1,
+            geometry_mode="conformal",
+            bg_material_type="normal",
+            conformal_pec_snap_fraction=0.05,
+            verbose=0,
+        )
+
+        # ----------------------------------------------------------
+        # Synthetic material topology
+        #
+        # Region 0 = normal background
+        # Region 1 = PEC
+        # ----------------------------------------------------------
+        grid.stl_solids = {
+            "pec": "unused",
+        }
+
+        grid.stl_materials = {
+            "pec": [
+                np.inf,
+                1.0,
+                0.0,
+            ],
+        }
+
+        grid.stl_material_types = {
+            "pec": "pec",
+        }
+
+        point_shape = (
+            3,
+            2,
+            2,
+        )
+
+        pec_mask = np.zeros(
+            point_shape,
+            dtype=bool,
+        )
+
+        # Initial x-sequence:
+        #
+        #   0 ---- 0 ---- 1
+        #
+        pec_mask[2, :, :] = True
+
+        grid.primal_point_masks = {
+            "pec": pec_mask.copy(),
+        }
+
+        grid.dual_point_masks = {
+            "pec": pec_mask.copy(),
+        }
+
+        grid._build_interface_topology()
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            np.testing.assert_array_equal(
+                grid.region_ids[grid_type][
+                    :,
+                    0,
+                    0,
+                ],
+                np.array(
+                    [
+                        0,
+                        0,
+                        1,
+                    ],
+                    dtype=np.int32,
+                ),
+            )
+
+        # ----------------------------------------------------------
+        # Synthetic raw STL intersection data
+        # ----------------------------------------------------------
+        grid.interface_intersections = {
+            "primal": {},
+            "dual": {},
+        }
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                (
+                    edge_shape,
+                    _,
+                ) = grid._get_edge_shape_and_transverse_indices(
+                    grid_type,
+                    direction,
+                )
+
+                grid.interface_intersections[grid_type][direction] = {
+                    "alpha": np.full(
+                        edge_shape,
+                        np.nan,
+                        dtype=float,
+                    ),
+                    "surface_id": np.full(
+                        edge_shape,
+                        -1,
+                        dtype=np.int32,
+                    ),
+                    "cell_id": np.full(
+                        edge_shape,
+                        -1,
+                        dtype=np.int64,
+                    ),
+                    "normal": np.full(
+                        edge_shape + (3,),
+                        np.nan,
+                        dtype=float,
+                    ),
+                    "has_crossing": np.zeros(
+                        edge_shape,
+                        dtype=bool,
+                    ),
+                    "multiple_crossing_positions": np.zeros(
+                        edge_shape,
+                        dtype=bool,
+                    ),
+                }
+
+        # Crossing on the second x-edge:
+        #
+        # point 1 ---- x ---- point 2
+        #              0.01
+        cut_edge = (
+            1,
+            0,
+            0,
+        )
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            data = grid.interface_intersections[grid_type]["x"]
+
+            data["alpha"][cut_edge] = 0.01
+
+            data["surface_id"][cut_edge] = 1
+
+            data["cell_id"][cut_edge] = 0
+
+            data["normal"][cut_edge] = [
+                1.0,
+                0.0,
+                0.0,
+            ]
+
+            data["has_crossing"][cut_edge] = True
+
+        grid._build_resolved_interface_edge_masks()
+
+        # Before snapping, the second x-edge is the resolved
+        # normal -> PEC interior cut.
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            assert grid.interior_interface_edge_masks[grid_type]["x"][cut_edge]
+
+            assert grid.resolved_interface_edge_masks[grid_type]["x"][cut_edge]
+
+        # ----------------------------------------------------------
+        # Apply PEC snapping
+        # ----------------------------------------------------------
+        grid._apply_conformal_pec_snapping()
+
+        endpoint_x_edge = (
+            0,
+            0,
+            0,
+        )
+
+        endpoint_y_edge = (
+            1,
+            0,
+            0,
+        )
+
+        endpoint_z_edge = (
+            1,
+            0,
+            0,
+        )
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            # ------------------------------------------------------
+            # Point topology changed from
+            #
+            #     normal, normal, PEC
+            #
+            # to
+            #
+            #     normal, PEC, PEC
+            # ------------------------------------------------------
+            np.testing.assert_array_equal(
+                grid.region_ids[grid_type][
+                    :,
+                    0,
+                    0,
+                ],
+                np.array(
+                    [
+                        0,
+                        1,
+                        1,
+                    ],
+                    dtype=np.int32,
+                ),
+            )
+
+            np.testing.assert_array_equal(
+                (
+                    grid.primal_point_masks
+                    if grid_type == "primal"
+                    else grid.dual_point_masks
+                )["pec"][
+                    :,
+                    0,
+                    0,
+                ],
+                np.array(
+                    [
+                        False,
+                        True,
+                        True,
+                    ],
+                    dtype=bool,
+                ),
+            )
+
+            # ------------------------------------------------------
+            # Original cut edge:
+            #
+            # PEC ---- PEC
+            #
+            # It is no longer an interface edge at all.
+            # ------------------------------------------------------
+            assert not grid.interface_edge_masks[grid_type]["x"][cut_edge]
+
+            assert not grid.interior_interface_edge_masks[grid_type]["x"][cut_edge]
+
+            assert not grid.endpoint_interface_edge_masks[grid_type]["x"][cut_edge]
+
+            assert not grid.resolved_interface_edge_masks[grid_type]["x"][cut_edge]
+
+            # The raw STL location must still be available.
+            assert grid.interface_intersections[grid_type]["x"]["raw_alpha"][
+                cut_edge
+            ] == pytest.approx(0.01)
+
+            # The dense effective alpha no longer represents
+            # a cut on this now PEC-PEC edge.
+            assert np.isnan(
+                grid.interface_intersections[grid_type]["x"]["alpha"][cut_edge]
+            )
+
+            # ------------------------------------------------------
+            # Previous x-edge:
+            #
+            # normal ---- PEC
+            #              ^
+            #          alpha = 1
+            #
+            # This is an endpoint contact, not an interior cut.
+            # ------------------------------------------------------
+            assert grid.interface_edge_masks[grid_type]["x"][endpoint_x_edge]
+
+            assert not grid.interior_interface_edge_masks[grid_type]["x"][
+                endpoint_x_edge
+            ]
+
+            assert grid.endpoint_interface_edge_masks[grid_type]["x"][endpoint_x_edge]
+
+            assert grid.resolved_interface_edge_masks[grid_type]["x"][endpoint_x_edge]
+
+            assert grid.interface_intersections[grid_type]["x"]["alpha"][
+                endpoint_x_edge
+            ] == pytest.approx(1.0)
+
+            # ------------------------------------------------------
+            # The snapped point is PEC for ALL incident edges.
+            #
+            # Therefore new y/z material transitions are represented
+            # as endpoint contacts at alpha=0, not as interior cuts.
+            # ------------------------------------------------------
+            assert grid.endpoint_interface_edge_masks[grid_type]["y"][endpoint_y_edge]
+
+            assert not grid.interior_interface_edge_masks[grid_type]["y"][
+                endpoint_y_edge
+            ]
+
+            assert grid.interface_intersections[grid_type]["y"]["alpha"][
+                endpoint_y_edge
+            ] == pytest.approx(0.0)
+
+            assert grid.endpoint_interface_edge_masks[grid_type]["z"][endpoint_z_edge]
+
+            assert not grid.interior_interface_edge_masks[grid_type]["z"][
+                endpoint_z_edge
+            ]
+
+            assert grid.interface_intersections[grid_type]["z"]["alpha"][
+                endpoint_z_edge
+            ] == pytest.approx(0.0)
+
+        # ----------------------------------------------------------
+        # Endpoint contacts must not trigger conformal face cuts.
+        # ----------------------------------------------------------
+        grid._build_face_candidate_masks()
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for face_direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                assert not np.any(grid.face_candidate_masks[grid_type][face_direction])
+
+        # ----------------------------------------------------------
+        # Solver integration
+        #
+        # The snapped topology must now propagate into the actual
+        # material operator.
+        #
+        # Effective x topology:
+        #
+        #     normal -------- PEC -------- PEC
+        #                    ^
+        #              endpoint contact
+        #
+        # Edge 0 remains a fully active normal edge.
+        # Edge 1 is fully inside PEC and must therefore have ieps = 0.
+        #
+        # Neither edge should retain the original tiny 0.01 metric
+        # fraction.
+        # ----------------------------------------------------------
+        solver = SolverFIT3D(
+            grid,
+            bg=[
+                1.0,
+                1.0,
+                0.0,
+            ],
+            use_stl=True,
+            verbose=0,
+        )
+
+        normal_edge = (
+            0,
+            0,
+            0,
+        )
+
+        snapped_pec_edge = (
+            1,
+            0,
+            0,
+        )
+
+        L_fraction_x = solver.L_fraction.to_matrix("x")
+
+        L_eff_x = solver.L_eff.to_matrix("x")
+
+        L_x = solver.L.to_matrix("x")
+
+        ieps_x = solver.ieps.to_matrix("x")
+
+        # ----------------------------------------------------------
+        # Geometric line fractions
+        #
+        # normal -> PEC endpoint contact at alpha = 1:
+        #     active normal fraction = 1
+        #
+        # PEC -> PEC:
+        #     no conformal cut remains, therefore the base metric
+        #     remains unchanged.
+        # ----------------------------------------------------------
+        assert L_fraction_x[normal_edge] == pytest.approx(1.0)
+
+        assert L_fraction_x[snapped_pec_edge] == pytest.approx(1.0)
+
+        assert L_eff_x[normal_edge] == pytest.approx(L_x[normal_edge])
+
+        assert L_eff_x[snapped_pec_edge] == pytest.approx(L_x[snapped_pec_edge])
+
+        # ----------------------------------------------------------
+        # Electric material operator
+        #
+        # Normal edge:
+        #     ieps = 1 / eps_0
+        #
+        # Snapped PEC-PEC edge:
+        #     eps = infinity
+        #     ieps = 0
+        # ----------------------------------------------------------
+        assert ieps_x[normal_edge] == pytest.approx(1.0 / eps_0)
+
+        assert ieps_x[snapped_pec_edge] == pytest.approx(0.0)
+
+        # The sparse material matrix used by the actual update
+        # equations must contain the same PEC deactivation.
+        ieps_diagonal = solver.iDeps.diagonal()
+
+        assert np.count_nonzero(ieps_diagonal == 0.0) > 0
+
     def test_face_candidate_masks(self):
         grid = GridFIT3D(
             0.0,
@@ -1561,7 +2214,7 @@ class TestGridFIT3DMeshing:
             edge_index,
             expected_faces,
         ) in cases:
-            grid.resolved_interface_edge_masks = {
+            grid.interior_interface_edge_masks = {
                 "primal": {
                     direction: np.zeros(
                         edge_shapes[direction],
@@ -1590,7 +2243,7 @@ class TestGridFIT3DMeshing:
                 "primal",
                 "dual",
             ):
-                grid.resolved_interface_edge_masks[grid_type][edge_direction][
+                grid.interior_interface_edge_masks[grid_type][edge_direction][
                     edge_index
                 ] = True
 
@@ -2101,6 +2754,11 @@ class TestGridFIT3DMeshing:
             "dual": {},
         }
 
+        grid.interior_interface_edge_masks = {
+            "primal": {},
+            "dual": {},
+        }
+
         grid.interface_intersections = {
             "primal": {},
             "dual": {},
@@ -2118,6 +2776,11 @@ class TestGridFIT3DMeshing:
                 shape = edge_shapes[direction]
 
                 grid.resolved_interface_edge_masks[grid_type][direction] = np.zeros(
+                    shape,
+                    dtype=bool,
+                )
+
+                grid.interior_interface_edge_masks[grid_type][direction] = np.zeros(
                     shape,
                     dtype=bool,
                 )
@@ -2174,6 +2837,8 @@ class TestGridFIT3DMeshing:
             ),
         ):
             grid.resolved_interface_edge_masks["primal"]["y"][edge] = True
+
+            grid.interior_interface_edge_masks["primal"]["y"][edge] = True
 
             grid.interface_intersections["primal"]["y"]["alpha"][edge] = alpha
 
@@ -2347,6 +3012,7 @@ class TestGridFIT3DMeshing:
             1,
             1,
             geometry_mode="conformal",
+            bg_material_type="normal",
             verbose=0,
         )
 
@@ -2514,7 +3180,6 @@ class TestGridFIT3DMeshing:
                 3.0,
                 4.0,
             ],
-            bg_material_type="normal",
             use_stl=False,
             verbose=0,
         )

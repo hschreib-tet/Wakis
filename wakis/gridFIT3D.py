@@ -65,6 +65,8 @@ class GridFIT3D(PlotMixin):
         stl_tol=1e-3,
         stl_method="legacy",
         geometry_mode="legacy",
+        bg_material_type=None,
+        conformal_pec_snap_fraction=0.0,
         subpixel_smoothing=False,
         subpixel_smoothing_factor=4,
         subpixel_smoothing_threshold=0.3,
@@ -150,6 +152,14 @@ class GridFIT3D(PlotMixin):
             Load grid from an h5 file previously saved with `save_to_h5`.
         verbose : int or bool, optional
             Enable verbose output on the terminal. Use `verbose=2` for more detail.
+        bg_material_type : str, optional
+            Material treatment of region 0. Required by the conformal
+            geometry pipeline when PEC snapping is enabled. Default is
+            None.
+        conformal_pec_snap_fraction : float, optional
+            Minimum active normal edge fraction at normal-PEC interfaces.
+            Smaller normal fractions are removed by snapping the interface
+            onto the adjacent grid point. Default is 0.0 (disabled).
 
         Attributes
         ----------
@@ -176,6 +186,72 @@ class GridFIT3D(PlotMixin):
         if self.geometry_mode not in ("legacy", "conformal"):
             raise ValueError("[!] geometry_mode must be 'legacy' or 'conformal'.")
 
+        if bg_material_type is None:
+            self.bg_material_type = None
+
+        else:
+            if not isinstance(
+                bg_material_type,
+                str,
+            ):
+                raise TypeError("bg_material_type must be None or a string.")
+
+            self.bg_material_type = bg_material_type.lower()
+
+            if self.bg_material_type not in VALID_MATERIAL_TYPES:
+                raise ValueError(
+                    "Unknown background material "
+                    f"type "
+                    f"{self.bg_material_type!r}. "
+                    f"Expected one of "
+                    f"{VALID_MATERIAL_TYPES}."
+                )
+
+        self.conformal_pec_snap_fraction = float(conformal_pec_snap_fraction)
+
+        if (
+            self.geometry_mode == "conformal"
+            and self.conformal_pec_snap_fraction > 0.0
+            and self.bg_material_type is None
+        ):
+            raise ValueError(
+                "Conformal PEC snapping requires "
+                "bg_material_type to be specified "
+                "in GridFIT3D."
+            )
+
+        if not (0.0 <= self.conformal_pec_snap_fraction < 0.5):
+            raise ValueError(
+                "conformal_pec_snap_fraction must satisfy 0 <= value < 0.5."
+            )
+
+        # Primary and dual edges whose endpoints belong to different regions
+        self.interface_edge_masks = {
+            "primal": {},
+            "dual": {},
+        }
+
+        # Geometric STL intersections with primal and dual interface edges
+        self.interface_intersections = {
+            "primal": {},
+            "dual": {},
+        }
+
+        self.interior_interface_edge_masks = {
+            "primal": {},
+            "dual": {},
+        }
+
+        self.endpoint_interface_edge_masks = {
+            "primal": {},
+            "dual": {},
+        }
+
+        self.snapped_point_data = {
+            "primal": {},
+            "dual": {},
+        }
+
         # Point-based STL masks on the primal and dual grids
         self.primal_point_masks = {}
         self.dual_point_masks = {}
@@ -189,18 +265,6 @@ class GridFIT3D(PlotMixin):
 
         self.region_id_to_key = {0: None}
         self.region_key_to_id = {}
-
-        # Primary and dual edges whose endpoints belong to different regions
-        self.interface_edge_masks = {
-            "primal": {},
-            "dual": {},
-        }
-
-        # Geometric STL intersections with primal and dual interface edges
-        self.interface_intersections = {
-            "primal": {},
-            "dual": {},
-        }
 
         self.face_candidate_masks = {
             "primal": {},
@@ -2079,18 +2143,28 @@ class GridFIT3D(PlotMixin):
 
     def _build_resolved_interface_edge_masks(self):
         """
-        Build the interface masks used by the current conformal FIT
-        discretization.
+        Build the interface masks used by the conformal FIT discretization.
 
-        An interface edge is considered resolved if
+        Before PEC snapping, every resolved interface is an interior
+        geometrical crossing:
 
-        1. its endpoint region IDs indicate a material transition, and
-        2. at least one geometric STL crossing was found.
+            endpoint material transition
+            AND
+            geometric STL crossing
 
-        Hidden crossings are retained in the geometric intersection data but
-        are intentionally ignored by the current discretization. Endpoint
-        interfaces without a crossing are also excluded.
+        PEC snapping may later replace some interior crossings by
+        endpoint contacts.
         """
+        self.interior_interface_edge_masks = {
+            "primal": {},
+            "dual": {},
+        }
+
+        self.endpoint_interface_edge_masks = {
+            "primal": {},
+            "dual": {},
+        }
+
         self.resolved_interface_edge_masks = {
             "primal": {},
             "dual": {},
@@ -2111,9 +2185,619 @@ class GridFIT3D(PlotMixin):
                     "has_crossing"
                 ]
 
-                self.resolved_interface_edge_masks[grid_type][direction] = (
-                    endpoint_mask & has_crossing
+                interior = endpoint_mask & has_crossing
+
+                endpoint_contact = np.zeros_like(
+                    interior,
+                    dtype=bool,
                 )
+
+                self.interior_interface_edge_masks[grid_type][direction] = interior
+
+                self.endpoint_interface_edge_masks[grid_type][direction] = (
+                    endpoint_contact
+                )
+
+                self.resolved_interface_edge_masks[grid_type][direction] = (
+                    interior.copy()
+                )
+
+    @staticmethod
+    def _get_edge_endpoint_indices(
+        direction,
+        index,
+    ):
+        """
+        Return the start and end grid-point indices of one edge.
+        """
+        i, j, k = (int(value) for value in index)
+
+        start_index = (
+            i,
+            j,
+            k,
+        )
+
+        if direction == "x":
+            end_index = (
+                i + 1,
+                j,
+                k,
+            )
+
+        elif direction == "y":
+            end_index = (
+                i,
+                j + 1,
+                k,
+            )
+
+        elif direction == "z":
+            end_index = (
+                i,
+                j,
+                k + 1,
+            )
+
+        else:
+            raise ValueError(f"Unknown edge direction {direction!r}.")
+
+        return (
+            start_index,
+            end_index,
+        )
+
+    def _get_region_material_type(
+        self,
+        region_id,
+    ):
+        region_id = int(region_id)
+
+        if region_id == 0:
+            if self.bg_material_type is None:
+                raise RuntimeError(
+                    "Background material type is "
+                    "required for this conformal "
+                    "geometry operation."
+                )
+
+            return self.bg_material_type
+
+        key = self.region_id_to_key[region_id]
+
+        return self.stl_material_types[key]
+
+    def _rebuild_point_masks_from_region_ids(
+        self,
+    ):
+        """
+        Rebuild effective STL point masks from the current region IDs.
+
+        After PEC snapping the region IDs describe the effective
+        discretized geometry. The STL point masks are therefore
+        reconstructed from these IDs so that material assignment and
+        topology use the same geometry.
+        """
+        for (
+            grid_type,
+            point_masks,
+        ) in (
+            (
+                "primal",
+                self.primal_point_masks,
+            ),
+            (
+                "dual",
+                self.dual_point_masks,
+            ),
+        ):
+            regions = self.region_ids[grid_type]
+
+            for (
+                key,
+                region_id,
+            ) in self.region_key_to_id.items():
+                point_masks[key] = regions == region_id
+
+        # Keep the existing cell masks consistent with the
+        # effective primal-point geometry.
+        for key in self.stl_solids:
+            cell_mask = self._point_mask_to_cell_mask(
+                self.primal_point_masks[key],
+                threshold=0.5,
+            )
+
+            self.grid[key] = np.reshape(
+                cell_mask,
+                self.Nx * self.Ny * self.Nz,
+                order="C",
+            )
+
+    def _apply_conformal_pec_snapping(
+        self,
+        max_iterations=20,
+    ):
+        """
+        Remove small active normal edge fractions at normal-PEC
+        interfaces by snapping the interface onto a grid point.
+
+        Only single-crossing resolved interfaces are considered.
+
+        normal -> PEC:
+            alpha < eta
+            => start point becomes PEC
+
+        PEC -> normal:
+            1 - alpha < eta
+            => end point becomes PEC
+
+        The operation is monotonic: normal points may become PEC,
+        but PEC points are never converted back to normal.
+        """
+        eta = self.conformal_pec_snap_fraction
+
+        if eta <= 0.0:
+            return
+
+        # ----------------------------------------------------------
+        # Preserve the original geometric representative data.
+        #
+        # hit_groups / crossing_groups remain untouched as well.
+        # The dense alpha/surface/normal arrays will later describe
+        # the effective discretized interface.
+        # ----------------------------------------------------------
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                data = self.interface_intersections[grid_type][direction]
+
+                if "raw_alpha" not in data:
+                    data["raw_alpha"] = data["alpha"].copy()
+
+                    data["raw_surface_id"] = data["surface_id"].copy()
+
+                    data["raw_cell_id"] = data["cell_id"].copy()
+
+                    data["raw_normal"] = data["normal"].copy()
+
+        self.snapped_point_data = {
+            "primal": {},
+            "dual": {},
+        }
+
+        conflict_count = 0
+
+        for iteration in range(max_iterations):
+            proposals = {
+                "primal": {},
+                "dual": {},
+            }
+
+            # Rebuild endpoint topology from the current
+            # effective point regions.
+            for grid_type in (
+                "primal",
+                "dual",
+            ):
+                self.interface_edge_masks[grid_type] = (
+                    self._build_edge_transition_masks(self.region_ids[grid_type])
+                )
+
+            # ------------------------------------------------------
+            # Find small active normal portions.
+            # ------------------------------------------------------
+            for grid_type in (
+                "primal",
+                "dual",
+            ):
+                for direction in (
+                    "x",
+                    "y",
+                    "z",
+                ):
+                    (
+                        start_regions,
+                        end_regions,
+                    ) = self._get_edge_region_ids(
+                        grid_type,
+                        direction,
+                    )
+
+                    data = self.interface_intersections[grid_type][direction]
+
+                    raw_alpha = data["raw_alpha"]
+
+                    candidate = (
+                        self.interface_edge_masks[grid_type][direction]
+                        & data["has_crossing"]
+                    )
+
+                    for index_array in np.argwhere(candidate):
+                        index = tuple(int(value) for value in index_array)
+
+                        alpha = float(raw_alpha[index])
+
+                        if not np.isfinite(alpha):
+                            continue
+
+                        start_region = int(start_regions[index])
+
+                        end_region = int(end_regions[index])
+
+                        start_type = self._get_region_material_type(start_region)
+
+                        end_type = self._get_region_material_type(end_region)
+
+                        (
+                            start_index,
+                            end_index,
+                        ) = self._get_edge_endpoint_indices(
+                            direction,
+                            index,
+                        )
+
+                        node_index = None
+                        target_region = None
+
+                        # ------------------------------
+                        # normal -> PEC
+                        #
+                        # Active normal fraction = alpha
+                        # ------------------------------
+                        if start_type == "normal" and end_type == "pec" and alpha < eta:
+                            node_index = start_index
+
+                            target_region = end_region
+
+                        # ------------------------------
+                        # PEC -> normal
+                        #
+                        # Active normal fraction = 1-alpha
+                        # ------------------------------
+                        elif (
+                            start_type == "pec"
+                            and end_type == "normal"
+                            and (1.0 - alpha) < eta
+                        ):
+                            node_index = end_index
+
+                            target_region = start_region
+
+                        if node_index is None:
+                            continue
+
+                        proposal = {
+                            "target_region": (int(target_region)),
+                            "surface_id": int(data["raw_surface_id"][index]),
+                            "cell_id": int(data["raw_cell_id"][index]),
+                            "normal": np.asarray(
+                                data["raw_normal"][index],
+                                dtype=float,
+                            ).copy(),
+                        }
+
+                        proposals[grid_type].setdefault(
+                            node_index,
+                            [],
+                        ).append(proposal)
+
+            # ------------------------------------------------------
+            # Apply all non-conflicting point snaps simultaneously.
+            # ------------------------------------------------------
+            n_changes = 0
+
+            for grid_type in (
+                "primal",
+                "dual",
+            ):
+                regions = self.region_ids[grid_type]
+
+                for (
+                    node_index,
+                    node_proposals,
+                ) in proposals[grid_type].items():
+                    target_regions = {
+                        proposal["target_region"] for proposal in node_proposals
+                    }
+
+                    # Different requested PEC regions are a genuine
+                    # topological conflict.
+                    if len(target_regions) != 1:
+                        conflict_count += 1
+                        continue
+
+                    target_region = next(iter(target_regions))
+
+                    # Prefer geometry belonging directly to the
+                    # requested target STL region.
+                    target_surface_proposals = [
+                        proposal
+                        for proposal in node_proposals
+                        if proposal["surface_id"] == target_region
+                    ]
+
+                    if target_surface_proposals:
+                        metadata_proposals = target_surface_proposals
+
+                    else:
+                        # For example, a PEC background has no STL
+                        # surface of its own. In that case accept the
+                        # metadata only when the contributing
+                        # interface surface is unambiguous.
+                        surface_ids = {
+                            proposal["surface_id"] for proposal in node_proposals
+                        }
+
+                        if len(surface_ids) != 1:
+                            conflict_count += 1
+                            continue
+
+                        metadata_proposals = node_proposals
+
+                    selected_surface_id = int(metadata_proposals[0]["surface_id"])
+
+                    current_region = int(regions[node_index])
+
+                    if self._get_region_material_type(current_region) != "normal":
+                        continue
+
+                    regions[node_index] = target_region
+
+                    normals = [
+                        proposal["normal"]
+                        for proposal in metadata_proposals
+                        if np.all(np.isfinite(proposal["normal"]))
+                    ]
+
+                    if normals:
+                        normal = np.mean(
+                            normals,
+                            axis=0,
+                        )
+
+                        norm = np.linalg.norm(normal)
+
+                        if norm > 0.0:
+                            normal = normal / norm
+
+                        else:
+                            normal = np.full(
+                                3,
+                                np.nan,
+                            )
+
+                    else:
+                        normal = np.full(
+                            3,
+                            np.nan,
+                        )
+
+                    cell_ids = [
+                        proposal["cell_id"]
+                        for proposal in metadata_proposals
+                        if proposal["cell_id"] >= 0
+                    ]
+
+                    self.snapped_point_data[grid_type][node_index] = {
+                        "region_id": (int(target_region)),
+                        "surface_id": (selected_surface_id),
+                        "cell_id": (min(cell_ids) if cell_ids else -1),
+                        "normal": (normal.copy()),
+                    }
+
+                    n_changes += 1
+
+            if n_changes == 0:
+                break
+
+        else:
+            raise RuntimeError(
+                f"PEC snapping did not converge within {max_iterations} iterations."
+            )
+
+        if conflict_count:
+            warnings.warn(
+                f"{conflict_count} conformal PEC "
+                "snapping proposals were ignored "
+                "because multiple incompatible "
+                "regions or surfaces met at the "
+                "same grid point.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # Point masks used by material assignment must
+        # represent the same effective geometry.
+        self._rebuild_point_masks_from_region_ids()
+
+        self._rebuild_effective_interface_edges_after_snapping()
+
+    def _rebuild_effective_interface_edges_after_snapping(
+        self,
+    ):
+        """
+        Rebuild the effective interface topology after PEC snapping.
+
+        Interior cuts:
+            genuine STL crossings inside endpoint-transition edges.
+
+        Endpoint contacts:
+            new normal-PEC transitions caused by a snapped PEC node,
+            with the interface located exactly at alpha=0 or alpha=1.
+        """
+        self.interior_interface_edge_masks = {
+            "primal": {},
+            "dual": {},
+        }
+
+        self.endpoint_interface_edge_masks = {
+            "primal": {},
+            "dual": {},
+        }
+
+        self.resolved_interface_edge_masks = {
+            "primal": {},
+            "dual": {},
+        }
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            self.interface_edge_masks[grid_type] = self._build_edge_transition_masks(
+                self.region_ids[grid_type]
+            )
+
+            snapped_points = self.snapped_point_data[grid_type]
+
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                data = self.interface_intersections[grid_type][direction]
+
+                endpoint_transition = self.interface_edge_masks[grid_type][direction]
+
+                raw_alpha = data["raw_alpha"]
+
+                raw_surface_id = data["raw_surface_id"]
+
+                raw_cell_id = data["raw_cell_id"]
+
+                raw_normal = data["raw_normal"]
+
+                # Existing geometrical cuts that still connect
+                # two different effective endpoint regions.
+                interior = endpoint_transition & data["has_crossing"]
+
+                endpoint_contact = np.zeros_like(
+                    endpoint_transition,
+                    dtype=bool,
+                )
+
+                # Dense arrays now describe the EFFECTIVE
+                # conformal interface.
+                alpha = np.full(
+                    raw_alpha.shape,
+                    np.nan,
+                    dtype=float,
+                )
+
+                surface_id = np.full(
+                    raw_surface_id.shape,
+                    -1,
+                    dtype=np.int32,
+                )
+
+                cell_id = np.full(
+                    raw_cell_id.shape,
+                    -1,
+                    dtype=np.int64,
+                )
+
+                normal = np.full(
+                    raw_normal.shape,
+                    np.nan,
+                    dtype=float,
+                )
+
+                alpha[interior] = raw_alpha[interior]
+
+                surface_id[interior] = raw_surface_id[interior]
+
+                cell_id[interior] = raw_cell_id[interior]
+
+                normal[interior] = raw_normal[interior]
+
+                (
+                    start_regions,
+                    end_regions,
+                ) = self._get_edge_region_ids(
+                    grid_type,
+                    direction,
+                )
+
+                # Only transitions without an interior STL crossing
+                # can be synthetic endpoint contacts.
+                endpoint_candidates = endpoint_transition & ~interior
+
+                for index_array in np.argwhere(endpoint_candidates):
+                    index = tuple(int(value) for value in index_array)
+
+                    (
+                        start_index,
+                        end_index,
+                    ) = self._get_edge_endpoint_indices(
+                        direction,
+                        index,
+                    )
+
+                    start_region = int(start_regions[index])
+
+                    end_region = int(end_regions[index])
+
+                    start_type = self._get_region_material_type(start_region)
+
+                    end_type = self._get_region_material_type(end_region)
+
+                    metadata = None
+                    endpoint_alpha = None
+
+                    # normal -> PEC:
+                    # interface at the PEC end point.
+                    if start_type == "normal" and end_type == "pec":
+                        metadata = snapped_points.get(end_index)
+
+                        if metadata is not None and metadata["region_id"] == end_region:
+                            endpoint_alpha = 1.0
+
+                    # PEC -> normal:
+                    # interface at the PEC start point.
+                    elif start_type == "pec" and end_type == "normal":
+                        metadata = snapped_points.get(start_index)
+
+                        if (
+                            metadata is not None
+                            and metadata["region_id"] == start_region
+                        ):
+                            endpoint_alpha = 0.0
+
+                    if endpoint_alpha is None:
+                        continue
+
+                    endpoint_contact[index] = True
+
+                    alpha[index] = endpoint_alpha
+
+                    surface_id[index] = metadata["surface_id"]
+
+                    cell_id[index] = metadata["cell_id"]
+
+                    normal[index] = metadata["normal"]
+
+                resolved = interior | endpoint_contact
+
+                self.interior_interface_edge_masks[grid_type][direction] = interior
+
+                self.endpoint_interface_edge_masks[grid_type][direction] = (
+                    endpoint_contact
+                )
+
+                self.resolved_interface_edge_masks[grid_type][direction] = resolved
+
+                data["alpha"] = alpha
+                data["surface_id"] = surface_id
+                data["cell_id"] = cell_id
+                data["normal"] = normal
+
+                data["effective_endpoint_contact"] = endpoint_contact.copy()
 
     def _get_interface_diagnostics(self):
         """
@@ -2148,7 +2832,11 @@ class GridFIT3D(PlotMixin):
 
                 multiple = data["multiple_crossing_positions"]
 
-                missing = endpoint_mask & ~has_crossing
+                endpoint_contact = self.endpoint_interface_edge_masks[grid_type][
+                    direction
+                ]
+
+                missing = endpoint_mask & ~has_crossing & ~endpoint_contact
 
                 hidden = ~endpoint_mask & has_crossing
 
@@ -2291,7 +2979,7 @@ class GridFIT3D(PlotMixin):
             "primal",
             "dual",
         ):
-            edge_masks = self.resolved_interface_edge_masks.get(
+            edge_masks = self.interior_interface_edge_masks.get(
                 grid_type,
                 {},
             )
@@ -3575,6 +4263,9 @@ class GridFIT3D(PlotMixin):
         # and is independent of the endpoint transition masks.
         # --------------------------------------------------------------
         self._build_interface_intersections()
+
+        if self.conformal_pec_snap_fraction > 0.0:
+            self._apply_conformal_pec_snapping()
 
         # Produce Warnings for ignored interface cases (hidden crossings, missing crossings)
         self._warn_interface_diagnostics()
