@@ -1586,18 +1586,20 @@ class PlotMixinSolver:
     @staticmethod
     def _plotting_plane_axes(normal):
         """
-        Return the two in-plane coordinate indices for a slicing plane.
+        Return the two coordinate directions lying in a slicing plane.
 
-        normal='x' -> y-z plot
-        normal='y' -> x-z plot
-        normal='z' -> x-y plot
+        normal='x' -> y-z plane
+        normal='y' -> x-z plane
+        normal='z' -> x-y plane
         """
         normal = normal.lower()
 
         if normal == "x":
             return (1, 2), ("y", "z")
+
         if normal == "y":
             return (0, 2), ("x", "z")
+
         if normal == "z":
             return (0, 1), ("x", "y")
 
@@ -1606,402 +1608,1018 @@ class PlotMixinSolver:
     @staticmethod
     def _polydata_lines_to_segments(poly):
         """
-        Convert a PyVista PolyData line set into a list of point arrays,
-        one array per polyline.
+        Convert PyVista PolyData lines into a list of point arrays.
+
+        Each returned array contains the points of one polyline.
         """
         if poly is None or poly.n_points == 0 or poly.n_cells == 0:
             return []
 
-        points = poly.points
-        lines = poly.lines
+        points = np.asarray(poly.points)
+        lines = np.asarray(poly.lines)
 
         segments = []
-        i = 0
-        while i < len(lines):
-            npts = int(lines[i])
-            ids = lines[i + 1 : i + 1 + npts]
-            segments.append(points[ids])
-            i += npts + 1
+
+        offset = 0
+
+        while offset < len(lines):
+            n_points = int(lines[offset])
+
+            point_ids = lines[offset + 1 : offset + 1 + n_points]
+
+            segments.append(points[point_ids])
+
+            offset += n_points + 1
 
         return segments
 
     @staticmethod
-    def _conformal_active_interval(line_data, index, tol=1e-12):
-        """
-        Return the active parameter interval [t0, t1] on an edge.
-
-        Full edge:
-            t in [0, 1]
-
-        For conductor/normal transitions:
-            active part is clipped according to alpha.
-
-        The routine assumes the line_data dictionary contains the boolean masks
-        already used in the conformal preprocessing. If your exact key names for
-        the directional conductor cases differ slightly, adapt the two branches
-        below.
-        """
-        alpha = line_data["alpha"][index]
-
-        if not np.isfinite(alpha):
-            return 0.0, 1.0
-
-        alpha = float(np.clip(alpha, 0.0, 1.0))
-
-        # normal-normal: full edge remains active in the solver
-        if "normal_normal" in line_data and line_data["normal_normal"][index]:
-            return 0.0, 1.0
-
-        # conductor at start -> normal at end
-        if (
-            "conductor_to_normal" in line_data
-            and line_data["conductor_to_normal"][index]
-        ):
-            if alpha >= 1.0 - tol:
-                return None
-            return alpha, 1.0
-
-        # normal at start -> conductor at end
-        if (
-            "normal_to_conductor" in line_data
-            and line_data["normal_to_conductor"][index]
-        ):
-            if alpha <= tol:
-                return None
-            return 0.0, alpha
-
-        # fallback: if no special case is known, keep full edge
-        return 0.0, 1.0
-
-    @staticmethod
-    def _edge_segment_from_interval(p0, p1, interval):
-        """
-        Convert a parametric interval [t0, t1] on the edge p(t)=p0+t*(p1-p0)
-        into a clipped Cartesian line segment.
-        """
-        if interval is None:
-            return None
-
-        t0, t1 = interval
-        direction = p1 - p0
-
-        q0 = p0 + t0 * direction
-        q1 = p0 + t1 * direction
-
-        return q0, q1
-
-    def plot_conformal_primal_edge_slice(
-        self,
-        normal="x",
-        index=0,
-        ax=None,
-        figsize=(7, 7),
-        show_full_grid=True,
-        show_stl=True,
-        show_intersection_marker=True,
-        split_normal_normal=False,
-        active_color="C0",
-        inactive_color="0.85",
-        stl_color="k",
-        full_grid_color="0.85",
-        full_grid_lw=0.6,
-        active_lw=2.0,
-        stl_lw=1.0,
-        marker_size=18,
-        tol=1e-12,
+    def _point_on_edge(
+        p0,
+        p1,
+        alpha,
     ):
         """
-        Plot a 2D slice of the primal conformal grid as edge segments.
+        Return the point
 
-        The function visualizes the primal in-plane edges on a chosen slice:
-        - for x-slices: y- and z-directed primal edges
-        - for y-slices: x- and z-directed primal edges
-        - for z-slices: x- and y-directed primal edges
+            p(alpha) = p0 + alpha * (p1 - p0)
 
-        Active edge lengths are clipped according to the conformal solver data
-        (alpha and line classification). For normal-normal transitions, the full
-        edge remains active; optionally a marker can show the interface crossing.
+        on an edge.
+        """
+        return p0 + alpha * (p1 - p0)
 
-        Parameters
-        ----------
-        self :
-            Solver object. The function expects:
-            - self.grid
-            - self.conformal_line_data["primal"]
-            - self.L_fraction
-            to be available.
+    def _conformal_region_colors(self):
+        """
+        Build plotting colors for all conformal material regions.
 
-        normal : {"x", "y", "z"}
-            Slice normal direction.
+        STL colors explicitly supplied through ``grid.stl_colors`` are
+        preserved. All remaining STL regions receive automatically assigned
+        colors from Matplotlib's tab20 colormap.
 
-        index : int
-            Slice index on the corresponding primal grid plane.
+        Region 0 is the background and receives a neutral color.
+        """
+        grid = self.grid
 
-        show_full_grid : bool
-            If True, draw the full uncut grid edges in the background.
+        region_colors = {
+            0: "0.55",
+        }
 
-        show_stl : bool
-            If True, draw the STL intersection curves in the same slice.
+        stl_colors = getattr(
+            grid,
+            "stl_colors",
+            {},
+        )
 
-        split_normal_normal : bool
-            If True, normal-normal edges are drawn as two differently colored
-            subsegments split at alpha. If False, they are drawn as one active
-            segment plus an optional marker at the interface.
+        if stl_colors is None:
+            stl_colors = {}
+
+        cmap = plt.get_cmap("tab20")
+
+        color_index = 0
+
+        for key in grid.stl_solids.keys():
+            region_id = int(grid.region_key_to_id[key])
+
+            requested_color = stl_colors.get(
+                key,
+                None,
+            )
+
+            if requested_color is not None:
+                region_colors[region_id] = requested_color
+
+            else:
+                region_colors[region_id] = cmap(color_index % cmap.N)
+
+                color_index += 1
+
+        # Fallback for any additional region IDs which are not
+        # represented by an STL key.
+        for region_id in self.region_material_types:
+            region_id = int(region_id)
+
+            if region_id in region_colors:
+                continue
+
+            region_colors[region_id] = cmap(color_index % cmap.N)
+
+            color_index += 1
+
+        return region_colors
+
+    def _conformal_region_label(
+        self,
+        region_id,
+    ):
+        """
+        Return a human-readable label for a conformal material region.
+        """
+        region_id = int(region_id)
+
+        key = self.grid.region_id_to_key.get(
+            region_id,
+            None,
+        )
+
+        material_type = self.region_material_types.get(
+            region_id,
+            "unknown",
+        )
+
+        if key is None:
+            name = "background"
+
+        else:
+            name = str(key)
+
+        if material_type == "normal":
+            return name
+
+        return f"{name} ({material_type.upper()})"
+
+    def _conformal_endpoint_alpha(
+        self,
+        direction,
+        edge_index,
+        tol=1e-8,
+    ):
+        """
+        Detect whether an interface lies exactly on one endpoint of a
+        primal edge.
+
+        Geometric hits located exactly on a grid node are assigned by
+        GridFIT3D to one unique edge. Because _locate_intersection_edge()
+        uses searchsorted(..., side="right"), an interface at the end of
+        the current edge can therefore appear as alpha=0 on the following
+        edge.
 
         Returns
         -------
-        ax : matplotlib.axes.Axes
+        0.0
+            Interface lies at the start point of the current edge.
+
+        1.0
+            Interface lies at the end point of the current edge.
+
+        None
+            No endpoint interface could be identified unambiguously.
         """
-        if not hasattr(self, "conformal_line_data"):
-            raise RuntimeError("No conformal line data available on this object.")
+        grid = self.grid
+
+        intersection_data = grid.interface_intersections["primal"][direction]
+
+        hit_groups = intersection_data.get(
+            "hit_groups",
+            {},
+        )
+
+        def group_alphas(index):
+            groups = hit_groups.get(
+                index,
+                [],
+            )
+
+            alphas = []
+
+            for group in groups:
+                if not group:
+                    continue
+
+                alpha = float(np.mean([hit["alpha"] for hit in group]))
+
+                if np.isfinite(alpha):
+                    alphas.append(alpha)
+
+            return alphas
+
+        # ------------------------------------------------------
+        # 1) Check the current edge itself.
+        # ------------------------------------------------------
+        current_alphas = group_alphas(edge_index)
+
+        if any(alpha <= tol for alpha in current_alphas):
+            return 0.0
+
+        if any(alpha >= 1.0 - tol for alpha in current_alphas):
+            return 1.0
+
+        # ------------------------------------------------------
+        # 2) A hit at the end point of the current edge is often
+        #    stored as alpha=0 on the following edge.
+        # ------------------------------------------------------
+        i, j, k = edge_index
+
+        if direction == "x":
+            next_index = (
+                i + 1,
+                j,
+                k,
+            )
+
+            valid_next = i + 1 < grid.Nx
+
+        elif direction == "y":
+            next_index = (
+                i,
+                j + 1,
+                k,
+            )
+
+            valid_next = j + 1 < grid.Ny
+
+        elif direction == "z":
+            next_index = (
+                i,
+                j,
+                k + 1,
+            )
+
+            valid_next = k + 1 < grid.Nz
+
+        else:
+            raise ValueError(f"Unknown edge direction '{direction}'.")
+
+        if valid_next:
+            next_alphas = group_alphas(next_index)
+
+            if any(alpha <= tol for alpha in next_alphas):
+                return 1.0
+
+        return None
+
+    def _conformal_edge_display_segments(
+        self,
+        direction,
+        line_data,
+        edge_index,
+        p0,
+        p1,
+        tol=1e-8,
+    ):
+        """
+        Return the active drawable parts of one primal conformal edge.
+
+        Each returned entry is
+
+            (q0, q1, region_id)
+
+        where q0 and q1 are the endpoints of one active edge segment.
+
+        Plotting rules
+        --------------
+        Edge entirely inside one normal region:
+            Draw the complete edge.
+
+        Edge entirely inside PEC/SIBC:
+            Draw nothing.
+
+        normal <-> normal with 0 < alpha < 1:
+            Split the edge at alpha and draw both material portions.
+
+        normal <-> PEC/SIBC:
+            Draw only the normal-material portion.
+
+        alpha ~= 0:
+            The interface lies at the start node. Apart from that single
+            point, the complete edge belongs to the end region.
+
+        alpha ~= 1:
+            The interface lies at the end node. Apart from that single
+            point, the complete edge belongs to the start region.
+
+        Unresolved transitions:
+            Endpoint contacts are recovered from the geometric
+            contact-group information. Other unresolved cases are omitted.
+        """
+        start_region = int(line_data["start_region"][edge_index])
+
+        end_region = int(line_data["end_region"][edge_index])
+
+        start_type = self.region_material_types[start_region]
+
+        end_type = self.region_material_types[end_region]
+
+        def full_normal_edge(region_id, material_type):
+            if material_type == "normal":
+                return [
+                    (
+                        p0,
+                        p1,
+                        region_id,
+                    )
+                ]
+
+            return []
+
+        # ----------------------------------------------------------
+        # No material transition on this edge.
+        # ----------------------------------------------------------
+        if start_region == end_region:
+            return full_normal_edge(
+                start_region,
+                start_type,
+            )
+
+        # ----------------------------------------------------------
+        # First try the representative solver intersection.
+        # ----------------------------------------------------------
+        resolved = bool(line_data["resolved"][edge_index])
+
+        alpha = line_data["alpha"][edge_index]
+
+        if resolved and np.isfinite(alpha):
+            alpha = float(
+                np.clip(
+                    alpha,
+                    0.0,
+                    1.0,
+                )
+            )
+
+            # ------------------------------------------------------
+            # Interface exactly at the start node:
+            #
+            #     interface
+            #         |
+            #         x-------------------x
+            #        p0                  p1
+            #
+            # The finite-length edge belongs to the end region.
+            # ------------------------------------------------------
+            if alpha <= tol:
+                return full_normal_edge(
+                    end_region,
+                    end_type,
+                )
+
+            # ------------------------------------------------------
+            # Interface exactly at the end node:
+            #
+            #                             interface
+            #                                 |
+            #         x-----------------------x
+            #        p0                      p1
+            #
+            # The finite-length edge belongs to the start region.
+            # ------------------------------------------------------
+            if alpha >= 1.0 - tol:
+                return full_normal_edge(
+                    start_region,
+                    start_type,
+                )
+
+            # ------------------------------------------------------
+            # Genuine interior interface.
+            # ------------------------------------------------------
+            interface_point = self._point_on_edge(
+                p0,
+                p1,
+                alpha,
+            )
+
+            segments = []
+
+            if start_type == "normal":
+                segments.append(
+                    (
+                        p0,
+                        interface_point,
+                        start_region,
+                    )
+                )
+
+            if end_type == "normal":
+                segments.append(
+                    (
+                        interface_point,
+                        p1,
+                        end_region,
+                    )
+                )
+
+            return segments
+
+        # ----------------------------------------------------------
+        # No resolved crossing.
+        #
+        # A common valid case is that the material transition lies
+        # exactly on one of the edge endpoints. These are stored by
+        # the geometry pipeline as contact groups rather than ordinary
+        # crossing groups.
+        # ----------------------------------------------------------
+        # ----------------------------------------------------------
+        # No resolved interior crossing.
+        #
+        # The transition may lie exactly on a grid node. Such a hit
+        # can be stored on the neighbouring edge rather than this one.
+        # ----------------------------------------------------------
+        endpoint_alpha = self._conformal_endpoint_alpha(
+            direction=direction,
+            edge_index=edge_index,
+            tol=tol,
+        )
+
+        # Interface at p0:
+        #
+        #     interface
+        #         |
+        #         x-------------------x
+        #        p0                  p1
+        #
+        # The complete finite-length edge belongs to the end region.
+        if endpoint_alpha == 0.0:
+            return full_normal_edge(
+                end_region,
+                end_type,
+            )
+
+        # Interface at p1:
+        #
+        #                             interface
+        #                                 |
+        #         x-----------------------x
+        #        p0                      p1
+        #
+        # The complete finite-length edge belongs to the start region.
+        if endpoint_alpha == 1.0:
+            return full_normal_edge(
+                start_region,
+                start_type,
+            )
+
+        # Truly unresolved case.
+        return []
+
+    def plot_conformal_primal_edge_slice(
+        self,
+        normal="z",
+        index=0,
+        ax=None,
+        figsize=(7, 7),
+        show_full_grid=False,
+        show_stl=True,
+        show_intersection_marker=True,
+        show_legend=True,
+        full_grid_color="0.85",
+        full_grid_lw=0.6,
+        edge_lw=2.0,
+        stl_lw=1.0,
+        marker_size=14,
+        tol=1e-8,
+    ):
+        """
+        Plot the active primal conformal edge geometry in a 2D slice.
+
+        The plot represents the material regions actually used by the
+        conformal solver.
+
+        Normal-material edge portions are drawn in the color assigned to
+        their material region. PEC and SIBC edge portions are omitted.
+
+        At normal-normal interfaces the edge is split at the geometric
+        intersection position alpha and both portions are drawn in their
+        corresponding region colors.
+
+        At normal-conductor interfaces only the normal-material portion
+        is drawn.
+
+        Parameters
+        ----------
+        normal : {'x', 'y', 'z'}
+            Normal direction of the slicing plane.
+
+        index : int
+            Index of the primal grid plane.
+
+        ax : matplotlib.axes.Axes, optional
+            Existing Matplotlib axes.
+
+        figsize : tuple
+            Figure size used when no axes are supplied.
+
+        show_full_grid : bool
+            Draw the complete Cartesian grid as a faint reference mesh.
+
+            This reference grid is purely geometric and therefore also
+            passes through PEC/SIBC regions. Set False when visualizing
+            only solver-active edge portions.
+
+        show_stl : bool
+            Draw the exact STL intersection contours with the slicing
+            plane.
+
+        show_intersection_marker : bool
+            Mark resolved interface intersections that lie strictly
+            inside an edge.
+
+        show_legend : bool
+            Show the region-color legend.
+
+        full_grid_color : matplotlib color
+            Color of the optional reference grid.
+
+        full_grid_lw : float
+            Line width of the optional reference grid.
+
+        edge_lw : float
+            Line width of active conformal edge segments.
+
+        stl_lw : float
+            Line width of the STL intersection contours.
+
+        marker_size : float
+            Size of interface intersection markers.
+
+        tol : float
+            Numerical tolerance used to suppress zero-length segments and
+            markers located directly on grid nodes.
+
+        Returns
+        -------
+        matplotlib.axes.Axes
+            Axes containing the conformal slice plot.
+        """
+        if not hasattr(
+            self,
+            "conformal_line_data",
+        ):
+            raise RuntimeError("No conformal line data available.")
+
+        if not self.conformal_line_data.get(
+            "primal",
+            {},
+        ):
+            raise RuntimeError("No primal conformal line data available.")
+
+        if not getattr(
+            self,
+            "region_material_types",
+            None,
+        ):
+            raise RuntimeError("No conformal region material types available.")
 
         grid = self.grid
 
-        # ----------------------------------------------------------
-        # Build primal grid coordinates from the structured domain.
-        # ----------------------------------------------------------
-        x = np.linspace(grid.xmin, grid.xmax, grid.Nx + 1)
-        y = np.linspace(grid.ymin, grid.ymax, grid.Ny + 1)
-        z = np.linspace(grid.zmin, grid.zmax, grid.Nz + 1)
+        # Use the actual primal grid coordinates rather than rebuilding
+        # them from the domain bounds.
+        x = np.asarray(
+            grid.x,
+            dtype=float,
+        )
 
-        coords = {
-            "x": x,
-            "y": y,
-            "z": z,
-        }
+        y = np.asarray(
+            grid.y,
+            dtype=float,
+        )
+
+        z = np.asarray(
+            grid.z,
+            dtype=float,
+        )
 
         normal = normal.lower()
 
+        center = np.array(
+            [
+                0.5 * (x[0] + x[-1]),
+                0.5 * (y[0] + y[-1]),
+                0.5 * (z[0] + z[-1]),
+            ],
+            dtype=float,
+        )
+
         if normal == "x":
-            if index < 0 or index > grid.Nx:
+            if index < 0 or index >= len(x):
                 raise IndexError("Slice index out of bounds for x-slice.")
-            in_plane_dirs = ("y", "z")
-            plane_origin = np.array([x[index], 0.0, 0.0])
+
+            in_plane_dirs = (
+                "y",
+                "z",
+            )
+
+            plane_origin = center.copy()
+
+            plane_origin[0] = x[index]
+
+            plane_coordinate = x[index]
 
         elif normal == "y":
-            if index < 0 or index > grid.Ny:
+            if index < 0 or index >= len(y):
                 raise IndexError("Slice index out of bounds for y-slice.")
-            in_plane_dirs = ("x", "z")
-            plane_origin = np.array([0.0, y[index], 0.0])
+
+            in_plane_dirs = (
+                "x",
+                "z",
+            )
+
+            plane_origin = center.copy()
+
+            plane_origin[1] = y[index]
+
+            plane_coordinate = y[index]
 
         elif normal == "z":
-            if index < 0 or index > grid.Nz:
+            if index < 0 or index >= len(z):
                 raise IndexError("Slice index out of bounds for z-slice.")
-            in_plane_dirs = ("x", "y")
-            plane_origin = np.array([0.0, 0.0, z[index]])
+
+            in_plane_dirs = (
+                "x",
+                "y",
+            )
+
+            plane_origin = center.copy()
+
+            plane_origin[2] = z[index]
+
+            plane_coordinate = z[index]
 
         else:
             raise ValueError(
                 f"Unknown plane normal '{normal}'. Expected 'x', 'y' or 'z'."
             )
 
-        plane_axes, axis_labels = self._plotting_plane_axes(normal)
+        (
+            plane_axes,
+            axis_labels,
+        ) = self._plotting_plane_axes(normal)
 
         if ax is None:
             _, ax = plt.subplots(figsize=figsize)
 
-        # ----------------------------------------------------------
-        # Helper: draw one primal edge direction in the plane.
-        # ----------------------------------------------------------
-        def draw_direction(direction):
-            line_data = self.conformal_line_data["primal"][direction]
+        region_colors = self._conformal_region_colors()
 
-            if direction == "x":
-                # edge: (i,j,k) -> (i+1,j,k)
-                for i in range(grid.Nx):
-                    for j in range(grid.Ny + 1):
-                        for k in range(grid.Nz + 1):
-                            if normal == "x":
-                                # x-directed edge is perpendicular to x-slice
-                                continue
-                            if normal == "y" and j != index:
-                                continue
-                            if normal == "z" and k != index:
-                                continue
+        drawn_region_ids = set()
 
-                            p0 = np.array([x[i], y[j], z[k]], dtype=float)
-                            p1 = np.array([x[i + 1], y[j], z[k]], dtype=float)
-
-                            plot_edge(direction, (i, j, k), p0, p1)
-
-            elif direction == "y":
-                # edge: (i,j,k) -> (i,j+1,k)
-                for i in range(grid.Nx + 1):
-                    for j in range(grid.Ny):
-                        for k in range(grid.Nz + 1):
-                            if normal == "y":
-                                # y-directed edge is perpendicular to y-slice
-                                continue
-                            if normal == "x" and i != index:
-                                continue
-                            if normal == "z" and k != index:
-                                continue
-
-                            p0 = np.array([x[i], y[j], z[k]], dtype=float)
-                            p1 = np.array([x[i], y[j + 1], z[k]], dtype=float)
-
-                            plot_edge(direction, (i, j, k), p0, p1)
-
-            elif direction == "z":
-                # edge: (i,j,k) -> (i,j,k+1)
-                for i in range(grid.Nx + 1):
-                    for j in range(grid.Ny + 1):
-                        for k in range(grid.Nz):
-                            if normal == "z":
-                                # z-directed edge is perpendicular to z-slice
-                                continue
-                            if normal == "x" and i != index:
-                                continue
-                            if normal == "y" and j != index:
-                                continue
-
-                            p0 = np.array([x[i], y[j], z[k]], dtype=float)
-                            p1 = np.array([x[i], y[j], z[k + 1]], dtype=float)
-
-                            plot_edge(direction, (i, j, k), p0, p1)
-
-            else:
-                raise ValueError(f"Unknown edge direction '{direction}'.")
-
-        # ----------------------------------------------------------
-        # Helper: draw a single edge, optionally clipped.
-        # ----------------------------------------------------------
-        def plot_edge(direction, edge_index, p0, p1):
+        # ======================================================
+        # Draw one primal edge.
+        # ======================================================
+        def plot_edge(
+            direction,
+            edge_index,
+            p0,
+            p1,
+        ):
             p0_2d = p0[list(plane_axes)]
+
             p1_2d = p1[list(plane_axes)]
 
+            # Optional reference Cartesian grid.
             if show_full_grid:
                 ax.plot(
-                    [p0_2d[0], p1_2d[0]],
-                    [p0_2d[1], p1_2d[1]],
+                    [
+                        p0_2d[0],
+                        p1_2d[0],
+                    ],
+                    [
+                        p0_2d[1],
+                        p1_2d[1],
+                    ],
                     color=full_grid_color,
                     lw=full_grid_lw,
                     zorder=1,
                 )
 
-            interval = self._conformal_active_interval(
-                line_data=self.conformal_line_data["primal"][direction],
-                index=edge_index,
+            line_data = self.conformal_line_data["primal"][direction]
+
+            segments = self._conformal_edge_display_segments(
+                direction=direction,
+                line_data=line_data,
+                edge_index=edge_index,
+                p0=p0,
+                p1=p1,
                 tol=tol,
             )
 
-            clipped = self._edge_segment_from_interval(p0, p1, interval)
+            for (
+                q0,
+                q1,
+                region_id,
+            ) in segments:
+                q0_2d = q0[list(plane_axes)]
 
-            if clipped is None:
+                q1_2d = q1[list(plane_axes)]
+
+                ax.plot(
+                    [
+                        q0_2d[0],
+                        q1_2d[0],
+                    ],
+                    [
+                        q0_2d[1],
+                        q1_2d[1],
+                    ],
+                    color=region_colors[region_id],
+                    lw=edge_lw,
+                    zorder=3,
+                )
+
+                drawn_region_ids.add(int(region_id))
+
+            # ----------------------------------------------
+            # Optional marker for a resolved intersection.
+            #
+            # Mark only intersections lying strictly inside
+            # an edge. Intersections exactly on a grid node
+            # are intentionally suppressed.
+            # ----------------------------------------------
+            if not show_intersection_marker:
                 return
 
-            q0, q1 = clipped
-            q0_2d = q0[list(plane_axes)]
-            q1_2d = q1[list(plane_axes)]
+            start_region = int(line_data["start_region"][edge_index])
 
-            data = self.conformal_line_data["primal"][direction]
-            alpha = data["alpha"][edge_index]
+            end_region = int(line_data["end_region"][edge_index])
 
-            # normal-normal: optionally split into two pieces at alpha
-            if (
-                split_normal_normal
-                and "normal_normal" in data
-                and data["normal_normal"][edge_index]
-                and np.isfinite(alpha)
-                and 0.0 < alpha < 1.0
-            ):
-                m = p0 + alpha * (p1 - p0)
-                m_2d = m[list(plane_axes)]
+            if start_region == end_region:
+                return
 
-                ax.plot(
-                    [p0_2d[0], m_2d[0]],
-                    [p0_2d[1], m_2d[1]],
-                    color="C0",
-                    lw=active_lw,
-                    zorder=3,
-                )
+            if not bool(line_data["resolved"][edge_index]):
+                return
 
-                ax.plot(
-                    [m_2d[0], p1_2d[0]],
-                    [m_2d[1], p1_2d[1]],
-                    color="C1",
-                    lw=active_lw,
-                    zorder=3,
-                )
+            alpha = float(line_data["alpha"][edge_index])
 
-                if show_intersection_marker:
-                    ax.scatter(
-                        [m_2d[0]],
-                        [m_2d[1]],
-                        s=marker_size,
-                        color=stl_color,
-                        zorder=4,
-                    )
+            if not np.isfinite(alpha):
+                return
 
-            else:
-                ax.plot(
-                    [q0_2d[0], q1_2d[0]],
-                    [q0_2d[1], q1_2d[1]],
-                    color=active_color,
-                    lw=active_lw,
-                    zorder=3,
-                )
+            if not (tol < alpha < 1.0 - tol):
+                return
 
-                if (
-                    show_intersection_marker
-                    and "normal_normal" in data
-                    and data["normal_normal"][edge_index]
-                    and np.isfinite(alpha)
-                    and 0.0 < alpha < 1.0
-                ):
-                    m = p0 + alpha * (p1 - p0)
-                    m_2d = m[list(plane_axes)]
+            interface_point = self._point_on_edge(
+                p0,
+                p1,
+                alpha,
+            )
 
-                    ax.scatter(
-                        [m_2d[0]],
-                        [m_2d[1]],
-                        s=marker_size,
-                        color=stl_color,
-                        zorder=4,
-                    )
+            interface_2d = interface_point[list(plane_axes)]
 
-        # ----------------------------------------------------------
-        # Draw primal edges in the chosen plane.
-        # ----------------------------------------------------------
-        for direction in in_plane_dirs:
-            draw_direction(direction)
+            ax.scatter(
+                interface_2d[0],
+                interface_2d[1],
+                s=marker_size,
+                facecolors="white",
+                edgecolors="black",
+                linewidths=0.8,
+                zorder=5,
+            )
 
-        # ----------------------------------------------------------
-        # STL cross-section
-        # ----------------------------------------------------------
-        if show_stl and hasattr(grid, "stl_solids") and grid.stl_solids:
+        # ======================================================
+        # Draw x-directed primal edges.
+        #
+        # Shape:
+        #     (Nx, Ny + 1, Nz + 1)
+        # ======================================================
+        if "x" in in_plane_dirs:
+            for i in range(grid.Nx):
+                for j in range(grid.Ny + 1):
+                    for k in range(grid.Nz + 1):
+                        if normal == "y" and j != index:
+                            continue
+
+                        if normal == "z" and k != index:
+                            continue
+
+                        p0 = np.array(
+                            [
+                                x[i],
+                                y[j],
+                                z[k],
+                            ],
+                            dtype=float,
+                        )
+
+                        p1 = np.array(
+                            [
+                                x[i + 1],
+                                y[j],
+                                z[k],
+                            ],
+                            dtype=float,
+                        )
+
+                        plot_edge(
+                            "x",
+                            (i, j, k),
+                            p0,
+                            p1,
+                        )
+
+        # ======================================================
+        # Draw y-directed primal edges.
+        #
+        # Shape:
+        #     (Nx + 1, Ny, Nz + 1)
+        # ======================================================
+        if "y" in in_plane_dirs:
+            for i in range(grid.Nx + 1):
+                for j in range(grid.Ny):
+                    for k in range(grid.Nz + 1):
+                        if normal == "x" and i != index:
+                            continue
+
+                        if normal == "z" and k != index:
+                            continue
+
+                        p0 = np.array(
+                            [
+                                x[i],
+                                y[j],
+                                z[k],
+                            ],
+                            dtype=float,
+                        )
+
+                        p1 = np.array(
+                            [
+                                x[i],
+                                y[j + 1],
+                                z[k],
+                            ],
+                            dtype=float,
+                        )
+
+                        plot_edge(
+                            "y",
+                            (i, j, k),
+                            p0,
+                            p1,
+                        )
+
+        # ======================================================
+        # Draw z-directed primal edges.
+        #
+        # Shape:
+        #     (Nx + 1, Ny + 1, Nz)
+        # ======================================================
+        if "z" in in_plane_dirs:
+            for i in range(grid.Nx + 1):
+                for j in range(grid.Ny + 1):
+                    for k in range(grid.Nz):
+                        if normal == "x" and i != index:
+                            continue
+
+                        if normal == "y" and j != index:
+                            continue
+
+                        p0 = np.array(
+                            [
+                                x[i],
+                                y[j],
+                                z[k],
+                            ],
+                            dtype=float,
+                        )
+
+                        p1 = np.array(
+                            [
+                                x[i],
+                                y[j],
+                                z[k + 1],
+                            ],
+                            dtype=float,
+                        )
+
+                        plot_edge(
+                            "z",
+                            (i, j, k),
+                            p0,
+                            p1,
+                        )
+
+        # ======================================================
+        # Draw exact STL intersections with the slice.
+        #
+        # Use grid.read_stl() so that scale / rotation /
+        # translation applied by GridFIT3D are respected.
+        # ======================================================
+        if show_stl:
             normal_vector = {
-                "x": (1.0, 0.0, 0.0),
-                "y": (0.0, 1.0, 0.0),
-                "z": (0.0, 0.0, 1.0),
+                "x": (
+                    1.0,
+                    0.0,
+                    0.0,
+                ),
+                "y": (
+                    0.0,
+                    1.0,
+                    0.0,
+                ),
+                "z": (
+                    0.0,
+                    0.0,
+                    1.0,
+                ),
             }[normal]
 
-            for _, solid_path in grid.stl_solids.items():
-                mesh = pv.read(solid_path)
+            for key in grid.stl_solids.keys():
+                region_id = int(grid.region_key_to_id[key])
 
-                slice_poly = mesh.slice(
+                surface = grid.read_stl(key)
+
+                slice_poly = surface.slice(
                     normal=normal_vector,
                     origin=plane_origin,
                 )
 
-                for seg in self._polydata_lines_to_segments(slice_poly):
-                    seg_2d = seg[:, list(plane_axes)]
+                for segment in self._polydata_lines_to_segments(slice_poly):
+                    segment_2d = segment[
+                        :,
+                        list(plane_axes),
+                    ]
 
                     ax.plot(
-                        seg_2d[:, 0],
-                        seg_2d[:, 1],
-                        color=stl_color,
+                        segment_2d[:, 0],
+                        segment_2d[:, 1],
+                        color=region_colors[region_id],
                         lw=stl_lw,
-                        zorder=5,
+                        zorder=4,
                     )
 
-        # ----------------------------------------------------------
-        # Cosmetic settings
-        # ----------------------------------------------------------
-        ax.set_aspect("equal")
+        # ======================================================
+        # Legend
+        # ======================================================
+        if show_legend:
+            from matplotlib.lines import Line2D
+
+            handles = []
+
+            # Background only needs a legend entry if it is
+            # actually visible in the active edge plot.
+            if 0 in drawn_region_ids:
+                handles.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        color=region_colors[0],
+                        lw=edge_lw,
+                        label=self._conformal_region_label(0),
+                    )
+                )
+
+            # Every STL geometry gets its own legend entry.
+            for key in grid.stl_solids.keys():
+                region_id = int(grid.region_key_to_id[key])
+
+                material_type = self.region_material_types[region_id]
+
+                legend_lw = edge_lw if material_type == "normal" else stl_lw
+
+                handles.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        color=region_colors[region_id],
+                        lw=legend_lw,
+                        label=self._conformal_region_label(region_id),
+                    )
+                )
+
+            if handles:
+                ax.legend(
+                    handles=handles,
+                    loc="center left",
+                    bbox_to_anchor=(1.02, 0.5),
+                    borderaxespad=0.0,
+                )
+
+                ax.figure.subplots_adjust(right=0.78)
+
+        # ======================================================
+        # Final plot formatting
+        # ======================================================
+        ax.set_aspect(
+            "equal",
+            adjustable="box",
+        )
+
         ax.set_xlabel(axis_labels[0])
+
         ax.set_ylabel(axis_labels[1])
-        ax.set_title(f"Conformal primal edge slice ({normal}={index})")
+
+        ax.set_title(
+            "Conformal primal edge slice, "
+            f"{normal} = "
+            f"{plane_coordinate:.6g} "
+            f"(index {index})"
+        )
+
+        coordinate_arrays = {
+            "x": x,
+            "y": y,
+            "z": z,
+        }
+
+        horizontal_coordinates = coordinate_arrays[axis_labels[0]]
+
+        vertical_coordinates = coordinate_arrays[axis_labels[1]]
+
+        ax.set_xlim(
+            horizontal_coordinates[0],
+            horizontal_coordinates[-1],
+        )
+
+        ax.set_ylim(
+            vertical_coordinates[0],
+            vertical_coordinates[-1],
+        )
 
         return ax
 
