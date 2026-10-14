@@ -3049,7 +3049,7 @@ class PlotMixinSolver:
         normal,
         index=None,
         ax=None,
-        figsize=(7, 7),
+        figsize=(12, 7),
         show_full_grid=True,
         show_stl=True,
         show_intersection_marker=True,
