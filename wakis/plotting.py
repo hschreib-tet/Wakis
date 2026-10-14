@@ -6,6 +6,7 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import pyvista as pv
+from matplotlib.widgets import Slider
 
 
 class PlotMixinSolver:
@@ -2052,8 +2053,8 @@ class PlotMixinSolver:
 
     def plot_conformal_primal_edge_slice(
         self,
-        normal="z",
-        index=0,
+        normal,
+        index=None,
         ax=None,
         figsize=(7, 7),
         show_full_grid=False,
@@ -2083,13 +2084,21 @@ class PlotMixinSolver:
         At normal-conductor interfaces only the normal-material portion
         is drawn.
 
+        If ``index`` is None, an interactive slider is added which allows
+        browsing through all primal grid planes along the selected normal
+        direction.
+
         Parameters
         ----------
         normal : {'x', 'y', 'z'}
             Normal direction of the slicing plane.
 
-        index : int
+        index : int or None, optional
             Index of the primal grid plane.
+
+            If None, an interactive slider is created and initialized at
+            the center plane. If an integer is supplied, a static plot of
+            that slice is created.
 
         ax : matplotlib.axes.Axes, optional
             Existing Matplotlib axes.
@@ -2101,8 +2110,7 @@ class PlotMixinSolver:
             Draw the complete Cartesian grid as a faint reference mesh.
 
             This reference grid is purely geometric and therefore also
-            passes through PEC/SIBC regions. Set False when visualizing
-            only solver-active edge portions.
+            passes through PEC/SIBC regions.
 
         show_stl : bool
             Draw the exact STL intersection contours with the slicing
@@ -2125,7 +2133,7 @@ class PlotMixinSolver:
             Line width of active conformal edge segments.
 
         stl_lw : float
-            Line width of the STL intersection contours.
+            Line width of STL intersection contours.
 
         marker_size : float
             Size of interface intersection markers.
@@ -2138,7 +2146,23 @@ class PlotMixinSolver:
         -------
         matplotlib.axes.Axes
             Axes containing the conformal slice plot.
+
+            In interactive mode the slider and slice cache are attached to
+            the returned axes as
+
+                ax._conformal_slice_slider
+                ax._conformal_slice_cache
+
+            so that they remain alive for the lifetime of the figure.
         """
+        from matplotlib.collections import LineCollection
+        from matplotlib.lines import Line2D
+        from matplotlib.widgets import Slider
+
+        # ==============================================================
+        # Validate conformal solver data
+        # ==============================================================
+
         if not hasattr(
             self,
             "conformal_line_data",
@@ -2160,8 +2184,10 @@ class PlotMixinSolver:
 
         grid = self.grid
 
-        # Use the actual primal grid coordinates rather than rebuilding
-        # them from the domain bounds.
+        # ==============================================================
+        # Grid coordinates
+        # ==============================================================
+
         x = np.asarray(
             grid.x,
             dtype=float,
@@ -2177,7 +2203,52 @@ class PlotMixinSolver:
             dtype=float,
         )
 
+        coordinate_arrays = {
+            "x": x,
+            "y": y,
+            "z": z,
+        }
+
         normal = normal.lower()
+
+        if normal not in coordinate_arrays:
+            raise ValueError(
+                f"Unknown plane normal '{normal}'. Expected 'x', 'y' or 'z'."
+            )
+
+        slice_coordinates = coordinate_arrays[normal]
+
+        max_index = len(slice_coordinates) - 1
+
+        interactive = index is None
+
+        if interactive:
+            initial_index = len(slice_coordinates) // 2
+
+        else:
+            if not isinstance(
+                index,
+                (int, np.integer),
+            ):
+                raise TypeError("index must be an integer or None.")
+
+            initial_index = int(index)
+
+        if initial_index < 0 or initial_index > max_index:
+            raise IndexError(
+                f"Slice index {initial_index} out of "
+                f"bounds for {normal}-slice. "
+                f"Valid range is 0 ... {max_index}."
+            )
+
+        (
+            plane_axes,
+            axis_labels,
+        ) = self._plotting_plane_axes(normal)
+
+        horizontal_coordinates = coordinate_arrays[axis_labels[0]]
+
+        vertical_coordinates = coordinate_arrays[axis_labels[1]]
 
         center = np.array(
             [
@@ -2188,172 +2259,158 @@ class PlotMixinSolver:
             dtype=float,
         )
 
-        if normal == "x":
-            if index < 0 or index >= len(x):
-                raise IndexError("Slice index out of bounds for x-slice.")
+        normal_axis = {
+            "x": 0,
+            "y": 1,
+            "z": 2,
+        }[normal]
 
-            in_plane_dirs = (
-                "y",
-                "z",
-            )
+        normal_vector = {
+            "x": (
+                1.0,
+                0.0,
+                0.0,
+            ),
+            "y": (
+                0.0,
+                1.0,
+                0.0,
+            ),
+            "z": (
+                0.0,
+                0.0,
+                1.0,
+            ),
+        }[normal]
 
-            plane_origin = center.copy()
-
-            plane_origin[0] = x[index]
-
-            plane_coordinate = x[index]
-
-        elif normal == "y":
-            if index < 0 or index >= len(y):
-                raise IndexError("Slice index out of bounds for y-slice.")
-
-            in_plane_dirs = (
-                "x",
-                "z",
-            )
-
-            plane_origin = center.copy()
-
-            plane_origin[1] = y[index]
-
-            plane_coordinate = y[index]
-
-        elif normal == "z":
-            if index < 0 or index >= len(z):
-                raise IndexError("Slice index out of bounds for z-slice.")
-
-            in_plane_dirs = (
-                "x",
-                "y",
-            )
-
-            plane_origin = center.copy()
-
-            plane_origin[2] = z[index]
-
-            plane_coordinate = z[index]
-
-        else:
-            raise ValueError(
-                f"Unknown plane normal '{normal}'. Expected 'x', 'y' or 'z'."
-            )
-
-        (
-            plane_axes,
-            axis_labels,
-        ) = self._plotting_plane_axes(normal)
+        # ==============================================================
+        # Figure
+        # ==============================================================
 
         if ax is None:
-            _, ax = plt.subplots(figsize=figsize)
+            _, ax = plt.subplots(
+                figsize=figsize,
+            )
+
+        fig = ax.figure
+
+        if interactive:
+            if show_legend:
+                fig.subplots_adjust(
+                    right=0.78,
+                    bottom=0.14,
+                )
+
+            else:
+                fig.subplots_adjust(
+                    bottom=0.14,
+                )
+
+        elif show_legend:
+            fig.subplots_adjust(
+                right=0.78,
+            )
+
+        # ==============================================================
+        # Colors
+        # ==============================================================
 
         region_colors = self._conformal_region_colors()
 
-        drawn_region_ids = set()
-
-        # ======================================================
-        # Draw one primal edge.
-        # ======================================================
-        def plot_edge(
-            direction,
-            edge_index,
-            p0,
-            p1,
-        ):
-            p0_2d = p0[list(plane_axes)]
-
-            p1_2d = p1[list(plane_axes)]
-
-            # Optional reference Cartesian grid.
-            if show_full_grid:
-                ax.plot(
-                    [
-                        p0_2d[0],
-                        p1_2d[0],
-                    ],
-                    [
-                        p0_2d[1],
-                        p1_2d[1],
-                    ],
-                    color=full_grid_color,
-                    lw=full_grid_lw,
-                    zorder=1,
-                )
-
-            line_data = self.conformal_line_data["primal"][direction]
-
-            segments = self._conformal_edge_display_segments(
-                direction=direction,
-                line_data=line_data,
-                edge_index=edge_index,
-                p0=p0,
-                p1=p1,
-                tol=tol,
-            )
-
+        normal_region_ids = [
+            int(region_id)
             for (
-                q0,
-                q1,
                 region_id,
-            ) in segments:
-                q0_2d = q0[list(plane_axes)]
+                material_type,
+            ) in self.region_material_types.items()
+            if material_type == "normal"
+        ]
 
-                q1_2d = q1[list(plane_axes)]
+        # ==============================================================
+        # Static Cartesian reference grid
+        #
+        # This geometry is independent of the slice index because all
+        # slices are planes of the same tensor-product grid.
+        # ==============================================================
 
-                ax.plot(
-                    [
-                        q0_2d[0],
-                        q1_2d[0],
-                    ],
-                    [
-                        q0_2d[1],
-                        q1_2d[1],
-                    ],
-                    color=region_colors[region_id],
-                    lw=edge_lw,
-                    zorder=3,
+        if show_full_grid:
+            full_grid_segments = []
+
+            # Lines parallel to the horizontal plotting direction.
+            for vertical_coordinate in vertical_coordinates:
+                full_grid_segments.append(
+                    np.array(
+                        [
+                            [
+                                horizontal_coordinates[0],
+                                vertical_coordinate,
+                            ],
+                            [
+                                horizontal_coordinates[-1],
+                                vertical_coordinate,
+                            ],
+                        ],
+                        dtype=float,
+                    )
                 )
 
-                drawn_region_ids.add(int(region_id))
+            # Lines parallel to the vertical plotting direction.
+            for horizontal_coordinate in horizontal_coordinates:
+                full_grid_segments.append(
+                    np.array(
+                        [
+                            [
+                                horizontal_coordinate,
+                                vertical_coordinates[0],
+                            ],
+                            [
+                                horizontal_coordinate,
+                                vertical_coordinates[-1],
+                            ],
+                        ],
+                        dtype=float,
+                    )
+                )
 
-            # ----------------------------------------------
-            # Optional marker for a resolved intersection.
-            #
-            # Mark only intersections lying strictly inside
-            # an edge. Intersections exactly on a grid node
-            # are intentionally suppressed.
-            # ----------------------------------------------
-            if not show_intersection_marker:
-                return
-
-            start_region = int(line_data["start_region"][edge_index])
-
-            end_region = int(line_data["end_region"][edge_index])
-
-            if start_region == end_region:
-                return
-
-            if not bool(line_data["resolved"][edge_index]):
-                return
-
-            alpha = float(line_data["alpha"][edge_index])
-
-            if not np.isfinite(alpha):
-                return
-
-            if not (tol < alpha < 1.0 - tol):
-                return
-
-            interface_point = self._point_on_edge(
-                p0,
-                p1,
-                alpha,
+            full_grid_collection = LineCollection(
+                full_grid_segments,
+                colors=full_grid_color,
+                linewidths=full_grid_lw,
+                zorder=1,
             )
 
-            interface_2d = interface_point[list(plane_axes)]
+            ax.add_collection(full_grid_collection)
 
-            ax.scatter(
-                interface_2d[0],
-                interface_2d[1],
+        # ==============================================================
+        # Active conformal edge collections
+        #
+        # One LineCollection per normal material region.
+        # These artists are created once and only their segment data are
+        # changed when the slider moves.
+        # ==============================================================
+
+        active_collections = {}
+
+        for region_id in normal_region_ids:
+            collection = LineCollection(
+                [],
+                colors=[region_colors[region_id]],
+                linewidths=edge_lw,
+                zorder=3,
+            )
+
+            ax.add_collection(collection)
+
+            active_collections[region_id] = collection
+
+        # ==============================================================
+        # Interface markers
+        # ==============================================================
+
+        if show_intersection_marker:
+            intersection_artist = ax.scatter(
+                [],
+                [],
                 s=marker_size,
                 facecolors="white",
                 edgecolors="black",
@@ -2361,63 +2418,140 @@ class PlotMixinSolver:
                 zorder=5,
             )
 
-        # ======================================================
-        # Draw x-directed primal edges.
+        else:
+            intersection_artist = None
+
+        # ==============================================================
+        # STL data
         #
-        # Shape:
-        #     (Nx, Ny + 1, Nz + 1)
-        # ======================================================
-        if "x" in in_plane_dirs:
-            for i in range(grid.Nx):
-                for j in range(grid.Ny + 1):
-                    for k in range(grid.Nz + 1):
-                        if normal == "y" and j != index:
-                            continue
+        # Load every transformed STL only once. Only the plane slicing is
+        # repeated for a new index.
+        # ==============================================================
 
-                        if normal == "z" and k != index:
-                            continue
+        stl_surfaces = {}
+        stl_collections = {}
 
-                        p0 = np.array(
-                            [
-                                x[i],
-                                y[j],
-                                z[k],
-                            ],
-                            dtype=float,
-                        )
+        if show_stl:
+            for key in grid.stl_solids.keys():
+                region_id = int(grid.region_key_to_id[key])
 
-                        p1 = np.array(
-                            [
-                                x[i + 1],
-                                y[j],
-                                z[k],
-                            ],
-                            dtype=float,
-                        )
+                stl_surfaces[key] = grid.read_stl(key)
 
-                        plot_edge(
-                            "x",
-                            (i, j, k),
-                            p0,
-                            p1,
-                        )
+                collection = LineCollection(
+                    [],
+                    colors=[region_colors[region_id]],
+                    linewidths=stl_lw,
+                    zorder=4,
+                )
 
-        # ======================================================
-        # Draw y-directed primal edges.
+                ax.add_collection(collection)
+
+                stl_collections[region_id] = collection
+
+        # ==============================================================
+        # Axes formatting
         #
-        # Shape:
-        #     (Nx + 1, Ny, Nz + 1)
-        # ======================================================
-        if "y" in in_plane_dirs:
-            for i in range(grid.Nx + 1):
+        # These properties do not change while browsing through slices.
+        # ==============================================================
+
+        ax.set_aspect(
+            "equal",
+            adjustable="box",
+        )
+
+        ax.set_xlabel(axis_labels[0])
+
+        ax.set_ylabel(axis_labels[1])
+
+        ax.set_xlim(
+            horizontal_coordinates[0],
+            horizontal_coordinates[-1],
+        )
+
+        ax.set_ylim(
+            vertical_coordinates[0],
+            vertical_coordinates[-1],
+        )
+
+        # ==============================================================
+        # Legend
+        #
+        # Keep this static. In interactive mode a material may disappear
+        # from one slice and reappear in another, therefore rebuilding the
+        # legend for every slider movement would be undesirable.
+        # ==============================================================
+
+        if show_legend:
+            handles = []
+
+            # Background region.
+            if (
+                0 in self.region_material_types
+                and self.region_material_types[0] == "normal"
+            ):
+                handles.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        color=region_colors[0],
+                        lw=edge_lw,
+                        label=(self._conformal_region_label(0)),
+                    )
+                )
+
+            # STL regions.
+            for key in grid.stl_solids.keys():
+                region_id = int(grid.region_key_to_id[key])
+
+                material_type = self.region_material_types[region_id]
+
+                legend_lw = edge_lw if material_type == "normal" else stl_lw
+
+                handles.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        color=region_colors[region_id],
+                        lw=legend_lw,
+                        label=(self._conformal_region_label(region_id)),
+                    )
+                )
+
+            if handles:
+                ax.legend(
+                    handles=handles,
+                    loc="center left",
+                    bbox_to_anchor=(
+                        1.02,
+                        0.5,
+                    ),
+                    borderaxespad=0.0,
+                )
+
+        # ==============================================================
+        # Direct iteration over the edges lying in one slice
+        #
+        # Crucially, this does NOT loop over the complete 3D edge arrays.
+        #
+        # normal = x:
+        #     y- and z-directed edges at fixed i
+        #
+        # normal = y:
+        #     x- and z-directed edges at fixed j
+        #
+        # normal = z:
+        #     x- and y-directed edges at fixed k
+        # ==============================================================
+
+        def iter_slice_edges(
+            slice_index,
+        ):
+            if normal == "x":
+                i = slice_index
+
+                # y-directed edges
                 for j in range(grid.Ny):
                     for k in range(grid.Nz + 1):
-                        if normal == "x" and i != index:
-                            continue
-
-                        if normal == "z" and k != index:
-                            continue
-
                         p0 = np.array(
                             [
                                 x[i],
@@ -2436,29 +2570,20 @@ class PlotMixinSolver:
                             dtype=float,
                         )
 
-                        plot_edge(
+                        yield (
                             "y",
-                            (i, j, k),
+                            (
+                                i,
+                                j,
+                                k,
+                            ),
                             p0,
                             p1,
                         )
 
-        # ======================================================
-        # Draw z-directed primal edges.
-        #
-        # Shape:
-        #     (Nx + 1, Ny + 1, Nz)
-        # ======================================================
-        if "z" in in_plane_dirs:
-            for i in range(grid.Nx + 1):
+                # z-directed edges
                 for j in range(grid.Ny + 1):
                     for k in range(grid.Nz):
-                        if normal == "x" and i != index:
-                            continue
-
-                        if normal == "y" and j != index:
-                            continue
-
                         p0 = np.array(
                             [
                                 x[i],
@@ -2477,128 +2602,648 @@ class PlotMixinSolver:
                             dtype=float,
                         )
 
-                        plot_edge(
+                        yield (
                             "z",
-                            (i, j, k),
+                            (
+                                i,
+                                j,
+                                k,
+                            ),
                             p0,
                             p1,
                         )
 
-        # ======================================================
-        # Draw exact STL intersections with the slice.
+            elif normal == "y":
+                j = slice_index
+
+                # x-directed edges
+                for i in range(grid.Nx):
+                    for k in range(grid.Nz + 1):
+                        p0 = np.array(
+                            [
+                                x[i],
+                                y[j],
+                                z[k],
+                            ],
+                            dtype=float,
+                        )
+
+                        p1 = np.array(
+                            [
+                                x[i + 1],
+                                y[j],
+                                z[k],
+                            ],
+                            dtype=float,
+                        )
+
+                        yield (
+                            "x",
+                            (
+                                i,
+                                j,
+                                k,
+                            ),
+                            p0,
+                            p1,
+                        )
+
+                # z-directed edges
+                for i in range(grid.Nx + 1):
+                    for k in range(grid.Nz):
+                        p0 = np.array(
+                            [
+                                x[i],
+                                y[j],
+                                z[k],
+                            ],
+                            dtype=float,
+                        )
+
+                        p1 = np.array(
+                            [
+                                x[i],
+                                y[j],
+                                z[k + 1],
+                            ],
+                            dtype=float,
+                        )
+
+                        yield (
+                            "z",
+                            (
+                                i,
+                                j,
+                                k,
+                            ),
+                            p0,
+                            p1,
+                        )
+
+            else:
+                k = slice_index
+
+                # x-directed edges
+                for i in range(grid.Nx):
+                    for j in range(grid.Ny + 1):
+                        p0 = np.array(
+                            [
+                                x[i],
+                                y[j],
+                                z[k],
+                            ],
+                            dtype=float,
+                        )
+
+                        p1 = np.array(
+                            [
+                                x[i + 1],
+                                y[j],
+                                z[k],
+                            ],
+                            dtype=float,
+                        )
+
+                        yield (
+                            "x",
+                            (
+                                i,
+                                j,
+                                k,
+                            ),
+                            p0,
+                            p1,
+                        )
+
+                # y-directed edges
+                for i in range(grid.Nx + 1):
+                    for j in range(grid.Ny):
+                        p0 = np.array(
+                            [
+                                x[i],
+                                y[j],
+                                z[k],
+                            ],
+                            dtype=float,
+                        )
+
+                        p1 = np.array(
+                            [
+                                x[i],
+                                y[j + 1],
+                                z[k],
+                            ],
+                            dtype=float,
+                        )
+
+                        yield (
+                            "y",
+                            (
+                                i,
+                                j,
+                                k,
+                            ),
+                            p0,
+                            p1,
+                        )
+
+        # ==============================================================
+        # Slice cache
         #
-        # Use grid.read_stl() so that scale / rotation /
-        # translation applied by GridFIT3D are respected.
-        # ======================================================
-        if show_stl:
-            normal_vector = {
-                "x": (
-                    1.0,
-                    0.0,
-                    0.0,
-                ),
-                "y": (
-                    0.0,
-                    1.0,
-                    0.0,
-                ),
-                "z": (
-                    0.0,
-                    0.0,
-                    1.0,
-                ),
-            }[normal]
+        # Geometry is immutable during plotting. Once one slice has been
+        # constructed, revisiting it only requires updating the existing
+        # Matplotlib artists.
+        # ==============================================================
 
-            for key in grid.stl_solids.keys():
-                region_id = int(grid.region_key_to_id[key])
+        slice_cache = {}
 
-                surface = grid.read_stl(key)
+        def build_slice_data(
+            slice_index,
+        ):
+            if slice_index in slice_cache:
+                return slice_cache[slice_index]
 
-                slice_poly = surface.slice(
-                    normal=normal_vector,
-                    origin=plane_origin,
+            segments_by_region = {region_id: [] for region_id in normal_region_ids}
+
+            intersection_points = []
+
+            # ----------------------------------------------------------
+            # Active primal conformal edges
+            # ----------------------------------------------------------
+
+            for (
+                direction,
+                edge_index,
+                p0,
+                p1,
+            ) in iter_slice_edges(slice_index):
+                line_data = self.conformal_line_data["primal"][direction]
+
+                display_segments = self._conformal_edge_display_segments(
+                    direction=direction,
+                    line_data=line_data,
+                    edge_index=edge_index,
+                    p0=p0,
+                    p1=p1,
+                    tol=tol,
                 )
 
-                for segment in self._polydata_lines_to_segments(slice_poly):
-                    segment_2d = segment[
-                        :,
-                        list(plane_axes),
-                    ]
-
-                    ax.plot(
-                        segment_2d[:, 0],
-                        segment_2d[:, 1],
-                        color=region_colors[region_id],
-                        lw=stl_lw,
-                        zorder=4,
+                for (
+                    q0,
+                    q1,
+                    region_id,
+                ) in display_segments:
+                    q0 = np.asarray(
+                        q0,
+                        dtype=float,
                     )
 
-        # ======================================================
-        # Legend
-        # ======================================================
-        if show_legend:
-            from matplotlib.lines import Line2D
+                    q1 = np.asarray(
+                        q1,
+                        dtype=float,
+                    )
 
-            handles = []
+                    if np.linalg.norm(q1 - q0) <= tol:
+                        continue
 
-            # Background only needs a legend entry if it is
-            # actually visible in the active edge plot.
-            if 0 in drawn_region_ids:
-                handles.append(
-                    Line2D(
-                        [0],
-                        [0],
-                        color=region_colors[0],
-                        lw=edge_lw,
-                        label=self._conformal_region_label(0),
+                    segment_2d = np.array(
+                        [
+                            q0[list(plane_axes)],
+                            q1[list(plane_axes)],
+                        ],
+                        dtype=float,
+                    )
+
+                    segments_by_region.setdefault(
+                        int(region_id),
+                        [],
+                    ).append(segment_2d)
+
+                # ------------------------------------------------------
+                # Resolved interior interface marker
+                # ------------------------------------------------------
+
+                if not show_intersection_marker:
+                    continue
+
+                start_region = int(line_data["start_region"][edge_index])
+
+                end_region = int(line_data["end_region"][edge_index])
+
+                if start_region == end_region:
+                    continue
+
+                if not bool(line_data["resolved"][edge_index]):
+                    continue
+
+                alpha = float(line_data["alpha"][edge_index])
+
+                if not np.isfinite(alpha):
+                    continue
+
+                if not (tol < alpha < 1.0 - tol):
+                    continue
+
+                interface_point = self._point_on_edge(
+                    p0,
+                    p1,
+                    alpha,
+                )
+
+                intersection_points.append(interface_point[list(plane_axes)].copy())
+
+            # ----------------------------------------------------------
+            # Exact STL contours
+            # ----------------------------------------------------------
+
+            stl_segments_by_region = {}
+
+            if show_stl:
+                plane_origin = center.copy()
+
+                plane_origin[normal_axis] = slice_coordinates[slice_index]
+
+                for (
+                    key,
+                    surface,
+                ) in stl_surfaces.items():
+                    region_id = int(grid.region_key_to_id[key])
+
+                    slice_poly = surface.slice(
+                        normal=normal_vector,
+                        origin=plane_origin,
+                    )
+
+                    segments_2d = []
+
+                    for segment in self._polydata_lines_to_segments(slice_poly):
+                        segment = np.asarray(
+                            segment,
+                            dtype=float,
+                        )
+
+                        if len(segment) < 2:
+                            continue
+
+                        segments_2d.append(
+                            segment[
+                                :,
+                                list(plane_axes),
+                            ].copy()
+                        )
+
+                    stl_segments_by_region[region_id] = segments_2d
+
+            if intersection_points:
+                intersection_points = np.asarray(
+                    intersection_points,
+                    dtype=float,
+                )
+
+            else:
+                intersection_points = np.empty(
+                    (
+                        0,
+                        2,
+                    ),
+                    dtype=float,
+                )
+
+            result = {
+                "segments_by_region": (segments_by_region),
+                "intersection_points": (intersection_points),
+                "stl_segments_by_region": (stl_segments_by_region),
+            }
+
+            slice_cache[slice_index] = result
+
+            return result
+
+        # ==============================================================
+        # Update existing artists
+        # ==============================================================
+
+        current_index = {
+            "value": None,
+        }
+
+        def update_slice(
+            slice_index,
+        ):
+            slice_index = int(slice_index)
+
+            if current_index["value"] == slice_index:
+                return
+
+            if slice_index < 0 or slice_index > max_index:
+                return
+
+            data = build_slice_data(slice_index)
+
+            # ----------------------------------------------------------
+            # Active conformal edge segments
+            # ----------------------------------------------------------
+
+            for (
+                region_id,
+                collection,
+            ) in active_collections.items():
+                collection.set_segments(
+                    data["segments_by_region"].get(
+                        region_id,
+                        [],
                     )
                 )
 
-            # Every STL geometry gets its own legend entry.
-            for key in grid.stl_solids.keys():
-                region_id = int(grid.region_key_to_id[key])
+            # ----------------------------------------------------------
+            # Interface markers
+            # ----------------------------------------------------------
 
-                material_type = self.region_material_types[region_id]
+            if intersection_artist is not None:
+                intersection_artist.set_offsets(data["intersection_points"])
 
-                legend_lw = edge_lw if material_type == "normal" else stl_lw
+            # ----------------------------------------------------------
+            # STL contours
+            # ----------------------------------------------------------
 
-                handles.append(
-                    Line2D(
-                        [0],
-                        [0],
-                        color=region_colors[region_id],
-                        lw=legend_lw,
-                        label=self._conformal_region_label(region_id),
+            if show_stl:
+                for (
+                    region_id,
+                    collection,
+                ) in stl_collections.items():
+                    collection.set_segments(
+                        data["stl_segments_by_region"].get(
+                            region_id,
+                            [],
+                        )
                     )
-                )
 
-            if handles:
-                ax.legend(
-                    handles=handles,
-                    loc="center left",
-                    bbox_to_anchor=(1.02, 0.5),
-                    borderaxespad=0.0,
-                )
+            # ----------------------------------------------------------
+            # Title
+            # ----------------------------------------------------------
 
-                ax.figure.subplots_adjust(right=0.78)
+            plane_coordinate = slice_coordinates[slice_index]
 
-        # ======================================================
-        # Final plot formatting
-        # ======================================================
-        ax.set_aspect(
-            "equal",
-            adjustable="box",
+            ax.set_title(
+                "Conformal primal edge slice, "
+                f"{normal} = "
+                f"{plane_coordinate:.6g} "
+                f"(index {slice_index})"
+            )
+
+            current_index["value"] = slice_index
+
+            fig.canvas.draw_idle()
+
+        # ==============================================================
+        # Draw initial slice
+        # ==============================================================
+
+        update_slice(initial_index)
+
+        # ==============================================================
+        # Interactive slider
+        # ==============================================================
+
+        if interactive:
+            slider_width = 0.60 if show_legend else 0.70
+
+            slider_ax = fig.add_axes(
+                [
+                    0.15,
+                    0.04,
+                    slider_width,
+                    0.035,
+                ]
+            )
+
+            slider = Slider(
+                ax=slider_ax,
+                label=f"{normal} index",
+                valmin=0,
+                valmax=max_index,
+                valinit=initial_index,
+                valstep=1,
+                valfmt="%0.0f",
+            )
+
+            def on_slider_changed(
+                value,
+            ):
+                update_slice(int(round(value)))
+
+            slider.on_changed(on_slider_changed)
+
+            # Keep references alive. Matplotlib widgets may otherwise be
+            # garbage-collected after returning from this function.
+            ax._conformal_slice_slider = slider
+
+            ax._conformal_slice_slider_callback = on_slider_changed
+
+            ax._conformal_slice_cache = slice_cache
+
+        return ax
+
+    def plot_conformal_sibc_slice(
+        self,
+        normal,
+        index=None,
+        ax=None,
+        figsize=(7, 7),
+        show_full_grid=True,
+        show_stl=True,
+        show_intersection_marker=True,
+        show_face_outline=True,
+        show_legend=True,
+        full_grid_color="0.85",
+        full_grid_lw=0.6,
+        face_outline_color="0.45",
+        face_outline_lw=0.8,
+        normal_polygon_alpha=0.18,
+        sibc_segment_color="black",
+        sibc_segment_lw=3.0,
+        stl_lw=1.0,
+        marker_size=22,
+    ):
+        """
+        Visualize resolved conformal normal-SIBC interfaces on primal faces.
+
+        For every resolved primal face classified as a normal-SIBC interface,
+        the function plots
+
+            - the normal-material polygon,
+            - the SIBC-material polygon,
+            - the reconstructed interface segment connecting the two
+            boundary-intersection points,
+            - the two interface-intersection points,
+            - optionally the exact STL contour,
+            - optionally the underlying Cartesian grid.
+
+        The reconstructed interface segment represents the tangential
+        surface segment inside the primal face. It is drawn as an unoriented
+        line because its stored geometric orientation must not be interpreted
+        as the Stokes orientation of the SIBC formulation.
+
+        If ``index`` is None, an interactive slider is created.
+
+        Parameters
+        ----------
+        normal : {'x', 'y', 'z'}
+            Normal direction of the primal faces to visualize.
+
+            normal='x' -> yz faces
+            normal='y' -> xz faces
+            normal='z' -> xy faces
+
+        index : int or None, optional
+            Index of the primal face plane.
+
+            If None, an interactive slider is created and initialized at the
+            center plane.
+
+        ax : matplotlib.axes.Axes, optional
+            Existing Matplotlib axes.
+
+        figsize : tuple
+            Figure size used when no axes are supplied.
+
+        show_full_grid : bool
+            Draw the complete Cartesian grid in the slicing plane.
+
+        show_stl : bool
+            Draw exact STL intersection contours with the slicing plane.
+
+        show_intersection_marker : bool
+            Mark the two endpoints of each reconstructed SIBC interface
+            segment.
+
+        show_face_outline : bool
+            Draw the rectangular outline of every normal-SIBC primal face.
+
+        show_legend : bool
+            Show material-region and SIBC-segment legend entries.
+
+        full_grid_color : matplotlib color
+            Color of the Cartesian reference grid.
+
+        full_grid_lw : float
+            Line width of the Cartesian reference grid.
+
+        face_outline_color : matplotlib color
+            Color used for the outline of affected primal faces.
+
+        face_outline_lw : float
+            Line width of affected primal-face outlines.
+
+        normal_polygon_alpha : float
+            Opacity of normal-material face polygons.
+
+        sibc_polygon_alpha : float
+            Opacity of SIBC-material face polygons.
+
+        sibc_segment_color : matplotlib color
+            Color of the reconstructed tangential SIBC surface segments.
+
+        sibc_segment_lw : float
+            Line width of the reconstructed SIBC surface segments.
+
+        stl_lw : float
+            Line width of exact STL contours.
+
+        marker_size : float
+            Size of interface endpoint markers.
+
+        Returns
+        -------
+        matplotlib.axes.Axes
+            Axes containing the SIBC diagnostic plot.
+        """
+        from matplotlib.collections import (
+            LineCollection,
+            PolyCollection,
+        )
+        from matplotlib.lines import Line2D
+        from matplotlib.patches import Patch
+        from matplotlib.widgets import Slider
+
+        # ==============================================================
+        # Validate data
+        # ==============================================================
+
+        if not hasattr(
+            self.grid,
+            "interface_face_data",
+        ):
+            raise RuntimeError("No conformal interface face data available.")
+
+        if not getattr(
+            self,
+            "conformal_face_data",
+            None,
+        ):
+            raise RuntimeError("No solver-side conformal face data available.")
+
+        if not getattr(
+            self,
+            "region_material_types",
+            None,
+        ):
+            raise RuntimeError("No conformal region material types available.")
+
+        grid = self.grid
+
+        normal = normal.lower()
+
+        if normal not in (
+            "x",
+            "y",
+            "z",
+        ):
+            raise ValueError(
+                f"Unknown plane normal '{normal}'. Expected 'x', 'y' or 'z'."
+            )
+
+        if (
+            "primal" not in grid.interface_face_data
+            or normal not in grid.interface_face_data["primal"]
+        ):
+            raise RuntimeError(f"No primal {normal}-face interface data available.")
+
+        if (
+            "primal" not in self.conformal_face_data
+            or normal not in self.conformal_face_data["primal"]
+        ):
+            raise RuntimeError(f"No solver-side primal {normal}-face data available.")
+
+        geometry = grid.interface_face_data["primal"][normal]
+
+        face_data = self.conformal_face_data["primal"][normal]
+
+        if "normal_sibc" not in face_data:
+            raise RuntimeError("No normal-SIBC face classification available.")
+
+        normal_sibc_mask = np.asarray(
+            face_data["normal_sibc"],
+            dtype=bool,
         )
 
-        ax.set_xlabel(axis_labels[0])
+        # ==============================================================
+        # Coordinates
+        # ==============================================================
 
-        ax.set_ylabel(axis_labels[1])
+        x = np.asarray(
+            grid.x,
+            dtype=float,
+        )
 
-        ax.set_title(
-            "Conformal primal edge slice, "
-            f"{normal} = "
-            f"{plane_coordinate:.6g} "
-            f"(index {index})"
+        y = np.asarray(
+            grid.y,
+            dtype=float,
+        )
+
+        z = np.asarray(
+            grid.z,
+            dtype=float,
         )
 
         coordinate_arrays = {
@@ -2607,9 +3252,282 @@ class PlotMixinSolver:
             "z": z,
         }
 
+        slice_coordinates = coordinate_arrays[normal]
+
+        (
+            plane_axes,
+            axis_labels,
+        ) = self._plotting_plane_axes(normal)
+
         horizontal_coordinates = coordinate_arrays[axis_labels[0]]
 
         vertical_coordinates = coordinate_arrays[axis_labels[1]]
+
+        max_index = len(slice_coordinates) - 1
+
+        # The normal dimension of the primal-face mask must contain
+        # one face plane at every primal grid coordinate.
+        normal_axis = {
+            "x": 0,
+            "y": 1,
+            "z": 2,
+        }[normal]
+
+        if normal_sibc_mask.shape[normal_axis] != len(slice_coordinates):
+            raise RuntimeError(
+                "Unexpected normal-SIBC face-array shape "
+                f"{normal_sibc_mask.shape} for "
+                f"normal='{normal}'."
+            )
+
+        interactive = index is None
+
+        if interactive:
+            initial_index = len(slice_coordinates) // 2
+
+        else:
+            if not isinstance(
+                index,
+                (int, np.integer),
+            ):
+                raise TypeError("index must be an integer or None.")
+
+            initial_index = int(index)
+
+        if initial_index < 0 or initial_index > max_index:
+            raise IndexError(
+                f"Slice index {initial_index} "
+                f"out of bounds for "
+                f"{normal}-slice. "
+                f"Valid range is "
+                f"0 ... {max_index}."
+            )
+
+        center = np.array(
+            [
+                0.5 * (x[0] + x[-1]),
+                0.5 * (y[0] + y[-1]),
+                0.5 * (z[0] + z[-1]),
+            ],
+            dtype=float,
+        )
+
+        normal_vector = {
+            "x": (
+                1.0,
+                0.0,
+                0.0,
+            ),
+            "y": (
+                0.0,
+                1.0,
+                0.0,
+            ),
+            "z": (
+                0.0,
+                0.0,
+                1.0,
+            ),
+        }[normal]
+
+        # ==============================================================
+        # Figure
+        # ==============================================================
+
+        if ax is None:
+            _, ax = plt.subplots(
+                figsize=figsize,
+            )
+
+        fig = ax.figure
+
+        if interactive:
+            if show_legend:
+                fig.subplots_adjust(
+                    right=0.78,
+                    bottom=0.14,
+                )
+            else:
+                fig.subplots_adjust(
+                    bottom=0.14,
+                )
+
+        elif show_legend:
+            fig.subplots_adjust(
+                right=0.78,
+            )
+
+        region_colors = self._conformal_region_colors()
+
+        # ==============================================================
+        # Reference Cartesian grid
+        # ==============================================================
+
+        if show_full_grid:
+            full_grid_segments = []
+
+            for vertical_coordinate in vertical_coordinates:
+                full_grid_segments.append(
+                    np.array(
+                        [
+                            [
+                                horizontal_coordinates[0],
+                                vertical_coordinate,
+                            ],
+                            [
+                                horizontal_coordinates[-1],
+                                vertical_coordinate,
+                            ],
+                        ],
+                        dtype=float,
+                    )
+                )
+
+            for horizontal_coordinate in horizontal_coordinates:
+                full_grid_segments.append(
+                    np.array(
+                        [
+                            [
+                                horizontal_coordinate,
+                                vertical_coordinates[0],
+                            ],
+                            [
+                                horizontal_coordinate,
+                                vertical_coordinates[-1],
+                            ],
+                        ],
+                        dtype=float,
+                    )
+                )
+
+            grid_collection = LineCollection(
+                full_grid_segments,
+                colors=full_grid_color,
+                linewidths=full_grid_lw,
+                zorder=1,
+            )
+
+            ax.add_collection(grid_collection)
+
+        # ==============================================================
+        # Polygon collections
+        #
+        # One collection is retained per region so that material colors
+        # remain consistent with the other conformal plots.
+        # ==============================================================
+
+        polygon_collections = {}
+
+        for (
+            region_id,
+            material_type,
+        ) in self.region_material_types.items():
+            region_id = int(region_id)
+
+            # Only the volumetrically active normal-material
+            # portion of a normal-SIBC face is filled.
+            if material_type != "normal":
+                continue
+
+            collection = PolyCollection(
+                [],
+                facecolors=[region_colors[region_id]],
+                edgecolors="none",
+                alpha=normal_polygon_alpha,
+                zorder=2,
+            )
+
+            ax.add_collection(collection)
+
+            polygon_collections[region_id] = collection
+
+        # ==============================================================
+        # Outline of all primal faces affected by normal-SIBC
+        # ==============================================================
+
+        if show_face_outline:
+            face_outline_collection = LineCollection(
+                [],
+                colors=face_outline_color,
+                linewidths=face_outline_lw,
+                zorder=3,
+            )
+
+            ax.add_collection(face_outline_collection)
+
+        else:
+            face_outline_collection = None
+
+        # ==============================================================
+        # Reconstructed tangential SIBC surface segments
+        # ==============================================================
+
+        sibc_segment_collection = LineCollection(
+            [],
+            colors=sibc_segment_color,
+            linewidths=sibc_segment_lw,
+            zorder=5,
+        )
+
+        ax.add_collection(sibc_segment_collection)
+
+        # ==============================================================
+        # Interface endpoints
+        # ==============================================================
+
+        if show_intersection_marker:
+            intersection_artist = ax.scatter(
+                [],
+                [],
+                s=marker_size,
+                facecolors="white",
+                edgecolors=sibc_segment_color,
+                linewidths=1.0,
+                zorder=6,
+            )
+
+        else:
+            intersection_artist = None
+
+        # ==============================================================
+        # STL contours
+        #
+        # Load transformed STL geometry once. Plane slicing itself is
+        # performed only when a previously unseen slice is requested.
+        # ==============================================================
+
+        stl_surfaces = {}
+        stl_collections = {}
+
+        if show_stl:
+            for key in grid.stl_solids.keys():
+                region_id = int(grid.region_key_to_id[key])
+
+                stl_surfaces[key] = grid.read_stl(key)
+
+                collection = LineCollection(
+                    [],
+                    colors=[region_colors[region_id]],
+                    linewidths=stl_lw,
+                    zorder=4,
+                )
+
+                ax.add_collection(collection)
+
+                stl_collections[region_id] = collection
+
+        # ==============================================================
+        # Axes formatting
+        # ==============================================================
+
+        ax.set_aspect(
+            "equal",
+            adjustable="box",
+        )
+
+        ax.set_xlabel(axis_labels[0])
+
+        ax.set_ylabel(axis_labels[1])
 
         ax.set_xlim(
             horizontal_coordinates[0],
@@ -2620,6 +3538,493 @@ class PlotMixinSolver:
             vertical_coordinates[0],
             vertical_coordinates[-1],
         )
+
+        # ==============================================================
+        # Legend
+        # ==============================================================
+
+        if show_legend:
+            handles = []
+
+            # Show normal and SIBC region colors.
+            for (
+                region_id,
+                material_type,
+            ) in self.region_material_types.items():
+                region_id = int(region_id)
+
+                if material_type != "normal":
+                    continue
+
+                handles.append(
+                    Patch(
+                        facecolor=region_colors[region_id],
+                        edgecolor="none",
+                        alpha=normal_polygon_alpha,
+                        label=(self._conformal_region_label(region_id)),
+                    )
+                )
+
+            handles.append(
+                Line2D(
+                    [0],
+                    [0],
+                    color=sibc_segment_color,
+                    lw=sibc_segment_lw,
+                    label=("reconstructed SIBC surface segment"),
+                )
+            )
+
+            if show_intersection_marker:
+                handles.append(
+                    Line2D(
+                        [0],
+                        [0],
+                        linestyle="none",
+                        marker="o",
+                        markerfacecolor="white",
+                        markeredgecolor=(sibc_segment_color),
+                        markersize=6,
+                        label=("interface intersection"),
+                    )
+                )
+
+            ax.legend(
+                handles=handles,
+                loc="center left",
+                bbox_to_anchor=(
+                    1.02,
+                    0.5,
+                ),
+                borderaxespad=0.0,
+            )
+
+        # ==============================================================
+        # Convert one primal-face index to its rectangular 2D outline
+        # ==============================================================
+
+        def get_face_outline(
+            face_index,
+        ):
+            corners = grid._get_face_corners(
+                "primal",
+                normal,
+                face_index,
+            )
+
+            points = np.asarray(
+                [corner["point"] for corner in corners],
+                dtype=float,
+            )
+
+            points_2d = points[
+                :,
+                list(plane_axes),
+            ]
+
+            # Close rectangle.
+            return np.vstack(
+                [
+                    points_2d,
+                    points_2d[0],
+                ]
+            )
+
+        # ==============================================================
+        # Return all normal-SIBC face indices in one slice
+        # ==============================================================
+
+        def get_slice_face_indices(
+            slice_index,
+        ):
+            if normal == "x":
+                local_indices = np.argwhere(
+                    normal_sibc_mask[
+                        slice_index,
+                        :,
+                        :,
+                    ]
+                )
+
+                for (
+                    j,
+                    k,
+                ) in local_indices:
+                    yield (
+                        slice_index,
+                        int(j),
+                        int(k),
+                    )
+
+            elif normal == "y":
+                local_indices = np.argwhere(
+                    normal_sibc_mask[
+                        :,
+                        slice_index,
+                        :,
+                    ]
+                )
+
+                for (
+                    i,
+                    k,
+                ) in local_indices:
+                    yield (
+                        int(i),
+                        slice_index,
+                        int(k),
+                    )
+
+            else:
+                local_indices = np.argwhere(
+                    normal_sibc_mask[
+                        :,
+                        :,
+                        slice_index,
+                    ]
+                )
+
+                for (
+                    i,
+                    j,
+                ) in local_indices:
+                    yield (
+                        int(i),
+                        int(j),
+                        slice_index,
+                    )
+
+        # ==============================================================
+        # Slice cache
+        # ==============================================================
+
+        slice_cache = {}
+
+        def build_slice_data(
+            slice_index,
+        ):
+            if slice_index in slice_cache:
+                return slice_cache[slice_index]
+
+            polygons_by_region = {
+                region_id: [] for region_id in (polygon_collections.keys())
+            }
+
+            sibc_segments = []
+
+            intersection_points = []
+
+            face_outlines = []
+
+            face_indices = list(get_slice_face_indices(slice_index))
+
+            # ----------------------------------------------------------
+            # Resolved normal-SIBC primal faces
+            # ----------------------------------------------------------
+
+            for face_index in face_indices:
+                if face_index not in geometry["segments"]:
+                    raise RuntimeError(
+                        "Face classified as normal-SIBC "
+                        "has no reconstructed interface "
+                        f"segment: {normal}-face "
+                        f"{face_index}."
+                    )
+
+                if face_index not in geometry["polygons"]:
+                    raise RuntimeError(
+                        "Face classified as normal-SIBC "
+                        "has no reconstructed polygons: "
+                        f"{normal}-face "
+                        f"{face_index}."
+                    )
+
+                segment = geometry["segments"][face_index]
+
+                polygon_records = geometry["polygons"][face_index]
+
+                # ------------------------------------------------------
+                # Sanity check:
+                # a normal-SIBC face must contain one normal and one
+                # SIBC polygon.
+                # ------------------------------------------------------
+
+                polygon_types = []
+
+                for polygon in polygon_records:
+                    region_id = int(polygon["region_id"])
+
+                    material_type = self.region_material_types[region_id]
+
+                    polygon_types.append(material_type)
+
+                    if region_id not in (polygons_by_region):
+                        continue
+
+                    vertices = np.asarray(
+                        polygon["vertices"],
+                        dtype=float,
+                    )
+
+                    vertices_2d = vertices[
+                        :,
+                        list(plane_axes),
+                    ]
+
+                    polygons_by_region[region_id].append(vertices_2d.copy())
+
+                if set(polygon_types) != {
+                    "normal",
+                    "sibc",
+                }:
+                    raise RuntimeError(
+                        "Inconsistent normal-SIBC face "
+                        f"classification for "
+                        f"{normal}-face "
+                        f"{face_index}: "
+                        f"polygon material types are "
+                        f"{polygon_types}."
+                    )
+
+                # ------------------------------------------------------
+                # Reconstructed surface segment p0 -> p1
+                # ------------------------------------------------------
+
+                p0 = np.asarray(
+                    segment["p0"],
+                    dtype=float,
+                )
+
+                p1 = np.asarray(
+                    segment["p1"],
+                    dtype=float,
+                )
+
+                segment_2d = np.array(
+                    [
+                        p0[list(plane_axes)],
+                        p1[list(plane_axes)],
+                    ],
+                    dtype=float,
+                )
+
+                sibc_segments.append(segment_2d)
+
+                if show_intersection_marker:
+                    intersection_points.extend(
+                        [
+                            segment_2d[0],
+                            segment_2d[1],
+                        ]
+                    )
+
+                if show_face_outline:
+                    face_outlines.append(get_face_outline(face_index))
+
+            # ----------------------------------------------------------
+            # Exact STL contours
+            # ----------------------------------------------------------
+
+            stl_segments_by_region = {}
+
+            if show_stl:
+                plane_origin = center.copy()
+
+                plane_origin[normal_axis] = slice_coordinates[slice_index]
+
+                for (
+                    key,
+                    surface,
+                ) in stl_surfaces.items():
+                    region_id = int(grid.region_key_to_id[key])
+
+                    slice_poly = surface.slice(
+                        normal=normal_vector,
+                        origin=plane_origin,
+                    )
+
+                    segments_2d = []
+
+                    for segment in self._polydata_lines_to_segments(slice_poly):
+                        segment = np.asarray(
+                            segment,
+                            dtype=float,
+                        )
+
+                        if len(segment) < 2:
+                            continue
+
+                        segments_2d.append(
+                            segment[
+                                :,
+                                list(plane_axes),
+                            ].copy()
+                        )
+
+                    stl_segments_by_region[region_id] = segments_2d
+
+            if intersection_points:
+                intersection_points = np.asarray(
+                    intersection_points,
+                    dtype=float,
+                )
+
+            else:
+                intersection_points = np.empty(
+                    (
+                        0,
+                        2,
+                    ),
+                    dtype=float,
+                )
+
+            result = {
+                "polygons_by_region": (polygons_by_region),
+                "sibc_segments": (sibc_segments),
+                "intersection_points": (intersection_points),
+                "face_outlines": (face_outlines),
+                "stl_segments_by_region": (stl_segments_by_region),
+                "face_count": len(face_indices),
+            }
+
+            slice_cache[slice_index] = result
+
+            return result
+
+        # ==============================================================
+        # Update existing Matplotlib artists
+        # ==============================================================
+
+        current_index = {
+            "value": None,
+        }
+
+        def update_slice(
+            slice_index,
+        ):
+            slice_index = int(slice_index)
+
+            if current_index["value"] == slice_index:
+                return
+
+            if slice_index < 0 or slice_index > max_index:
+                return
+
+            data = build_slice_data(slice_index)
+
+            # ----------------------------------------------------------
+            # Face polygons
+            # ----------------------------------------------------------
+
+            for (
+                region_id,
+                collection,
+            ) in polygon_collections.items():
+                collection.set_verts(
+                    data["polygons_by_region"].get(
+                        region_id,
+                        [],
+                    )
+                )
+
+            # ----------------------------------------------------------
+            # Face outlines
+            # ----------------------------------------------------------
+
+            if face_outline_collection is not None:
+                face_outline_collection.set_segments(data["face_outlines"])
+
+            # ----------------------------------------------------------
+            # Reconstructed SIBC surface segments
+            # ----------------------------------------------------------
+
+            sibc_segment_collection.set_segments(data["sibc_segments"])
+
+            # ----------------------------------------------------------
+            # Intersection points
+            # ----------------------------------------------------------
+
+            if intersection_artist is not None:
+                intersection_artist.set_offsets(data["intersection_points"])
+
+            # ----------------------------------------------------------
+            # STL contours
+            # ----------------------------------------------------------
+
+            if show_stl:
+                for (
+                    region_id,
+                    collection,
+                ) in stl_collections.items():
+                    collection.set_segments(
+                        data["stl_segments_by_region"].get(
+                            region_id,
+                            [],
+                        )
+                    )
+
+            plane_coordinate = slice_coordinates[slice_index]
+
+            face_count = data["face_count"]
+
+            ax.set_title(
+                "Conformal SIBC face check, "
+                f"{normal} = "
+                f"{plane_coordinate:.6g} "
+                f"(index {slice_index}, "
+                f"{face_count} "
+                f"normal-SIBC faces)"
+            )
+
+            current_index["value"] = slice_index
+
+            fig.canvas.draw_idle()
+
+        # ==============================================================
+        # Initial slice
+        # ==============================================================
+
+        update_slice(initial_index)
+
+        # ==============================================================
+        # Interactive slider
+        # ==============================================================
+
+        if interactive:
+            slider_width = 0.60 if show_legend else 0.70
+
+            slider_ax = fig.add_axes(
+                [
+                    0.15,
+                    0.04,
+                    slider_width,
+                    0.035,
+                ]
+            )
+
+            slider = Slider(
+                ax=slider_ax,
+                label=f"{normal} index",
+                valmin=0,
+                valmax=max_index,
+                valinit=initial_index,
+                valstep=1,
+                valfmt="%0.0f",
+            )
+
+            def on_slider_changed(
+                value,
+            ):
+                update_slice(int(round(value)))
+
+            slider.on_changed(on_slider_changed)
+
+            # Keep references alive for Matplotlib.
+            ax._conformal_sibc_slider = slider
+
+            ax._conformal_sibc_slider_callback = on_slider_changed
+
+            ax._conformal_sibc_slice_cache = slice_cache
 
         return ax
 
