@@ -35,6 +35,26 @@ class BCsMixin:
         xlo, ylo, zlo = 1.0, 1.0, 1.0
         xhi, yhi, zhi = 1.0, 1.0, 1.0
 
+        # Boundary-condition masks for electric and magnetic DOFs.
+        #
+        # 1 -> active DOF
+        # 0 -> Dirichlet-constrained DOF
+        self.bc_mask_E = Field(
+            self.Nx,
+            self.Ny,
+            self.Nz,
+            dtype=np.int8,
+            use_ones=True,
+        )
+
+        self.bc_mask_H = Field(
+            self.Nx,
+            self.Ny,
+            self.Nz,
+            dtype=np.int8,
+            use_ones=True,
+        )
+
         # Check BCs for internal MPI subdomains
         if self.use_mpi and self.grid.use_mpi:
             if (
@@ -226,7 +246,7 @@ class BCsMixin:
                 zhi = 0
 
             # Assemble matrix
-            self.BC = Field(self.Nx, self.Ny, self.Nz, dtype=np.int8, use_ones=True)
+            self.BC = self.bc_mask_H
 
             for d in ["x", "y", "z"]:  # tangential to zero
                 if d != "x":

@@ -56,6 +56,31 @@ class FieldMonitor:
         self.shape = None
         self.xp = None
 
+    def _initialize_storage(self, E: Field):
+        """Initialize frequency-domain field storage from a Field object."""
+
+        if self.shape is not None:
+            return
+
+        self.shape = (E.Nx, E.Ny, E.Nz)
+        self.xp = E.xp
+
+        n_freqs = len(self.frequencies)
+        shape = (n_freqs, *self.shape)
+
+        self.Ex_acc = self.xp.zeros(
+            shape,
+            dtype=self.xp.complex128,
+        )
+        self.Ey_acc = self.xp.zeros(
+            shape,
+            dtype=self.xp.complex128,
+        )
+        self.Ez_acc = self.xp.zeros(
+            shape,
+            dtype=self.xp.complex128,
+        )
+
     def update(self, E: Field, dt: float):
         """Accumulate a time-domain ``Field`` snapshot into the monitors.
 
@@ -77,18 +102,9 @@ class FieldMonitor:
         """
         if self.dt is None:
             self.dt = dt
-            self.shape = (E.Nx, E.Ny, E.Nz)
-            self.xp = E.xp
 
-            n_freqs = len(self.frequencies)
-            shape = (n_freqs, *self.shape)
-            self.Ex_acc = self.xp.zeros(shape, dtype=self.xp.complex128)
-            self.Ey_acc = self.xp.zeros(shape, dtype=self.xp.complex128)
-            self.Ez_acc = self.xp.zeros(shape, dtype=self.xp.complex128)
-            t = self.time_index * self.dt
-
+        self._initialize_storage(E)
         t = self.time_index * self.dt
-
         Ex = E.to_matrix("x")  # E.array[0:E.N]
         Ey = E.to_matrix("y")
         Ez = E.to_matrix("z")
@@ -114,3 +130,43 @@ class FieldMonitor:
         """
 
         return {"Ex": self.Ex_acc, "Ey": self.Ey_acc, "Ez": self.Ez_acc}
+
+    def store(self, E, frequency):
+        """
+        Store a directly computed frequency-domain electric field.
+
+        Parameters
+        ----------
+        E : Field
+            Complex electric field distribution.
+
+        frequency : float
+            Frequency [Hz] corresponding to the field solution.
+        """
+
+        self._initialize_storage(E)
+
+        matches = np.flatnonzero(
+            np.isclose(
+                self.frequencies,
+                frequency,
+                rtol=1e-12,
+                atol=0.0,
+            )
+        )
+
+        if len(matches) == 0:
+            raise ValueError(
+                f"Frequency {frequency} Hz is not configured in this FieldMonitor."
+            )
+
+        if len(matches) > 1:
+            raise ValueError(
+                f"Frequency {frequency} Hz occurs multiple times in this FieldMonitor."
+            )
+
+        i = matches[0]
+
+        self.Ex_acc[i] = E.to_matrix("x")
+        self.Ey_acc[i] = E.to_matrix("y")
+        self.Ez_acc[i] = E.to_matrix("z")
