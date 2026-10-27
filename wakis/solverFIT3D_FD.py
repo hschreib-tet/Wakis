@@ -5,7 +5,7 @@
 
 import numpy as np
 from scipy.sparse import diags
-from scipy.sparse.linalg import spsolve
+from scipy.sparse.linalg import eigsh, spsolve
 
 from .routines_FD import RoutinesFDMixin
 from .solverFIT3D import SolverFIT3D
@@ -255,3 +255,121 @@ class SolverFIT3D_FD(
         e[self.free_E_idx] = e_red
 
         return e
+
+    def solve_eigenmodes(
+        self,
+        n_modes=6,
+        target_frequency=None,
+    ):
+        """
+        Solve the lossless generalized electric-field eigenvalue problem.
+
+        The source-free frequency-domain FIT system is
+
+            SL @ e = omega**2 * Meps @ e,
+
+        where ``e`` is the reduced electric grid-voltage vector.
+
+        Parameters
+        ----------
+        n_modes : int, optional
+            Number of eigenmodes to compute.
+
+        target_frequency : float, optional
+            Target frequency in Hz. If provided, shift-invert is used to
+            find the eigenmodes closest to this frequency.
+
+            If omitted, the smallest-magnitude eigenvalues are requested.
+            This may return curl-curl nullspace modes unless the nullspace
+            has been removed separately.
+
+        Returns
+        -------
+        frequencies : ndarray
+            Eigenfrequencies in Hz, sorted in ascending order.
+
+        modes : ndarray
+            Reduced electric grid-voltage eigenvectors. Shape is
+            ``(n_active_E_dofs, n_modes)``.
+
+        eigenvalues : ndarray
+            Eigenvalues ``omega**2``.
+        """
+
+        # ----------------------------------------------------------
+        # Lossless formulation only
+        # ----------------------------------------------------------
+
+        if self.Msigma.nnz != 0:
+            if np.any(np.abs(self.Msigma.diagonal()) > 0.0):
+                raise NotImplementedError(
+                    "The current eigenmode solver supports only "
+                    "lossless systems with Msigma = 0."
+                )
+
+        # ----------------------------------------------------------
+        # Generalized eigenvalue problem
+        #
+        #     SL e = lambda Meps e
+        #
+        # with
+        #
+        #     lambda = omega^2
+        # ----------------------------------------------------------
+
+        if target_frequency is not None:
+            target_frequency = float(target_frequency)
+
+            if not np.isfinite(target_frequency) or target_frequency <= 0.0:
+                raise ValueError(
+                    "target_frequency must be finite and greater than zero."
+                )
+
+            omega_target = 2.0 * np.pi * target_frequency
+
+            sigma = omega_target**2
+
+            eigenvalues, modes = eigsh(
+                self.SL,
+                k=n_modes,
+                M=self.Meps,
+                sigma=sigma,
+                which="LM",
+            )
+
+        else:
+            eigenvalues, modes = eigsh(
+                self.SL,
+                k=n_modes,
+                M=self.Meps,
+                which="SM",
+            )
+
+        # ----------------------------------------------------------
+        # Sort
+        # ----------------------------------------------------------
+
+        order = np.argsort(eigenvalues)
+
+        eigenvalues = eigenvalues[order]
+        modes = modes[:, order]
+
+        # ----------------------------------------------------------
+        # Convert omega^2 -> frequency
+        # ----------------------------------------------------------
+
+        positive = eigenvalues > 0.0
+
+        frequencies = np.full(
+            eigenvalues.shape,
+            np.nan,
+            dtype=float,
+        )
+
+        frequencies[positive] = np.sqrt(eigenvalues[positive]) / (2.0 * np.pi)
+
+        return (
+            frequencies,
+            modes,
+            eigenvalues,
+        )
