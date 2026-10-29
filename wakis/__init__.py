@@ -21,4 +21,5 @@ from .field_monitors import FieldMonitor
 from .gridFIT3D import GridFIT3D
 from .logger import Logger
 from .solverFIT3D import SolverFIT3D
+from .solverFIT3D_FD import SolverFIT3D_FD
 from .wakeSolver import WakeSolver

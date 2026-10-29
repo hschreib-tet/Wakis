@@ -50,21 +50,81 @@ class SolverFIT3D_FD(
 
         self._build_active_e_dofs()
         self._assemble_fd_operators()
+        self._build_sibc_geometry()
+
+    def _build_conductor_e_dof_mask(self):
+        """Return a boolean mask of primal electric edges in the field domain.
+
+        PEC and SIBC use identical *geometric* exclusion rules. Edges with
+        two conductor endpoints are removed; resolved normal-to-conductor
+        edges are retained because they have a nonzero active line segment.
+
+        This function does not impose the SIBC itself; the FD surface term
+        must be added separately. Unsupported/hidden conductor interfaces
+        are rejected rather than silently treated as fully active edges.
+        """
+        active = np.ones(3 * self.N, dtype=bool)
+
+        if not self.use_stl or self.grid.geometry_mode != "conformal":
+            return active
+
+        if not self.region_material_types:
+            self._build_region_material_types()
+
+        for component, direction in enumerate(("x", "y", "z")):
+            start_ids, end_ids = self.grid._get_edge_region_ids("primal", direction)
+            conductor_ids = [
+                region_id
+                for region_id, kind in self.region_material_types.items()
+                if kind in ("pec", "sibc")
+            ]
+            start_conductor = np.isin(start_ids, conductor_ids)
+            end_conductor = np.isin(end_ids, conductor_ids)
+            fully_conductor = start_conductor & end_conductor
+            crossing = start_conductor ^ end_conductor
+
+            line_data = self.conformal_line_data.get("primal", {}).get(direction)
+            if line_data is None:
+                raise RuntimeError(f"Missing conformal primal {direction}-edge data.")
+
+            resolved = np.asarray(line_data["supported"], dtype=bool)
+            alpha_fraction = np.asarray(
+                line_data["effective_length_fraction"], dtype=float
+            )
+            invalid = crossing & (
+                ~resolved | ~np.isfinite(alpha_fraction) | (alpha_fraction <= 0.0)
+            )
+
+            # The full arrays include high-side edges absent from Field.
+            # Only validate edges that actually belong to the solver DOFs.
+            invalid_stored = self._edge_array_to_field_component(invalid, direction)
+            if np.any(invalid_stored):
+                raise RuntimeError(
+                    f"Unsupported normal-to-conductor geometry on "
+                    f"{np.count_nonzero(invalid_stored)} stored {direction}-edges."
+                )
+
+            active_component = self._edge_array_to_field_component(
+                ~fully_conductor, direction
+            )
+            active[component * self.N : (component + 1) * self.N] = (
+                active_component.ravel(order="F")
+            )
+
+        return active
 
     def _build_active_e_dofs(self):
-        """
-        Build the active electric degree-of-freedom set.
+        """Build active electric DOFs from material, boundary and geometry.
 
-        Electric DOFs are inactive if they belong either to
-        a PEC material or to an electric Dirichlet boundary.
+        The geometric PEC/SIBC exclusion is shared. The impedance of SIBC
+        boundaries is *not* included in this mask and must enter the FD
+        operator through D_Zs later.
         """
-
         active_material = self.iDeps.diagonal() != 0.0
-
         active_boundary = self.bc_mask_E.toarray().astype(bool)
+        self.active_conductor_E = self._build_conductor_e_dof_mask()
 
-        self.active_E = active_material & active_boundary
-
+        self.active_E = active_material & active_boundary & self.active_conductor_E
         self.free_E_idx = np.flatnonzero(self.active_E)
 
     def _assemble_fd_operators(self):
@@ -179,6 +239,137 @@ class SolverFIT3D_FD(
 
         self.SL = (self.C_red.transpose() @ self.Mnu @ self.C_red).tocsr()
 
+    def _build_sibc_geometry(self):
+        """Prepare scalar SIBC coefficients on *primal faces* once.
+
+        Stored magnetic unknowns correspond to primal faces shifted in the
+        normal direction. Therefore use _primal_face_array_to_dual_edge_component,
+        NOT _face_array_to_field_component (which uses low-side faces).
+
+        First-order approximation: H is taken parallel to the FIT face normal.
+        Geometry coefficient g = cut_length * sin(theta) / active_face_area.
+        The normal-region permeability used in the conversion b -> H is saved
+        separately; SIBC material permeability belongs in Zs, not here.
+        """
+        self.sibc_g = np.zeros(3 * self.N, dtype=float)
+        self.sibc_sigma = np.zeros(3 * self.N, dtype=float)
+        self.sibc_mu_wall = np.zeros(3 * self.N, dtype=float)
+        self.sibc_mu_field = np.ones(3 * self.N, dtype=float)
+        self.has_sibc = False
+
+        if not self.use_stl or self.grid.geometry_mode != "conformal":
+            return
+        for direction in ("x", "y", "z"):
+            geom = self.grid.interface_face_data["primal"][direction]
+            classified = self.conformal_face_data["primal"][direction]
+            shape = geom["resolved"].shape
+            g = np.zeros(shape, dtype=float)
+            sig = np.zeros(shape, dtype=float)
+            mu_wall = np.zeros(shape, dtype=float)
+            mu_field = np.ones(shape, dtype=float)
+            axis = {"x": 0, "y": 1, "z": 2}[direction]
+
+            # A recorded SIBC segment must not be quietly dropped when its
+            # polygon classification is unresolved or not normal <-> SIBC.
+            for index, segment in geom["segments"].items():
+                region_id = int(segment["surface_id"])
+                if self.region_material_types[region_id] != "sibc":
+                    continue
+                if not classified["normal_sibc"][index] or not geom["resolved"][index]:
+                    raise RuntimeError(
+                        f"Unresolved/unsupported SIBC face: primal {direction} {index}"
+                    )
+                field_ids = classified["normal_region_ids"][index]
+                wall_ids = classified["conductor_region_ids"][index]
+                if (
+                    len(field_ids) != 1
+                    or len(wall_ids) != 1
+                    or wall_ids[0] != region_id
+                ):
+                    raise RuntimeError(f"Ambiguous SIBC interface: {direction} {index}")
+                area = float(geom["region_areas"][index][field_ids[0]])
+                normal = np.asarray(segment["normal"], dtype=float)
+                length = float(segment["length"])
+                if normal.shape != (3,) or not np.all(np.isfinite(normal)):
+                    raise RuntimeError(f"Missing SIBC normal: {direction} {index}")
+                n_norm = np.linalg.norm(normal)
+                if area <= 0 or length <= 0 or n_norm <= 0:
+                    raise RuntimeError(f"Invalid SIBC geometry: {direction} {index}")
+                normal /= n_norm
+                sin_theta = np.sqrt(max(0.0, 1.0 - normal[axis] ** 2))
+                if sin_theta <= 1e-10:
+                    raise RuntimeError(f"Degenerate SIBC angle: {direction} {index}")
+                wall_material = self._get_region_material_properties(region_id)
+                field_material = self._get_region_material_properties(field_ids[0])
+                if (
+                    wall_material[2] <= 0
+                    or wall_material[1] <= 0
+                    or field_material[1] <= 0
+                ):
+                    raise ValueError(f"Invalid SIBC material: {direction} {index}")
+                g[index] = length * sin_theta / area
+                sig[index] = wall_material[2]
+                mu_wall[index] = wall_material[1]
+                mu_field[index] = field_material[1]
+
+            # Shift from primal face index to stored magnetic H DOF.
+            # WAKIS uses x-fastest indexing, corresponding to order="F".
+            offset = axis * self.N
+            target = slice(offset, offset + self.N)
+
+            self.sibc_g[target] = self._primal_face_array_to_dual_edge_component(
+                g, direction
+            ).ravel(order="F")
+
+            self.sibc_sigma[target] = self._primal_face_array_to_dual_edge_component(
+                sig, direction
+            ).ravel(order="F")
+
+            self.sibc_mu_wall[target] = self._primal_face_array_to_dual_edge_component(
+                mu_wall, direction
+            ).ravel(order="F")
+
+            self.sibc_mu_field[target] = self._primal_face_array_to_dual_edge_component(
+                mu_field, direction
+            ).ravel(order="F")
+
+        # Low-side primal faces are not represented in the
+        # stored magnetic DOF space.
+        low = [slice(None)] * 3
+        low[axis] = 0
+
+        if np.any(g[tuple(low)] > 0):
+            bc = self.bc_low[axis].lower()
+
+            if bc not in ("pec", "electric"):
+                raise NotImplementedError(
+                    f"SIBC on low-side {direction} faces "
+                    "requires explicit boundary treatment"
+                )
+
+            # Outer PEC boundary: tangential E is zero.
+            # No additional SIBC correction is required.
+
+        self.has_sibc = bool(np.any(self.sibc_g > 0))
+
+    def _build_sibc_diagonal(self, omega):
+        """Diagonal D_Zs for exp(+j omega t), good-conductor Leontovich SIBC."""
+        D = np.ones(3 * self.N, dtype=np.complex128)
+        if not self.has_sibc:
+            return D
+        from scipy.constants import mu_0
+
+        active = self.sibc_g > 0
+        z_s = np.sqrt(
+            1j * omega * mu_0 * self.sibc_mu_wall[active] / self.sibc_sigma[active]
+        )
+        D[active] += (
+            self.sibc_g[active] * z_s / (1j * omega * mu_0 * self.sibc_mu_field[active])
+        )
+        if not np.all(np.isfinite(D)) or np.any(np.abs(D) == 0):
+            raise RuntimeError("Non-finite or zero D_Zs diagonal")
+        return D
+
     def build_system_matrix(
         self,
         omega,
@@ -202,8 +393,15 @@ class SolverFIT3D_FD(
         if omega <= 0.0:
             raise ValueError("omega must be greater than zero.")
 
+        if self.has_sibc:
+            D = self._build_sibc_diagonal(omega)
+            mnu_eff = self.Mnu.diagonal() / D
+            stiffness = (self.C_red.transpose() @ diags(mnu_eff) @ self.C_red).tocsr()
+        else:
+            stiffness = self.SL
+
         return (
-            self.Msigma + 1j * omega * self.Meps + 1.0 / (1j * omega) * self.SL
+            self.Msigma + 1j * omega * self.Meps + 1.0 / (1j * omega) * stiffness
         ).tocsr()
 
     def solve(self, omega, source):
@@ -295,6 +493,11 @@ class SolverFIT3D_FD(
         eigenvalues : ndarray
             Eigenvalues ``omega**2``.
         """
+
+        if self.has_sibc:
+            raise NotImplementedError(
+                "Frequency-dependent SIBC is not supported by the lossless eigenmode solver."
+            )
 
         # ----------------------------------------------------------
         # Lossless formulation only

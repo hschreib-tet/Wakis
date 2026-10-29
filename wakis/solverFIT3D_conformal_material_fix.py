@@ -1,0 +1,4381 @@
+# copyright ################################# #
+# This file is part of the wakis Package.     #
+# Copyright (c) CERN, 2024.                   #
+# ########################################### #
+
+import time
+
+import h5py
+import numpy as np
+from scipy.constants import c as c_light
+from scipy.constants import epsilon_0 as eps_0
+from scipy.constants import mu_0 as mu_0
+from scipy.sparse import csc_matrix as sparse_mat
+from scipy.sparse import diags, hstack, vstack
+
+from .boundaries import BCsMixin
+from .field import Field
+from .logger import Logger
+from .materials import VALID_MATERIAL_TYPES, material_lib
+from .plotting import PlotMixinSolver as PlotMixin
+from .routines import RoutinesMixin
+
+try:
+    import cupy as cp
+    from cupyx.scipy.sparse import csc_matrix as gpu_sparse_mat
+
+    imported_cupyx = True
+except ImportError:
+    imported_cupyx = False
+
+try:
+    from sparse_dot_mkl import csr_matrix as mkl_sparse_mat
+    from sparse_dot_mkl import dot_product_mkl
+
+    imported_mkl = True
+except ImportError:
+    imported_mkl = False
+
+
+class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
+    def __init__(
+        self,
+        grid,
+        wake=None,
+        cfln=0.5,
+        dt=None,
+        bc_low=["Periodic", "Periodic", "Periodic"],
+        bc_high=["Periodic", "Periodic", "Periodic"],
+        use_stl=False,
+        use_conductors=False,
+        use_gpu=False,
+        use_mpi=False,
+        use_sibc=False,
+        fmax=1e9,
+        dtype=np.float64,
+        n_pml=10,
+        kappa_max=5,
+        alpha_max=0.05,
+        sigma_factor=1,
+        pml_exp=4,
+        source_type="direct",
+        bg=[1.0, 1.0, 0.0],
+        verbose=2,
+    ):
+        """
+        3D time-domain electromagnetic solver based on the Finite Integration
+        Technique (FIT).
+
+        Using GridFIT3D's mesh and geometry, it handles the material assignment,
+        boundary conditions and time-stepping.
+        Supports CPU, optional GPU acceleration (cupyx) and MPI
+        domain decomposition. Provides utilities for importing conductors and
+        STL solids, applying PML/ABC boundaries, and saving/restoring solver
+        state.
+
+        Parameters
+        ----------
+        grid : GridFIT3D
+            Instance providing mesh, coordinate arrays and geometry flags.
+        wake : WakeSolver, optional
+            Wakefield object with beam parameters used for wake computations.
+        cfln : float, optional
+            CFL number used to compute a stable timestep when ``dt`` is None.
+        dt : float, optional
+            Explicit timestep. If provided, it overrides the CFL-based value.
+        bc_low, bc_high : list of str, optional
+            Boundary conditions for low/high faces in (x, y, z) order.
+        use_stl : bool, optional
+            If True, apply solids and materials provided in the ``grid`` object.
+        use_conductors : bool, optional
+            [LEGACY] will be removed in future releases.
+            If True, import conductor geometry from ``conductors.py`` masks.
+        use_sibc : bool, optional
+            Enable surface impedance boundary condition for high-conductivity solids.
+        fmax : float, optional
+            Maximum frequency for SIBC calculations, used to determine the
+            conductivity threshold for applying SIBC instead of explicit conductivity.
+            Default is 1 GHz if not set and a wakeSolver object is not provided.
+        use_gpu : bool, optional
+            Enable GPU acceleration via ``cupyx`` (if available).
+        use_mpi : bool, optional
+            Enable MPI execution for a subdivided grid.
+        dtype : numpy dtype, optional
+            Numeric dtype for solver arrays (default ``np.float64``).
+        n_pml : int, optional
+            Number of PML cells for PML boundary regions.
+        kappa_max : float, optional
+            Maximum kappa value for CPML boundaries.
+        alpha_max : float, optional
+            Maximum alpha value for CPML boundaries.
+        sigma_factor : float, optional
+            Scaling factor for CPML conductivity profile.
+        pml_exp : float, optional
+            Exponent for CPML conductivity profile.
+        source_type : str, optional
+            Type of source injection: 'direct', or 'tfsf' for 'Total-Field/Scattered-Field'.
+        bg : sequence or str, optional
+            Background material [eps_r, mu_r, sigma] or a material key from
+            the library. If a sigma value is provided conductivity handling is
+            enabled.
+        verbose : int or bool, optional
+            Verbosity flag for initialization messages.
+
+        Attributes
+        ----------
+        E, H, J : wakis.Field
+            Electric field, magnetic field and current density containers.
+            Access components via labels 'x','y','z'. Example:
+            ``solver.E[:, :, n, 'z']`` gives Ez at z-index n.
+        ieps, imu, sigma : wakis.Field
+            Material tensors (inverse permittivity, inverse permeability and
+            conductivity) stored per field component.
+        grid : GridFIT3D
+            Reference to the input grid object.
+        dt : float
+            Time-step used for time integration.
+        cfln : float
+            CFL number used when computing dt from grid spacing.
+        """
+
+        print("Initializing Electromagnetic solver...")
+        self.verbose = verbose
+        t0 = time.time()
+        self.logger = Logger()
+
+        # Flags
+        self.step_0 = True
+        self.nstep = int(0)
+        self.plotter_active = False
+        self.use_conductors = use_conductors
+        self.use_stl = use_stl
+        self.use_gpu = use_gpu
+        self.use_mpi = use_mpi
+        self.use_sibc = use_sibc  # surface impedance boundary condition
+        self.fmax = fmax  # maximum frequency for SIBC
+        self.activate_abc = False  # Will turn true if abc BCs are chosen
+        self.activate_pml = False  # Will turn true if pml BCs are chosen
+        self.activate_cpml = False  # Will turn true if cpml BCs are chosen
+        self.source_type = str(source_type).lower()  # 'direct' or 'tfsf'
+        if self.source_type not in ("direct", "tfsf"):
+            raise ValueError(
+                f"Invalid source_type={source_type!r}; expected 'direct' or 'tfsf'."
+            )
+        self.use_conductivity = False  # Will turn true with conductive material or pml
+        self.imported_mkl = imported_mkl  # Use MKL backend when available
+        self.one_step = self._one_step
+
+        if use_stl:
+            self.use_conductors = False
+        self.update_logger(["use_gpu", "use_mpi", "source_type"])
+
+        # Grid
+        self.grid = grid
+        self.background = bg
+
+        self.bg_material_type = getattr(
+            self.grid,
+            "bg_material_type",
+            None,
+        )
+
+        if self.bg_material_type is None:
+            # Backward compatibility for grids created before
+            # bg_material_type was introduced.
+            self.bg_material_type = self._infer_background_material_type(bg)
+
+        self._validate_background_material(bg)
+
+        self.region_material_types = {}
+
+        self.interface_transition_masks = {
+            "primal": {},
+            "dual": {},
+        }
+        self.conformal_line_data = {
+            "primal": {},
+            "dual": {},
+        }
+        self.conformal_line_materials = {
+            "primal": {},
+            "dual": {},
+        }
+
+        self.conformal_face_data = {
+            "primal": {},
+            "dual": {},
+        }
+
+        self.conformal_face_materials = {
+            "primal": {},
+            "dual": {},
+        }
+
+        self.conformal_diagonal_materials = {
+            "eps_r": {},
+            "mu_r": {},
+            "sigma": {},
+        }
+
+        if (
+            getattr(self.grid, "geometry_mode", "legacy") == "conformal"
+            and getattr(self.grid, "region_ids", {}).get("primal") is not None
+            and getattr(self.grid, "region_ids", {}).get("dual") is not None
+        ):
+            self._build_interface_transition_masks()
+        resolved_masks = getattr(
+            self.grid,
+            "resolved_interface_edge_masks",
+            None,
+        )
+
+        intersection_data = getattr(
+            self.grid,
+            "interface_intersections",
+            None,
+        )
+
+        if (
+            getattr(
+                self.grid,
+                "geometry_mode",
+                "legacy",
+            )
+            == "conformal"
+            and resolved_masks
+            and intersection_data
+            and all(
+                resolved_masks.get(grid_type)
+                for grid_type in (
+                    "primal",
+                    "dual",
+                )
+            )
+            and all(
+                intersection_data.get(grid_type)
+                for grid_type in (
+                    "primal",
+                    "dual",
+                )
+            )
+        ):
+            self._build_conformal_line_data()
+            self._build_conformal_line_materials()
+
+        self.Nx = self.grid.Nx
+        self.Ny = self.grid.Ny
+        self.Nz = self.grid.Nz
+        self.N = self.Nx * self.Ny * self.Nz
+
+        self.dx = self.grid.dx
+        self.dy = self.grid.dy
+        self.dz = self.grid.dz
+
+        self.x = self.grid.x[:-1] + self.dx / 2
+        self.y = self.grid.y[:-1] + self.dy / 2
+        self.z = self.grid.z[:-1] + self.dz / 2
+
+        self.L = self.grid.L
+        self.iA = self.grid.iA
+        self.tL = self.grid.tL
+        self.itA = self.grid.itA
+
+        self.L_fraction = None
+        self.tL_fraction = None
+        self.L_eff = None
+        self.tL_eff = None
+
+        self.A_fraction = None
+        self.tA_fraction = None
+        self.A_eff = None
+        self.tA_eff = None
+
+        if (
+            use_stl
+            and self.conformal_line_data["primal"]
+            and self.conformal_line_data["dual"]
+        ):
+            self._build_conformal_effective_lengths()
+
+        if (
+            use_stl
+            and getattr(
+                self.grid,
+                "interface_face_data",
+                {},
+            ).get("primal")
+            and getattr(
+                self.grid,
+                "interface_face_data",
+                {},
+            ).get("dual")
+        ):
+            self._build_conformal_face_data()
+            self._build_conformal_face_materials()
+            self._build_conformal_effective_areas()
+
+            if (
+                self.conformal_line_materials["primal"]
+                and self.conformal_line_materials["dual"]
+            ):
+                self._build_conformal_diagonal_materials()
+
+        if (
+            use_stl
+            and getattr(
+                self.grid,
+                "geometry_mode",
+                "legacy",
+            )
+            == "conformal"
+            and self.L_eff is not None
+            and self.tL_eff is not None
+            and self.A_eff is not None
+            and self.tA_eff is not None
+        ):
+            # ----------------------------------------------------------
+            # Activate conformal geometry metrics.
+            #
+            # From this point on, self.L, self.tL, self.iA and self.itA
+            # represent the metrics actually used by the solver.
+            # ----------------------------------------------------------
+
+            self.L = Field(
+                self.Nx,
+                self.Ny,
+                self.Nz,
+            )
+
+            self.tL = Field(
+                self.Nx,
+                self.Ny,
+                self.Nz,
+            )
+
+            self.L.fromarray(self.L_eff.toarray().copy())
+
+            self.tL.fromarray(self.tL_eff.toarray().copy())
+
+            A_values = self.A_eff.toarray()
+            tA_values = self.tA_eff.toarray()
+
+            if np.any(A_values <= 0.0):
+                raise RuntimeError(
+                    "Conformal primal effective face area must be positive."
+                )
+
+            if np.any(tA_values <= 0.0):
+                raise RuntimeError(
+                    "Conformal dual effective face area must be positive."
+                )
+
+            self.iA = Field(
+                self.Nx,
+                self.Ny,
+                self.Nz,
+            )
+
+            self.itA = Field(
+                self.Nx,
+                self.Ny,
+                self.Nz,
+            )
+
+            self.iA.fromarray(1.0 / A_values)
+
+            self.itA.fromarray(1.0 / tA_values)
+
+        self.update_logger(["grid", "background", "bg_material_type"])
+
+        # Wake computation
+        self.wake = wake
+        if self.wake is not None:
+            self.logger.wakeSolver = self.wake.logger.wakeSolver
+        if wake is not None and fmax == 1e9:
+            self.fmax = self.wake.fmax
+        if verbose > 1:
+            print(f"    * Maximum frequency set to fmax={self.fmax / 1e9} GHz")
+
+        # Fields
+        self.dtype = dtype
+        self.E = Field(
+            self.Nx, self.Ny, self.Nz, use_gpu=self.use_gpu, dtype=self.dtype
+        )
+        self.H = Field(
+            self.Nx, self.Ny, self.Nz, use_gpu=self.use_gpu, dtype=self.dtype
+        )
+        self.J = Field(
+            self.Nx, self.Ny, self.Nz, use_gpu=self.use_gpu, dtype=self.dtype
+        )
+
+        # MPI init
+        if self.use_mpi:
+            if self.grid.use_mpi:
+                self._mpi_initialize()
+                self.one_step = self._mpi_one_step
+            else:
+                print(
+                    "[!] Grid not subdivided for MPI, set `use_mpi`=True also in \
+                    `GridFIT3D` to enable MPI"
+                )
+
+        # Matrices
+        if verbose:
+            print("Assembling operator matrices...")
+        N = self.N
+        self.Px = diags([-1, 1], [0, 1], shape=(N, N), dtype=np.int8)
+        self.Py = diags([-1, 1], [0, self.Nx], shape=(N, N), dtype=np.int8)
+        self.Pz = diags([-1, 1], [0, self.Nx * self.Ny], shape=(N, N), dtype=np.int8)
+
+        # original grid
+        self.Ds = diags(
+            self.L.toarray(),
+            shape=(3 * N, 3 * N),
+            dtype=self.dtype,
+        )
+
+        self.iDa = diags(
+            self.iA.toarray(),
+            shape=(3 * N, 3 * N),
+            dtype=self.dtype,
+        )
+
+        # tilde grid
+        self.tDs = diags(
+            self.tL.toarray(),
+            shape=(3 * N, 3 * N),
+            dtype=self.dtype,
+        )
+
+        self.itDa = diags(
+            self.itA.toarray(),
+            shape=(3 * N, 3 * N),
+            dtype=self.dtype,
+        )
+
+        # Curl matrix
+        self.C = vstack(
+            [
+                hstack([sparse_mat((N, N)), -self.Pz, self.Py]),
+                hstack([self.Pz, sparse_mat((N, N)), -self.Px]),
+                hstack([-self.Py, self.Px, sparse_mat((N, N))]),
+            ],
+            dtype=np.int8,
+        )
+
+        # Boundaries
+        if verbose:
+            print("Applying boundary conditions...")
+        self.bc_low = bc_low
+        self.bc_high = bc_high
+        self.update_logger(["bc_low", "bc_high"])
+        self._apply_bc_to_C()
+
+        # Materials
+        if verbose:
+            print("Adding material tensors...")
+        if type(bg) is str:
+            bg = material_lib[bg.lower()]
+
+        if len(bg) == 3 and bg[2] > 0.0:
+            self.eps_bg, self.mu_bg, self.sigma_bg = (
+                bg[0] * eps_0,
+                bg[1] * mu_0,
+                bg[2],
+            )
+            if not bg == [1.0, 1.0, 0.0]:
+                self.use_conductivity = True
+        else:
+            self.eps_bg, self.mu_bg, self.sigma_bg = (
+                bg[0] * eps_0,
+                bg[1] * mu_0,
+                0.0,
+            )
+
+        # Max conductivity that can be resolved without SIBC
+        dn = np.sqrt(2) * min(self.dx.min(), self.dy.min(), self.dz.min())
+        self.sigma_max = 10 / (np.pi * self.fmax * mu_0 * dn**2)
+        if self.verbose > 1:
+            print(f"    * Max resolved conductivity without SIBC: {self.sigma_max} S/m")
+
+        # fmt: off
+        self.ieps = (
+            Field(self.Nx, self.Ny, self.Nz, use_ones=True, dtype=self.dtype)
+            * (1.0 / self.eps_bg)
+        )
+        self.imu = (
+            Field(self.Nx, self.Ny, self.Nz, use_ones=True, dtype=self.dtype)
+            * (1.0 / self.mu_bg)
+        )
+        self.sigma = (
+            Field(self.Nx, self.Ny, self.Nz, use_ones=True, dtype=self.dtype)
+            * self.sigma_bg
+        )
+        # fmt: on
+
+        if self.use_stl:
+            self._apply_stl_materials()
+
+        # Fill PML BCs
+        if self.activate_pml:
+            if verbose:
+                print("Filling PML sigmas...")
+            if self.source_type != "tfsf":
+                self.source_type = (
+                    "tfsf"  # Force Total-Field/Scattered-Field injection for PML
+                )
+                print(
+                    "[!] PML works better with Total-Field/Scattered-Field injection, setting source_type='tfsf'"
+                )
+                self.update_logger(["source_type"])
+            self.n_pml = n_pml
+            self._initialize_PML()
+            self.update_logger(["n_pml"])
+            if verbose > 1:
+                print(f"    * PML thickness: {self.n_pml} cells")
+
+        # Fill PML BCs
+        if self.activate_cpml:
+            if verbose:
+                print("Filling CPML parameters...")
+            self.one_step = self._one_step_cpml
+            if self.source_type != "tfsf":
+                self.source_type = (
+                    "tfsf"  # Force Total-Field/Scattered-Field injection for CPML
+                )
+                print(
+                    "[!] CPML requires Total-Field/Scattered-Field injection, setting source_type='tfsf'"
+                )
+                self.update_logger(["source_type"])
+            self.n_pml = n_pml
+            self.kappa_max = kappa_max
+            self.alpha_max = alpha_max
+            self.sigma_factor = sigma_factor
+            self.pml_exp = pml_exp
+            self._initialize_CPML()
+            self.update_logger(
+                ["n_pml", "kappa_max", "alpha_max", "sigma_factor", "pml_exp"]
+            )
+            if verbose > 1:
+                print(f"    * CPML thickness: {self.n_pml} cells")
+
+        # Timestep calculation
+        if verbose:
+            print("Calculating maximal stable timestep...")
+        self.cfln = cfln
+        if dt is None:
+            self.dt = cfln / (
+                c_light
+                * np.sqrt(
+                    1 / np.min(self.grid.dx) ** 2
+                    + 1 / np.min(self.grid.dy) ** 2
+                    + 1 / np.min(self.grid.dz) ** 2
+                )
+            )
+        else:
+            self.dt = dt
+        self.dt = self.dtype(self.dt)
+        self.update_logger(["dt"])
+
+        if self.use_conductivity:  # relaxation time criterion tau
+            mask = np.logical_and(
+                self.sigma.toarray() != 0,  # for non-conductive
+                self.ieps.toarray() != 0,
+            )  # for PEC eps=inf
+
+            self.tau = (1 / self.ieps.toarray()[mask]) / self.sigma.toarray()[mask]
+
+            if self.dt > self.tau.min():
+                self.dt = self.tau.min()
+
+        if self.verbose > 1:
+            print(f"    * Simulation timestep: dt={self.dt:.3e} s")
+        if self.verbose > 1 and wake is not None:
+            wakelength = 1.0 if self.wake.wakelength is None else self.wake.wakelength
+            tmax = (
+                wakelength + self.wake.ti * self.wake.v + (self.z.max() - self.z.min())
+            ) / self.wake.v  # [s]
+            print(
+                f"    * Total simulation time for wakelength={wakelength} m: tmax={tmax:.3e} s"
+            )
+            print(
+                f"    * Total number of timesteps for wakelength={wakelength} m: Nt={int(tmax / self.dt)}"
+            )
+
+        # Pre-computing
+        if verbose:
+            print("Pre-computing...")
+        self.iDeps = diags(self.ieps.toarray(), shape=(3 * N, 3 * N), dtype=self.dtype)
+        self.iDmu = diags(self.imu.toarray(), shape=(3 * N, 3 * N), dtype=self.dtype)
+        self.Dsigma = diags(
+            self.sigma.toarray(), shape=(3 * N, 3 * N), dtype=self.dtype
+        )
+
+        if self.activate_cpml:
+            self._initialize_CPML_matrices()  # Calculate diagonal matrices for CPML update equations
+        else:
+            self.tDsiDmuiDaC = self.iDa * self.iDmu * self.C * self.Ds
+            self.itDaiDepsDstC = self.iDeps * self.itDa * self.C.transpose() * self.tDs
+
+        if self.source_type.lower() == "tfsf":
+            self.E_trans = Field(
+                self.Nx, self.Ny, self.Nz, dtype=self.dtype, use_gpu=self.use_gpu
+            )
+            self.H_trans = Field(
+                self.Nx, self.Ny, self.Nz, dtype=self.dtype, use_gpu=self.use_gpu
+            )
+            self.injection_done = True
+            self._initialize_tfsf()
+        self.tdx = self.tL[:, 0, 0, "x"]
+        self.tdy = self.tL[0, :, 0, "y"]
+
+        if imported_mkl and not self.use_gpu:  # MKL backend for CPU
+            if verbose:
+                print("Using MKL backend for time-stepping...")
+            if self.activate_cpml:
+                self._move_CPML_to_mkl()
+                self.one_step = self._one_step_cpml_mkl
+            else:
+                self.tDsiDmuiDaC = mkl_sparse_mat(self.tDsiDmuiDaC)
+                self.itDaiDepsDstC = mkl_sparse_mat(self.itDaiDepsDstC)
+                self.one_step = (
+                    self._mpi_one_step_mkl if self.use_mpi else self._one_step_mkl
+                )
+            if self.source_type == "tfsf":
+                self._move_tfsf_to_mkl()
+
+        # Move to GPU
+        if use_gpu:
+            if verbose:
+                print("Moving to GPU...")
+            if imported_cupyx:
+                self.ieps.to_gpu()
+                self.sigma.to_gpu()
+                if self.activate_cpml:
+                    self._move_CPML_to_gpu()
+                else:
+                    self.tDsiDmuiDaC = gpu_sparse_mat(self.tDsiDmuiDaC)
+                    self.itDaiDepsDstC = gpu_sparse_mat(self.itDaiDepsDstC)
+                if self.source_type == "tfsf":
+                    self._move_tfsf_to_gpu()
+            else:
+                raise ImportError(
+                    "[!] cupyx could not be imported, please check CUDA installation"
+                )
+
+        if self.activate_abc:
+            self._initialize_abc()
+            self._one_step_backend = self.one_step
+            self.one_step = self._one_step_with_abc
+
+        if verbose:
+            print(f"Total solver initialization time: {time.time() - t0} s")
+
+        self.solverInitializationTime = time.time() - t0
+        self.update_logger(["solverInitializationTime"])
+
+    def _infer_background_material_type(
+        self,
+        bg,
+    ):
+        """
+        Infer the material treatment that is unambiguously implied by
+        the supplied background material.
+
+        This is primarily retained for backward compatibility. New grids
+        should define ``grid.bg_material_type`` explicitly.
+        """
+        if isinstance(bg, str):
+            material_key = bg.lower()
+
+            if material_key == "pec":
+                return "pec"
+
+            if material_key not in material_lib:
+                raise ValueError(f"Unknown background material {bg!r}.")
+
+            material = material_lib[material_key]
+
+            if np.isinf(material[0]):
+                return "pec"
+
+            return "normal"
+
+        if np.isinf(bg[0]):
+            return "pec"
+
+        return "normal"
+
+    def _validate_background_material(
+        self,
+        bg,
+    ):
+        """
+        Check that the solver background material is compatible with
+        the material treatment declared by the grid.
+        """
+        declared_type = self.bg_material_type
+
+        if declared_type not in (VALID_MATERIAL_TYPES):
+            raise ValueError(
+                "Invalid grid background material "
+                f"type {declared_type!r}. "
+                f"Expected one of "
+                f"{VALID_MATERIAL_TYPES}."
+            )
+
+        inferred_type = self._infer_background_material_type(bg)
+
+        # PEC is unambiguous from the constitutive material:
+        # eps_r = infinity / material key "pec".
+        if declared_type == "pec" and inferred_type != "pec":
+            raise ValueError(
+                "The grid declares the background "
+                "as PEC, but the material passed "
+                f"to SolverFIT3D is {bg!r} and "
+                "does not represent a PEC."
+            )
+
+        if declared_type != "pec" and inferred_type == "pec":
+            raise ValueError(
+                "The material passed to "
+                "SolverFIT3D represents a PEC, "
+                "but the grid declares the "
+                "background material type as "
+                f"{declared_type!r}."
+            )
+
+    def _build_region_material_types(self):
+        """
+        Associate every geometry region ID with its material treatment type.
+
+        Region 0 represents the background. STL region IDs are mapped through
+        ``grid.region_id_to_key`` and ``grid.stl_material_types``.
+        """
+        region_material_types = {
+            0: self.bg_material_type,
+        }
+
+        for region_id, key in self.grid.region_id_to_key.items():
+            if region_id == 0:
+                continue
+
+            if key not in self.grid.stl_material_types:
+                raise RuntimeError(f"No material type available for STL solid '{key}'.")
+
+            region_material_types[region_id] = self.grid.stl_material_types[key]
+
+        self.region_material_types = region_material_types
+
+    def _build_interface_transition_masks(self):
+        """
+        Classify primal and dual interface edges by the material types
+        on their two endpoint regions.
+
+        Transition orientation is ignored for the classification itself.
+        For example, normal-to-PEC and PEC-to-normal edges both belong
+        to "normal_pec".
+        """
+        self._build_region_material_types()
+
+        type_codes = {
+            "normal": 0,
+            "pec": 1,
+            "sibc": 2,
+        }
+
+        max_region_id = max(self.region_material_types)
+
+        region_type_codes = np.empty(
+            max_region_id + 1,
+            dtype=np.int8,
+        )
+
+        for (
+            region_id,
+            material_type,
+        ) in self.region_material_types.items():
+            region_type_codes[region_id] = type_codes[material_type]
+
+        normal = type_codes["normal"]
+        pec = type_codes["pec"]
+        sibc = type_codes["sibc"]
+
+        self.interface_transition_masks = {
+            "primal": {},
+            "dual": {},
+        }
+
+        for grid_type in ("primal", "dual"):
+            for direction in ("x", "y", "z"):
+                (
+                    start_regions,
+                    end_regions,
+                ) = self.grid._get_edge_region_ids(
+                    grid_type,
+                    direction,
+                )
+
+                interface_mask = self.grid.interface_edge_masks[grid_type][direction]
+
+                start_types = region_type_codes[start_regions]
+
+                end_types = region_type_codes[end_regions]
+
+                normal_normal = (
+                    interface_mask & (start_types == normal) & (end_types == normal)
+                )
+
+                normal_pec = interface_mask & (
+                    ((start_types == normal) & (end_types == pec))
+                    | ((start_types == pec) & (end_types == normal))
+                )
+
+                normal_sibc = interface_mask & (
+                    ((start_types == normal) & (end_types == sibc))
+                    | ((start_types == sibc) & (end_types == normal))
+                )
+
+                pec_pec = interface_mask & (start_types == pec) & (end_types == pec)
+
+                pec_sibc = interface_mask & (
+                    ((start_types == pec) & (end_types == sibc))
+                    | ((start_types == sibc) & (end_types == pec))
+                )
+
+                sibc_sibc = interface_mask & (start_types == sibc) & (end_types == sibc)
+
+                self.interface_transition_masks[grid_type][direction] = {
+                    "normal_normal": normal_normal,
+                    "normal_pec": normal_pec,
+                    "normal_sibc": normal_sibc,
+                    "pec_pec": pec_pec,
+                    "pec_sibc": pec_sibc,
+                    "sibc_sibc": sibc_sibc,
+                }
+
+    def _build_conformal_line_data(self):
+        """
+        Build solver-side line data for resolved conformal interfaces.
+
+        For normal-normal interfaces the complete edge remains active.
+
+        For normal-conductor interfaces, only the fraction of the edge inside
+        the normal material is retained:
+
+            normal -> conductor : fraction = alpha
+            conductor -> normal : fraction = 1 - alpha
+
+        Here, conductor means either PEC or SIBC.
+
+        The method does not modify FIT metric or material operators. It only
+        prepares the geometric line fractions required by later conformal
+        discretization steps.
+        """
+        if not self.region_material_types:
+            self._build_region_material_types()
+
+        type_codes = {
+            "normal": 0,
+            "pec": 1,
+            "sibc": 2,
+        }
+
+        max_region_id = max(self.region_material_types)
+
+        region_type_codes = np.empty(
+            max_region_id + 1,
+            dtype=np.int8,
+        )
+
+        for (
+            region_id,
+            material_type,
+        ) in self.region_material_types.items():
+            region_type_codes[region_id] = type_codes[material_type]
+
+        normal = type_codes["normal"]
+        pec = type_codes["pec"]
+        sibc = type_codes["sibc"]
+
+        self.conformal_line_data = {
+            "primal": {},
+            "dual": {},
+        }
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                (
+                    start_regions,
+                    end_regions,
+                ) = self.grid._get_edge_region_ids(
+                    grid_type,
+                    direction,
+                )
+
+                data = self.grid.interface_intersections[grid_type][direction]
+
+                alpha = np.asarray(
+                    data["alpha"],
+                    dtype=float,
+                )
+
+                resolved = np.asarray(
+                    self.grid.resolved_interface_edge_masks[grid_type][direction],
+                    dtype=bool,
+                )
+
+                if alpha.shape != resolved.shape:
+                    raise RuntimeError(
+                        "Conformal intersection and resolved-interface "
+                        f"shapes differ for {grid_type} "
+                        f"{direction}-edges."
+                    )
+
+                start_types = region_type_codes[start_regions]
+
+                end_types = region_type_codes[end_regions]
+
+                start_normal = start_types == normal
+
+                end_normal = end_types == normal
+
+                start_conductor = (start_types == pec) | (start_types == sibc)
+
+                end_conductor = (end_types == pec) | (end_types == sibc)
+
+                normal_normal = resolved & start_normal & end_normal
+
+                normal_to_conductor = resolved & start_normal & end_conductor
+
+                conductor_to_normal = resolved & start_conductor & end_normal
+
+                supported = normal_normal | normal_to_conductor | conductor_to_normal
+
+                # NaN deliberately marks edges for which no current
+                # conformal line treatment is defined.
+                effective_length_fraction = np.full(
+                    alpha.shape,
+                    np.nan,
+                    dtype=float,
+                )
+
+                effective_length_fraction[normal_normal] = 1.0
+
+                effective_length_fraction[normal_to_conductor] = alpha[
+                    normal_to_conductor
+                ]
+
+                effective_length_fraction[conductor_to_normal] = (
+                    1.0 - alpha[conductor_to_normal]
+                )
+
+                if np.any(~np.isfinite(effective_length_fraction[supported])):
+                    raise RuntimeError(
+                        "Non-finite conformal line fraction "
+                        f"for {grid_type} "
+                        f"{direction}-edges."
+                    )
+
+                if np.any(
+                    (effective_length_fraction[supported] < 0.0)
+                    | (effective_length_fraction[supported] > 1.0)
+                ):
+                    raise RuntimeError("Conformal line fraction outside [0, 1].")
+
+                self.conformal_line_data[grid_type][direction] = {
+                    "resolved": resolved,
+                    "supported": supported,
+                    "alpha": alpha,
+                    "start_region": start_regions,
+                    "end_region": end_regions,
+                    "normal_normal": normal_normal,
+                    "normal_to_conductor": (normal_to_conductor),
+                    "conductor_to_normal": (conductor_to_normal),
+                    "effective_length_fraction": (effective_length_fraction),
+                }
+
+    def _build_conformal_face_data(self):
+        """
+        Interpret geometric interface-face data in terms of material types.
+
+        The grid provides geometric region-area fractions. This method
+        determines which portions belong to volumetric normal materials.
+
+        No FIT operators are modified here.
+        """
+        if not self.region_material_types:
+            self._build_region_material_types()
+
+        self.conformal_face_data = {
+            "primal": {},
+            "dual": {},
+        }
+
+        conductor_types = {
+            "pec",
+            "sibc",
+        }
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                geometry = self.grid.interface_face_data[grid_type][direction]
+
+                resolved = np.asarray(
+                    geometry["resolved"],
+                    dtype=bool,
+                )
+
+                supported = np.zeros_like(
+                    resolved,
+                    dtype=bool,
+                )
+
+                normal_normal = np.zeros_like(
+                    resolved,
+                    dtype=bool,
+                )
+
+                normal_pec = np.zeros_like(
+                    resolved,
+                    dtype=bool,
+                )
+
+                normal_sibc = np.zeros_like(
+                    resolved,
+                    dtype=bool,
+                )
+
+                effective_area_fraction = np.full(
+                    resolved.shape,
+                    np.nan,
+                    dtype=float,
+                )
+
+                normal_region_ids = {}
+                conductor_region_ids = {}
+
+                for index, fractions in geometry["region_area_fractions"].items():
+                    if not resolved[index]:
+                        continue
+
+                    region_ids = list(fractions.keys())
+
+                    if len(region_ids) != 2:
+                        continue
+
+                    normal_regions = []
+                    conductor_regions = []
+
+                    for region_id in region_ids:
+                        material_type = self.region_material_types[int(region_id)]
+
+                        if material_type == "normal":
+                            normal_regions.append(int(region_id))
+
+                        elif material_type in conductor_types:
+                            conductor_regions.append(int(region_id))
+
+                    # ----------------------------------------------
+                    # normal <-> normal
+                    #
+                    # Entire geometrical face remains active.
+                    # ----------------------------------------------
+                    if len(normal_regions) == 2:
+                        supported[index] = True
+                        normal_normal[index] = True
+
+                        effective_area_fraction[index] = 1.0
+
+                        normal_region_ids[index] = tuple(normal_regions)
+
+                        continue
+
+                    # ----------------------------------------------
+                    # normal <-> PEC/SIBC
+                    #
+                    # Only the normal portion remains volumetrically
+                    # active.
+                    # ----------------------------------------------
+                    if len(normal_regions) == 1 and len(conductor_regions) == 1:
+                        normal_region = normal_regions[0]
+
+                        conductor_region = conductor_regions[0]
+
+                        supported[index] = True
+
+                        effective_area_fraction[index] = float(fractions[normal_region])
+
+                        normal_region_ids[index] = (normal_region,)
+
+                        conductor_region_ids[index] = (conductor_region,)
+
+                        conductor_type = self.region_material_types[conductor_region]
+
+                        if conductor_type == "pec":
+                            normal_pec[index] = True
+
+                        elif conductor_type == "sibc":
+                            normal_sibc[index] = True
+
+                self.conformal_face_data[grid_type][direction] = {
+                    "resolved": resolved.copy(),
+                    "supported": supported,
+                    "normal_normal": (normal_normal),
+                    "normal_pec": normal_pec,
+                    "normal_sibc": normal_sibc,
+                    "effective_area_fraction": (effective_area_fraction),
+                    "normal_region_ids": (normal_region_ids),
+                    "conductor_region_ids": (conductor_region_ids),
+                }
+
+    def _build_conformal_face_materials(self):
+        """
+        Build effective material properties on resolved conformal faces.
+
+        Material properties are averaged only over the active normal
+        portion of each face. Geometric area reduction is handled
+        separately through A_eff / tA_eff.
+
+        Primal faces:
+            mu_r
+
+        Dual faces:
+            eps_r, sigma
+        """
+        self.conformal_face_materials = {
+            "primal": {},
+            "dual": {},
+        }
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                face_data = self.conformal_face_data[grid_type][direction]
+
+                geometry = self.grid.interface_face_data[grid_type][direction]
+
+                supported = face_data["supported"]
+
+                shape = supported.shape
+
+                if grid_type == "primal":
+                    mu_r_eff = np.full(
+                        shape,
+                        np.nan,
+                        dtype=float,
+                    )
+
+                else:
+                    eps_r_eff = np.full(
+                        shape,
+                        np.nan,
+                        dtype=float,
+                    )
+
+                    sigma_eff = np.full(
+                        shape,
+                        np.nan,
+                        dtype=float,
+                    )
+
+                for index_array in np.argwhere(supported):
+                    index = tuple(int(value) for value in index_array)
+
+                    fractions = geometry["region_area_fractions"][index]
+
+                    normal_regions = face_data["normal_region_ids"][index]
+
+                    normal_fraction = sum(
+                        float(fractions[region_id]) for region_id in normal_regions
+                    )
+
+                    if normal_fraction <= 0.0:
+                        raise RuntimeError(
+                            f"Supported {grid_type} "
+                            f"{direction}-face {index} "
+                            "has no positive normal-material area."
+                        )
+
+                    expected_fraction = float(
+                        face_data["effective_area_fraction"][index]
+                    )
+
+                    if not np.isclose(
+                        normal_fraction,
+                        expected_fraction,
+                        rtol=1e-10,
+                        atol=1e-12,
+                    ):
+                        raise RuntimeError(
+                            f"Inconsistent active area fraction on "
+                            f"{grid_type} {direction}-face "
+                            f"{index}: geometry gives "
+                            f"{normal_fraction}, face data gives "
+                            f"{expected_fraction}."
+                        )
+
+                    if grid_type == "primal":
+                        value = 0.0
+
+                        for region_id in normal_regions:
+                            weight = float(fractions[region_id]) / normal_fraction
+
+                            material = self._get_region_material_properties(region_id)
+
+                            value += weight * material[1]
+
+                        mu_r_eff[index] = value
+
+                    else:
+                        eps_value = 0.0
+                        sigma_value = 0.0
+
+                        for region_id in normal_regions:
+                            weight = float(fractions[region_id]) / normal_fraction
+
+                            material = self._get_region_material_properties(region_id)
+
+                            eps_value += weight * material[0]
+
+                            sigma_value += weight * material[2]
+
+                        eps_r_eff[index] = eps_value
+
+                        sigma_eff[index] = sigma_value
+
+                if grid_type == "primal":
+                    self.conformal_face_materials[grid_type][direction] = {
+                        "mu_r": mu_r_eff,
+                    }
+
+                else:
+                    self.conformal_face_materials[grid_type][direction] = {
+                        "eps_r": eps_r_eff,
+                        "sigma": sigma_eff,
+                    }
+
+    def _get_region_material_properties(self, region_id):
+        """
+        Return [eps_r, mu_r, sigma] for one geometry region.
+
+        Region 0 is the background. All other regions correspond to STL solids.
+        """
+        region_id = int(region_id)
+
+        if region_id == 0:
+            material = self.background
+
+            if isinstance(material, str):
+                mat = material_lib[material.lower()]
+
+                material = [
+                    mat[0],
+                    mat[1],
+                    mat[2] if len(mat) == 3 else 0.0,
+                ]
+
+            else:
+                material = list(material)
+
+                if len(material) == 2:
+                    material.append(0.0)
+
+        else:
+            key = self.grid.region_id_to_key[region_id]
+
+            material = self.grid.stl_materials[key]
+
+        return np.asarray(
+            material,
+            dtype=float,
+        )
+
+    def _build_region_material_properties(self):
+        """
+        Build numerical material-property tables indexed by region ID.
+        """
+        max_region_id = max(self.region_material_types)
+
+        eps_r = np.full(
+            max_region_id + 1,
+            np.nan,
+            dtype=float,
+        )
+
+        mu_r = np.full(
+            max_region_id + 1,
+            np.nan,
+            dtype=float,
+        )
+
+        sigma = np.full(
+            max_region_id + 1,
+            np.nan,
+            dtype=float,
+        )
+
+        for region_id in self.region_material_types:
+            properties = self._get_region_material_properties(region_id)
+
+            eps_r[region_id] = properties[0]
+            mu_r[region_id] = properties[1]
+            sigma[region_id] = properties[2]
+
+        self.region_material_properties = {
+            "eps_r": eps_r,
+            "mu_r": mu_r,
+            "sigma": sigma,
+        }
+
+    def _build_conformal_line_materials(self):
+        """
+        Build effective material values along resolved conformal edges.
+
+        Primal edges:
+            - normal-normal: harmonic eps_r and sigma
+            - normal-conductor: material properties of the normal segment
+
+        Dual edges:
+            - normal-normal: harmonic mu_r
+            - normal-conductor: mu_r of the normal segment
+
+        No FIT operators are modified here.
+        """
+        self._build_region_material_properties()
+
+        eps_r_regions = self.region_material_properties["eps_r"]
+
+        mu_r_regions = self.region_material_properties["mu_r"]
+
+        sigma_regions = self.region_material_properties["sigma"]
+
+        self.conformal_line_materials = {
+            "primal": {},
+            "dual": {},
+        }
+
+        for grid_type in (
+            "primal",
+            "dual",
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                line_data = self.conformal_line_data[grid_type][direction]
+
+                alpha = line_data["alpha"]
+
+                start_regions = line_data["start_region"]
+
+                end_regions = line_data["end_region"]
+
+                normal_normal = line_data["normal_normal"]
+
+                normal_to_conductor = line_data["normal_to_conductor"]
+
+                conductor_to_normal = line_data["conductor_to_normal"]
+
+                shape = alpha.shape
+
+                start_eps_r = eps_r_regions[start_regions]
+
+                end_eps_r = eps_r_regions[end_regions]
+
+                start_mu_r = mu_r_regions[start_regions]
+
+                end_mu_r = mu_r_regions[end_regions]
+
+                start_sigma = sigma_regions[start_regions]
+
+                end_sigma = sigma_regions[end_regions]
+
+                if grid_type == "primal":
+                    eps_r_eff = np.full(
+                        shape,
+                        np.nan,
+                        dtype=float,
+                    )
+
+                    sigma_eff = np.full(
+                        shape,
+                        np.nan,
+                        dtype=float,
+                    )
+
+                    # ------------------------------------------
+                    # Normal -> normal:
+                    # harmonic average along the edge
+                    # ------------------------------------------
+                    eps_r_eff[normal_normal] = 1.0 / (
+                        alpha[normal_normal] / start_eps_r[normal_normal]
+                        + (1.0 - alpha[normal_normal]) / end_eps_r[normal_normal]
+                    )
+
+                    # Conductivity:
+                    #
+                    # For the present non-dispersive approximation,
+                    # use the corresponding series (harmonic)
+                    # conductivity. If either region is insulating,
+                    # the effective DC conductivity is zero.
+                    both_conductive = (
+                        normal_normal & (start_sigma > 0.0) & (end_sigma > 0.0)
+                    )
+
+                    sigma_eff[normal_normal] = 0.0
+
+                    sigma_eff[both_conductive] = 1.0 / (
+                        alpha[both_conductive] / start_sigma[both_conductive]
+                        + (1.0 - alpha[both_conductive]) / end_sigma[both_conductive]
+                    )
+
+                    # ------------------------------------------
+                    # Normal -> PEC/SIBC
+                    # ------------------------------------------
+                    eps_r_eff[normal_to_conductor] = start_eps_r[normal_to_conductor]
+
+                    sigma_eff[normal_to_conductor] = start_sigma[normal_to_conductor]
+
+                    # ------------------------------------------
+                    # PEC/SIBC -> normal
+                    # ------------------------------------------
+                    eps_r_eff[conductor_to_normal] = end_eps_r[conductor_to_normal]
+
+                    sigma_eff[conductor_to_normal] = end_sigma[conductor_to_normal]
+
+                    self.conformal_line_materials[grid_type][direction] = {
+                        "eps_r": eps_r_eff,
+                        "sigma": sigma_eff,
+                    }
+
+                else:
+                    mu_r_eff = np.full(
+                        shape,
+                        np.nan,
+                        dtype=float,
+                    )
+
+                    # ------------------------------------------
+                    # Normal -> normal:
+                    # harmonic average along dual edge
+                    # ------------------------------------------
+                    mu_r_eff[normal_normal] = 1.0 / (
+                        alpha[normal_normal] / start_mu_r[normal_normal]
+                        + (1.0 - alpha[normal_normal]) / end_mu_r[normal_normal]
+                    )
+
+                    # ------------------------------------------
+                    # Normal -> PEC/SIBC
+                    # ------------------------------------------
+                    mu_r_eff[normal_to_conductor] = start_mu_r[normal_to_conductor]
+
+                    # ------------------------------------------
+                    # PEC/SIBC -> normal
+                    # ------------------------------------------
+                    mu_r_eff[conductor_to_normal] = end_mu_r[conductor_to_normal]
+
+                    self.conformal_line_materials[grid_type][direction] = {
+                        "mu_r": mu_r_eff,
+                    }
+
+    def _edge_array_to_field_component(
+        self,
+        edge_values,
+        direction,
+    ):
+        """
+        Map a full primal/dual edge array to the edge DOFs stored by Field.
+
+        The full edge arrays include high-side boundary edges, whereas the
+        solver stores Nx * Ny * Nz DOFs per component. Low-side boundary
+        DOFs are included; high-side boundary DOFs are not.
+        """
+        edge_values = np.asarray(edge_values)
+
+        expected_shapes = {
+            "x": (
+                self.Nx,
+                self.Ny + 1,
+                self.Nz + 1,
+            ),
+            "y": (
+                self.Nx + 1,
+                self.Ny,
+                self.Nz + 1,
+            ),
+            "z": (
+                self.Nx + 1,
+                self.Ny + 1,
+                self.Nz,
+            ),
+        }
+
+        if direction not in expected_shapes:
+            raise ValueError(f"Unknown edge direction '{direction}'.")
+
+        if edge_values.shape != expected_shapes[direction]:
+            raise ValueError(
+                f"Expected {direction}-edge array shape "
+                f"{expected_shapes[direction]}, "
+                f"got {edge_values.shape}."
+            )
+
+        if direction == "x":
+            return edge_values[
+                :,
+                : self.Ny,
+                : self.Nz,
+            ]
+
+        if direction == "y":
+            return edge_values[
+                : self.Nx,
+                :,
+                : self.Nz,
+            ]
+
+        return edge_values[
+            : self.Nx,
+            : self.Ny,
+            :,
+        ]
+
+    def _face_array_to_field_component(
+        self,
+        face_values,
+        direction,
+    ):
+        """
+        Map a full grid-face array to the face DOFs stored in Field.
+
+        Full face-array shapes are:
+            x: (Nx + 1, Ny, Nz)
+            y: (Nx, Ny + 1, Nz)
+            z: (Nx, Ny, Nz + 1)
+
+        Field stores Nx * Ny * Nz values for every component and
+        therefore contains the low-side faces.
+        """
+        face_values = np.asarray(face_values)
+
+        expected_shapes = {
+            "x": (
+                self.Nx + 1,
+                self.Ny,
+                self.Nz,
+            ),
+            "y": (
+                self.Nx,
+                self.Ny + 1,
+                self.Nz,
+            ),
+            "z": (
+                self.Nx,
+                self.Ny,
+                self.Nz + 1,
+            ),
+        }
+
+        if direction not in expected_shapes:
+            raise ValueError(f"Unknown face direction '{direction}'.")
+
+        expected_shape = expected_shapes[direction]
+
+        if face_values.shape != expected_shape:
+            raise ValueError(
+                f"Expected {direction}-face array "
+                f"shape {expected_shape}, "
+                f"got {face_values.shape}."
+            )
+
+        if direction == "x":
+            return face_values[
+                : self.Nx,
+                :,
+                :,
+            ]
+
+        if direction == "y":
+            return face_values[
+                :,
+                : self.Ny,
+                :,
+            ]
+
+        return face_values[
+            :,
+            :,
+            : self.Nz,
+        ]
+
+    def _dual_face_array_to_primal_edge_component(
+        self,
+        face_values,
+        direction,
+        fill_value=np.nan,
+    ):
+        """
+        Map dual-face data to the associated stored primal-edge DOFs.
+
+        For interior primal edges the associated dual face is shifted by one
+        index in the two directions transverse to the edge:
+
+            Ex(i,j,k) <-> dual x-face (i,   j-1, k-1)
+            Ey(i,j,k) <-> dual y-face (i-1, j,   k-1)
+            Ez(i,j,k) <-> dual z-face (i-1, j-1, k)
+
+        Low-side boundary edges do not have a complete dual face inside the
+        physical domain. They are therefore left at ``fill_value`` here.
+        """
+        face_values = np.asarray(face_values)
+
+        expected_shapes = {
+            "x": (
+                self.Nx + 1,
+                self.Ny,
+                self.Nz,
+            ),
+            "y": (
+                self.Nx,
+                self.Ny + 1,
+                self.Nz,
+            ),
+            "z": (
+                self.Nx,
+                self.Ny,
+                self.Nz + 1,
+            ),
+        }
+
+        if direction not in expected_shapes:
+            raise ValueError(f"Unknown face direction '{direction}'.")
+
+        if face_values.shape != expected_shapes[direction]:
+            raise ValueError(
+                f"Expected dual {direction}-face array shape "
+                f"{expected_shapes[direction]}, "
+                f"got {face_values.shape}."
+            )
+
+        dtype = np.result_type(
+            face_values.dtype,
+            np.asarray(fill_value).dtype,
+        )
+
+        result = np.full(
+            (
+                self.Nx,
+                self.Ny,
+                self.Nz,
+            ),
+            fill_value,
+            dtype=dtype,
+        )
+
+        if direction == "x":
+            result[:, 1:, 1:] = face_values[
+                : self.Nx,
+                : self.Ny - 1,
+                : self.Nz - 1,
+            ]
+
+        elif direction == "y":
+            result[1:, :, 1:] = face_values[
+                : self.Nx - 1,
+                : self.Ny,
+                : self.Nz - 1,
+            ]
+
+        else:
+            result[1:, 1:, :] = face_values[
+                : self.Nx - 1,
+                : self.Ny - 1,
+                : self.Nz,
+            ]
+
+        return result
+
+    def _primal_face_array_to_dual_edge_component(
+        self,
+        face_values,
+        direction,
+    ):
+        """
+        Map primal-face data to the associated stored dual-edge DOFs.
+
+            Hx(i,j,k) <-> primal x-face (i+1, j,   k)
+            Hy(i,j,k) <-> primal y-face (i,   j+1, k)
+            Hz(i,j,k) <-> primal z-face (i,   j,   k+1)
+        """
+        face_values = np.asarray(face_values)
+
+        expected_shapes = {
+            "x": (
+                self.Nx + 1,
+                self.Ny,
+                self.Nz,
+            ),
+            "y": (
+                self.Nx,
+                self.Ny + 1,
+                self.Nz,
+            ),
+            "z": (
+                self.Nx,
+                self.Ny,
+                self.Nz + 1,
+            ),
+        }
+
+        if direction not in expected_shapes:
+            raise ValueError(f"Unknown face direction '{direction}'.")
+
+        if face_values.shape != expected_shapes[direction]:
+            raise ValueError(
+                f"Expected primal {direction}-face array shape "
+                f"{expected_shapes[direction]}, "
+                f"got {face_values.shape}."
+            )
+
+        if direction == "x":
+            return face_values[
+                1 : self.Nx + 1,
+                :,
+                :,
+            ]
+
+        if direction == "y":
+            return face_values[
+                :,
+                1 : self.Ny + 1,
+                :,
+            ]
+
+        return face_values[
+            :,
+            :,
+            1 : self.Nz + 1,
+        ]
+
+    @staticmethod
+    def _combine_conformal_diagonal_component(
+        perpendicular,
+        parallel,
+        line_mask,
+        face_mask,
+        line_n2,
+        face_n2,
+        normal_tol=1e-12,
+    ):
+        """
+        Combine normal and tangential effective material values into one
+        diagonal Cartesian material component.
+
+        The diagonal approximation is
+
+            m_ii = n_i^2 * m_perp
+                + (1 - n_i^2) * m_parallel
+
+        where
+
+            m_perp     : harmonic line value,
+            m_parallel : arithmetic face value.
+
+        Purely normal and purely tangential cases are treated explicitly so
+        that missing values in the unused contribution do not produce NaNs.
+        """
+        perpendicular = np.asarray(
+            perpendicular,
+            dtype=float,
+        )
+
+        parallel = np.asarray(
+            parallel,
+            dtype=float,
+        )
+
+        line_mask = np.asarray(
+            line_mask,
+            dtype=bool,
+        )
+
+        face_mask = np.asarray(
+            face_mask,
+            dtype=bool,
+        )
+
+        line_n2 = np.asarray(
+            line_n2,
+            dtype=float,
+        )
+
+        face_n2 = np.asarray(
+            face_n2,
+            dtype=float,
+        )
+
+        if not (
+            perpendicular.shape
+            == parallel.shape
+            == line_mask.shape
+            == face_mask.shape
+            == line_n2.shape
+            == face_n2.shape
+        ):
+            raise ValueError(
+                "Conformal diagonal material arrays must have identical shapes."
+            )
+
+        result = np.full(
+            perpendicular.shape,
+            np.nan,
+            dtype=float,
+        )
+
+        # Prefer the normal obtained directly from the edge intersection.
+        # For tangential edges without an edge crossing, use the normal
+        # reconstructed from the associated cut face.
+        n2 = np.where(
+            np.isfinite(line_n2),
+            line_n2,
+            face_n2,
+        )
+
+        finite_n2 = np.isfinite(n2)
+
+        # Numerical noise may produce values slightly outside [0, 1].
+        n2 = np.clip(
+            n2,
+            0.0,
+            1.0,
+        )
+
+        # ----------------------------------------------------------
+        # General case:
+        # both normal and tangential material values are available.
+        # ----------------------------------------------------------
+        combined = (
+            line_mask
+            & face_mask
+            & finite_n2
+            & np.isfinite(perpendicular)
+            & np.isfinite(parallel)
+        )
+
+        result[combined] = (
+            n2[combined] * perpendicular[combined]
+            + (1.0 - n2[combined]) * parallel[combined]
+        )
+
+        # ----------------------------------------------------------
+        # Pure normal component:
+        #
+        # n_i^2 = 1 -> m_ii = m_perp
+        #
+        # No face contribution is required.
+        # ----------------------------------------------------------
+        pure_normal = (
+            line_mask
+            & finite_n2
+            & np.isfinite(perpendicular)
+            & ((1.0 - n2) <= normal_tol)
+        )
+
+        result[pure_normal] = perpendicular[pure_normal]
+
+        # ----------------------------------------------------------
+        # Pure tangential component:
+        #
+        # n_i^2 = 0 -> m_ii = m_parallel
+        #
+        # No line crossing is required.
+        # ----------------------------------------------------------
+        pure_tangential = (
+            face_mask & finite_n2 & np.isfinite(parallel) & (n2 <= normal_tol)
+        )
+
+        result[pure_tangential] = parallel[pure_tangential]
+
+        return result
+
+    def _build_conformal_diagonal_materials(
+        self,
+        normal_tol=1e-12,
+    ):
+        """
+        Build diagonal effective material components for resolved
+        normal-normal interfaces.
+
+        Electric material components use
+
+            primal edge  -> normal/harmonic contribution
+            dual face    -> tangential/arithmetic contribution
+
+        Magnetic material components use
+
+            dual edge    -> normal/harmonic contribution
+            primal face  -> tangential/arithmetic contribution
+
+        The resulting arrays have shape (Nx, Ny, Nz) and contain NaN
+        where no complete conformal normal-normal treatment is available.
+        """
+        self.conformal_diagonal_materials = {
+            "eps_r": {},
+            "mu_r": {},
+            "sigma": {},
+        }
+
+        axis_index = {
+            "x": 0,
+            "y": 1,
+            "z": 2,
+        }
+
+        for direction in (
+            "x",
+            "y",
+            "z",
+        ):
+            axis = axis_index[direction]
+
+            # ======================================================
+            # Electric material:
+            #
+            # primal edge <-> dual face
+            # ======================================================
+
+            primal_line_data = self.conformal_line_data["primal"][direction]
+
+            primal_line_materials = self.conformal_line_materials["primal"][direction]
+
+            dual_face_data = self.conformal_face_data["dual"][direction]
+
+            dual_face_materials = self.conformal_face_materials["dual"][direction]
+
+            # ------------------------------------------------------
+            # Normal / harmonic contribution
+            # ------------------------------------------------------
+
+            eps_perp = self._edge_array_to_field_component(
+                primal_line_materials["eps_r"],
+                direction,
+            )
+
+            sigma_perp = self._edge_array_to_field_component(
+                primal_line_materials["sigma"],
+                direction,
+            )
+
+            electric_line_mask = self._edge_array_to_field_component(
+                primal_line_data["normal_normal"],
+                direction,
+            ).astype(bool)
+
+            line_normals = np.asarray(
+                self.grid.interface_intersections["primal"][direction]["normal"],
+                dtype=float,
+            )
+
+            line_norm = np.linalg.norm(
+                line_normals,
+                axis=-1,
+            )
+
+            electric_line_n2_full = np.full(
+                line_norm.shape,
+                np.nan,
+                dtype=float,
+            )
+
+            valid_line_normal = np.isfinite(line_norm) & (line_norm > 0.0)
+
+            electric_line_n2_full[valid_line_normal] = (
+                line_normals[..., axis][valid_line_normal]
+                / line_norm[valid_line_normal]
+            ) ** 2
+
+            electric_line_n2 = self._edge_array_to_field_component(
+                electric_line_n2_full,
+                direction,
+            )
+
+            # ------------------------------------------------------
+            # Tangential / arithmetic contribution
+            # ------------------------------------------------------
+
+            eps_parallel = self._dual_face_array_to_primal_edge_component(
+                dual_face_materials["eps_r"],
+                direction,
+            )
+
+            sigma_parallel = self._dual_face_array_to_primal_edge_component(
+                dual_face_materials["sigma"],
+                direction,
+            )
+
+            electric_face_mask = self._dual_face_array_to_primal_edge_component(
+                dual_face_data["normal_normal"],
+                direction,
+                fill_value=False,
+            ).astype(bool)
+
+            dual_face_geometry = self.grid.interface_face_data["dual"][direction]
+
+            face_n2_full = np.full(
+                dual_face_data["normal_normal"].shape,
+                np.nan,
+                dtype=float,
+            )
+
+            for index, segment in dual_face_geometry["segments"].items():
+                if not dual_face_data["normal_normal"][index]:
+                    continue
+
+                normal = np.asarray(
+                    segment["normal"],
+                    dtype=float,
+                )
+
+                norm = np.linalg.norm(normal)
+
+                if not np.isfinite(norm) or norm <= 0.0:
+                    continue
+
+                face_n2_full[index] = (normal[axis] / norm) ** 2
+
+            electric_face_n2 = self._dual_face_array_to_primal_edge_component(
+                face_n2_full,
+                direction,
+            )
+
+            # ------------------------------------------------------
+            # Final diagonal electric material components
+            # ------------------------------------------------------
+
+            self.conformal_diagonal_materials["eps_r"][direction] = (
+                self._combine_conformal_diagonal_component(
+                    eps_perp,
+                    eps_parallel,
+                    electric_line_mask,
+                    electric_face_mask,
+                    electric_line_n2,
+                    electric_face_n2,
+                    normal_tol=normal_tol,
+                )
+            )
+
+            self.conformal_diagonal_materials["sigma"][direction] = (
+                self._combine_conformal_diagonal_component(
+                    sigma_perp,
+                    sigma_parallel,
+                    electric_line_mask,
+                    electric_face_mask,
+                    electric_line_n2,
+                    electric_face_n2,
+                    normal_tol=normal_tol,
+                )
+            )
+
+            # ======================================================
+            # Magnetic material:
+            #
+            # dual edge <-> primal face
+            # ======================================================
+
+            dual_line_data = self.conformal_line_data["dual"][direction]
+
+            dual_line_materials = self.conformal_line_materials["dual"][direction]
+
+            primal_face_data = self.conformal_face_data["primal"][direction]
+
+            primal_face_materials = self.conformal_face_materials["primal"][direction]
+
+            # ------------------------------------------------------
+            # Normal / harmonic contribution
+            # ------------------------------------------------------
+
+            mu_perp = self._edge_array_to_field_component(
+                dual_line_materials["mu_r"],
+                direction,
+            )
+
+            magnetic_line_mask = self._edge_array_to_field_component(
+                dual_line_data["normal_normal"],
+                direction,
+            ).astype(bool)
+
+            line_normals = np.asarray(
+                self.grid.interface_intersections["dual"][direction]["normal"],
+                dtype=float,
+            )
+
+            line_norm = np.linalg.norm(
+                line_normals,
+                axis=-1,
+            )
+
+            magnetic_line_n2_full = np.full(
+                line_norm.shape,
+                np.nan,
+                dtype=float,
+            )
+
+            valid_line_normal = np.isfinite(line_norm) & (line_norm > 0.0)
+
+            magnetic_line_n2_full[valid_line_normal] = (
+                line_normals[..., axis][valid_line_normal]
+                / line_norm[valid_line_normal]
+            ) ** 2
+
+            magnetic_line_n2 = self._edge_array_to_field_component(
+                magnetic_line_n2_full,
+                direction,
+            )
+
+            # ------------------------------------------------------
+            # Tangential / arithmetic contribution
+            # ------------------------------------------------------
+
+            mu_parallel = self._primal_face_array_to_dual_edge_component(
+                primal_face_materials["mu_r"],
+                direction,
+            )
+
+            magnetic_face_mask = self._primal_face_array_to_dual_edge_component(
+                primal_face_data["normal_normal"],
+                direction,
+            ).astype(bool)
+
+            primal_face_geometry = self.grid.interface_face_data["primal"][direction]
+
+            face_n2_full = np.full(
+                primal_face_data["normal_normal"].shape,
+                np.nan,
+                dtype=float,
+            )
+
+            for index, segment in primal_face_geometry["segments"].items():
+                if not primal_face_data["normal_normal"][index]:
+                    continue
+
+                normal = np.asarray(
+                    segment["normal"],
+                    dtype=float,
+                )
+
+                norm = np.linalg.norm(normal)
+
+                if not np.isfinite(norm) or norm <= 0.0:
+                    continue
+
+                face_n2_full[index] = (normal[axis] / norm) ** 2
+
+            magnetic_face_n2 = self._primal_face_array_to_dual_edge_component(
+                face_n2_full,
+                direction,
+            )
+
+            # ------------------------------------------------------
+            # Final diagonal magnetic material component
+            # ------------------------------------------------------
+
+            self.conformal_diagonal_materials["mu_r"][direction] = (
+                self._combine_conformal_diagonal_component(
+                    mu_perp,
+                    mu_parallel,
+                    magnetic_line_mask,
+                    magnetic_face_mask,
+                    magnetic_line_n2,
+                    magnetic_face_n2,
+                    normal_tol=normal_tol,
+                )
+            )
+
+    def _build_conformal_effective_lengths(self):
+        """
+        Build effective primal and dual edge lengths for the current
+        conformal single-crossing treatment.
+
+        Normal-normal edges retain their full length.
+
+        Normal-PEC/SIBC edges retain only the fraction of the edge in the
+        normal region.
+
+        Hidden, missing, and currently unsupported interface cases retain
+        their original grid length.
+
+        The original grid metrics self.L and self.tL are not modified.
+        """
+        self.L_fraction = Field(
+            self.Nx,
+            self.Ny,
+            self.Nz,
+        )
+
+        self.tL_fraction = Field(
+            self.Nx,
+            self.Ny,
+            self.Nz,
+        )
+
+        self.L_eff = Field(
+            self.Nx,
+            self.Ny,
+            self.Nz,
+        )
+
+        self.tL_eff = Field(
+            self.Nx,
+            self.Ny,
+            self.Nz,
+        )
+
+        for (
+            grid_type,
+            base_lengths,
+            fraction_field,
+            effective_lengths,
+        ) in (
+            (
+                "primal",
+                self.L,
+                self.L_fraction,
+                self.L_eff,
+            ),
+            (
+                "dual",
+                self.tL,
+                self.tL_fraction,
+                self.tL_eff,
+            ),
+        ):
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                line_data = self.conformal_line_data[grid_type][direction]
+
+                full_fraction = np.ones(
+                    line_data["effective_length_fraction"].shape,
+                    dtype=float,
+                )
+
+                supported = line_data["supported"]
+
+                full_fraction[supported] = line_data["effective_length_fraction"][
+                    supported
+                ]
+
+                field_fraction = self._edge_array_to_field_component(
+                    full_fraction,
+                    direction,
+                )
+
+                base_component = base_lengths.to_matrix(direction)
+
+                setattr(
+                    fraction_field,
+                    f"field_{direction}",
+                    field_fraction.copy(),
+                )
+
+                setattr(
+                    effective_lengths,
+                    f"field_{direction}",
+                    (base_component * field_fraction),
+                )
+
+    def _build_conformal_effective_areas(self):
+        """
+        Build effective primal and dual face areas from conformal
+        interface-area fractions.
+
+        Original grid metrics self.iA and self.itA remain unchanged.
+        """
+        self.A_fraction = Field(
+            self.Nx,
+            self.Ny,
+            self.Nz,
+        )
+
+        self.tA_fraction = Field(
+            self.Nx,
+            self.Ny,
+            self.Nz,
+        )
+
+        self.A_eff = Field(
+            self.Nx,
+            self.Ny,
+            self.Nz,
+        )
+
+        self.tA_eff = Field(
+            self.Nx,
+            self.Ny,
+            self.Nz,
+        )
+
+        configurations = (
+            (
+                "primal",
+                self.A_fraction,
+                self.A_eff,
+                self.iA,
+            ),
+            (
+                "dual",
+                self.tA_fraction,
+                self.tA_eff,
+                self.itA,
+            ),
+        )
+
+        for (
+            grid_type,
+            fraction_field,
+            effective_area_field,
+            inverse_area_field,
+        ) in configurations:
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                data = self.conformal_face_data[grid_type][direction]
+
+                # Unsupported/unresolved faces retain their
+                # original area for now.
+                full_fraction = np.ones(
+                    data["supported"].shape,
+                    dtype=float,
+                )
+
+                supported = data["supported"]
+
+                full_fraction[supported] = data["effective_area_fraction"][supported]
+
+                field_fraction = self._face_array_to_field_component(
+                    full_fraction,
+                    direction,
+                )
+
+                # Grid stores inverse face areas.
+                base_area = np.divide(
+                    1.0,
+                    inverse_area_field.to_matrix(direction),
+                )
+
+                setattr(
+                    fraction_field,
+                    f"field_{direction}",
+                    field_fraction.copy(),
+                )
+
+                setattr(
+                    effective_area_field,
+                    f"field_{direction}",
+                    (base_area * field_fraction),
+                )
+
+    def _move_CPML_to_mkl(self):
+        self.dxy = mkl_sparse_mat(self.dxy)
+        self.dxz = mkl_sparse_mat(self.dxz)
+        self.dyz = mkl_sparse_mat(self.dyz)
+        self.dyx = mkl_sparse_mat(self.dyx)
+        self.dzx = mkl_sparse_mat(self.dzx)
+        self.dzy = mkl_sparse_mat(self.dzy)
+        self.dtxy = mkl_sparse_mat(self.dtxy)
+        self.dtxz = mkl_sparse_mat(self.dtxz)
+        self.dtyz = mkl_sparse_mat(self.dtyz)
+        self.dtyx = mkl_sparse_mat(self.dtyx)
+        self.dtzx = mkl_sparse_mat(self.dtzx)
+        self.dtzy = mkl_sparse_mat(self.dtzy)
+
+    def _move_CPML_to_gpu(self):
+        self.imu.to_gpu()
+        self.dxy = gpu_sparse_mat(self.dxy)
+        self.dxz = gpu_sparse_mat(self.dxz)
+        self.dyz = gpu_sparse_mat(self.dyz)
+        self.dyx = gpu_sparse_mat(self.dyx)
+        self.dzx = gpu_sparse_mat(self.dzx)
+        self.dzy = gpu_sparse_mat(self.dzy)
+        self.dtxy = gpu_sparse_mat(self.dtxy)
+        self.dtxz = gpu_sparse_mat(self.dtxz)
+        self.dtyz = gpu_sparse_mat(self.dtyz)
+        self.dtyx = gpu_sparse_mat(self.dtyx)
+        self.dtzx = gpu_sparse_mat(self.dtzx)
+        self.dtzy = gpu_sparse_mat(self.dtzy)
+
+        # Move only the CPML convolutional terms to GPU that are used
+        if self.bc_low[0].lower() == "cpml":
+            self.psiHa_z_low = cp.asarray(self.psiHa_z_low)
+            self.psiHb_y_low = cp.asarray(self.psiHb_y_low)
+            self.psiEa_z_low = cp.asarray(self.psiEa_z_low)
+            self.psiEb_y_low = cp.asarray(self.psiEb_y_low)
+            self.pml_b_E_x_low = cp.asarray(self.pml_b_E_x_low)
+            self.pml_b_H_x_low = cp.asarray(self.pml_b_H_x_low)
+            self.pml_c_E_x_low = cp.asarray(self.pml_c_E_x_low)
+            self.pml_c_H_x_low = cp.asarray(self.pml_c_H_x_low)
+            self.idx_x_low = cp.asarray(self.idx_x_low)
+        if self.bc_low[1].lower() == "cpml":
+            self.psiHa_x_low = cp.asarray(self.psiHa_x_low)
+            self.psiHb_z_low = cp.asarray(self.psiHb_z_low)
+            self.psiEa_x_low = cp.asarray(self.psiEa_x_low)
+            self.psiEb_z_low = cp.asarray(self.psiEb_z_low)
+            self.pml_b_E_y_low = cp.asarray(self.pml_b_E_y_low)
+            self.pml_b_H_y_low = cp.asarray(self.pml_b_H_y_low)
+            self.pml_c_E_y_low = cp.asarray(self.pml_c_E_y_low)
+            self.pml_c_H_y_low = cp.asarray(self.pml_c_H_y_low)
+            self.idx_y_low = cp.asarray(self.idx_y_low)
+        if self.bc_low[2].lower() == "cpml":
+            self.psiHa_y_low = cp.asarray(self.psiHa_y_low)
+            self.psiHb_x_low = cp.asarray(self.psiHb_x_low)
+            self.psiEa_y_low = cp.asarray(self.psiEa_y_low)
+            self.psiEb_x_low = cp.asarray(self.psiEb_x_low)
+            self.pml_b_E_z_low = cp.asarray(self.pml_b_E_z_low)
+            self.pml_b_H_z_low = cp.asarray(self.pml_b_H_z_low)
+            self.pml_c_E_z_low = cp.asarray(self.pml_c_E_z_low)
+            self.pml_c_H_z_low = cp.asarray(self.pml_c_H_z_low)
+            self.idx_z_low = cp.asarray(self.idx_z_low)
+        if self.bc_high[0].lower() == "cpml":
+            self.psiHa_z_high = cp.asarray(self.psiHa_z_high)
+            self.psiHb_y_high = cp.asarray(self.psiHb_y_high)
+            self.psiEa_z_high = cp.asarray(self.psiEa_z_high)
+            self.psiEb_y_high = cp.asarray(self.psiEb_y_high)
+            self.pml_b_E_x_high = cp.asarray(self.pml_b_E_x_high)
+            self.pml_b_H_x_high = cp.asarray(self.pml_b_H_x_high)
+            self.pml_c_E_x_high = cp.asarray(self.pml_c_E_x_high)
+            self.pml_c_H_x_high = cp.asarray(self.pml_c_H_x_high)
+            self.idx_x_high = cp.asarray(self.idx_x_high)
+        if self.bc_high[1].lower() == "cpml":
+            self.psiHa_x_high = cp.asarray(self.psiHa_x_high)
+            self.psiHb_z_high = cp.asarray(self.psiHb_z_high)
+            self.psiEa_x_high = cp.asarray(self.psiEa_x_high)
+            self.psiEb_z_high = cp.asarray(self.psiEb_z_high)
+            self.pml_b_E_y_high = cp.asarray(self.pml_b_E_y_high)
+            self.pml_b_H_y_high = cp.asarray(self.pml_b_H_y_high)
+            self.pml_c_E_y_high = cp.asarray(self.pml_c_E_y_high)
+            self.pml_c_H_y_high = cp.asarray(self.pml_c_H_y_high)
+            self.idx_y_high = cp.asarray(self.idx_y_high)
+        if self.bc_high[2].lower() == "cpml":
+            self.psiHa_y_high = cp.asarray(self.psiHa_y_high)
+            self.psiHb_x_high = cp.asarray(self.psiHb_x_high)
+            self.psiEa_y_high = cp.asarray(self.psiEa_y_high)
+            self.psiEb_x_high = cp.asarray(self.psiEb_x_high)
+            self.pml_b_E_z_high = cp.asarray(self.pml_b_E_z_high)
+            self.pml_b_H_z_high = cp.asarray(self.pml_b_H_z_high)
+            self.pml_c_E_z_high = cp.asarray(self.pml_c_E_z_high)
+            self.pml_c_H_z_high = cp.asarray(self.pml_c_H_z_high)
+            self.idx_z_high = cp.asarray(self.idx_z_high)
+
+    def _move_tfsf_to_mkl(self):
+        self.tf_dxz = mkl_sparse_mat(self.tf_dxz)
+        self.tf_dyz = mkl_sparse_mat(self.tf_dyz)
+        self.tf_dtxz = mkl_sparse_mat(self.tf_dtxz)
+        self.tf_dtyz = mkl_sparse_mat(self.tf_dtyz)
+
+    def _move_tfsf_to_gpu(self):
+        if not self.activate_cpml:
+            self.imu.to_gpu()
+        self.tf_dxz = gpu_sparse_mat(self.tf_dxz)
+        self.tf_dyz = gpu_sparse_mat(self.tf_dyz)
+        self.tf_dtxz = gpu_sparse_mat(self.tf_dtxz)
+        self.tf_dtyz = gpu_sparse_mat(self.tf_dtyz)
+
+    def update_tensors(self, tensor="all"):
+        """
+        Update tensor matrices after material Field changes and precompute
+        combined operators used for time-stepping.
+
+        When ``ieps``, ``imu`` or ``sigma`` are modified this routine
+        reconstructs the corresponding sparse diagonal matrices and the
+        composite operator products used in the update equations. Use the
+        ``tensor`` argument to restrict work to a single tensor for efficiency.
+
+        Parameters
+        ----------
+        tensor : {'ieps','imu','sigma','all'}, optional
+            Which tensor to update. Default is 'all' which recomputes every
+            tensor and refreshes the precomputed time-stepping matrices.
+        """
+        if self.verbose:
+            print(f'Re-computing tensor "{tensor}"...')
+
+        if tensor == "ieps":
+            self.iDeps = diags(
+                self.ieps.toarray(),
+                shape=(3 * self.N, 3 * self.N),
+                dtype=self.dtype,
+            )
+        elif tensor == "imu":
+            self.iDmu = diags(
+                self.imu.toarray(),
+                shape=(3 * self.N, 3 * self.N),
+                dtype=self.dtype,
+            )
+        elif tensor == "sigma":
+            self.Dsigma = diags(
+                self.sigma.toarray(),
+                shape=(3 * self.N, 3 * self.N),
+                dtype=self.dtype,
+            )
+        elif tensor == "all":
+            self.iDeps = diags(
+                self.ieps.toarray(),
+                shape=(3 * self.N, 3 * self.N),
+                dtype=self.dtype,
+            )
+            self.iDmu = diags(
+                self.imu.toarray(),
+                shape=(3 * self.N, 3 * self.N),
+                dtype=self.dtype,
+            )
+            self.Dsigma = diags(
+                self.sigma.toarray(),
+                shape=(3 * self.N, 3 * self.N),
+                dtype=self.dtype,
+            )
+
+        if self.verbose:
+            print("Re-Pre-computing ...")
+        self.tDsiDmuiDaC = self.iDa * self.iDmu * self.C * self.Ds
+        self.itDaiDepsDstC = self.iDeps * self.itDa * self.C.transpose() * self.tDs
+        self.step_0 = False
+
+    @staticmethod
+    def _average_dual_points_to_primal_edges(point_values):
+        """
+        Average material values at dual grid points over the dual faces
+        associated with the stored primal edges.
+
+        Parameters
+        ----------
+        point_values : ndarray
+            Material values on the dual grid points with shape
+            (Nx+1, Ny+1, Nz+1).
+
+        Returns
+        -------
+        values_x, values_y, values_z : ndarray
+            Face-averaged material values associated with the x-, y-, and
+            z-directed primal edges. Each array has shape (Nx, Ny, Nz).
+
+        Notes
+        -----
+        At low-side boundaries, the dual face is truncated by the physical
+        domain boundary. Missing dual-face vertices are represented by
+        constant extrapolation of the nearest available dual-point value.
+        """
+        point_values = np.asarray(point_values)
+
+        Nx = point_values.shape[0] - 1
+        Ny = point_values.shape[1] - 1
+        Nz = point_values.shape[2] - 1
+
+        # ----------------------------------------------------------
+        # x-directed primal edges -> dual yz faces
+        # ----------------------------------------------------------
+        values = point_values[:Nx, :, :]
+
+        padded = np.pad(
+            values,
+            ((0, 0), (1, 0), (1, 0)),
+            mode="edge",
+        )
+
+        values_x = 0.25 * (
+            padded[:, 1 : Ny + 1, 1 : Nz + 1]
+            + padded[:, :Ny, 1 : Nz + 1]
+            + padded[:, :Ny, :Nz]
+            + padded[:, 1 : Ny + 1, :Nz]
+        )
+
+        # ----------------------------------------------------------
+        # y-directed primal edges -> dual xz faces
+        # ----------------------------------------------------------
+        values = point_values[:, :Ny, :]
+
+        padded = np.pad(
+            values,
+            ((1, 0), (0, 0), (1, 0)),
+            mode="edge",
+        )
+
+        values_y = 0.25 * (
+            padded[1 : Nx + 1, :, 1 : Nz + 1]
+            + padded[:Nx, :, 1 : Nz + 1]
+            + padded[:Nx, :, :Nz]
+            + padded[1 : Nx + 1, :, :Nz]
+        )
+
+        # ----------------------------------------------------------
+        # z-directed primal edges -> dual xy faces
+        # ----------------------------------------------------------
+        values = point_values[:, :, :Nz]
+
+        padded = np.pad(
+            values,
+            ((1, 0), (1, 0), (0, 0)),
+            mode="edge",
+        )
+
+        values_z = 0.25 * (
+            padded[1 : Nx + 1, 1 : Ny + 1, :]
+            + padded[:Nx, 1 : Ny + 1, :]
+            + padded[:Nx, :Ny, :]
+            + padded[1 : Nx + 1, :Ny, :]
+        )
+
+        return values_x, values_y, values_z
+
+    @staticmethod
+    def _average_primal_points_to_dual_edges(point_values):
+        """
+        Average material values at primal grid points over the primal faces
+        associated with the stored dual edges.
+
+        Parameters
+        ----------
+        point_values : ndarray
+            Material values on the primal grid points with shape
+            (Nx+1, Ny+1, Nz+1).
+
+        Returns
+        -------
+        values_x, values_y, values_z : ndarray
+            Face-averaged material values associated with the x-, y-, and
+            z-directed dual edges. Each array has shape (Nx, Ny, Nz).
+        """
+        point_values = np.asarray(point_values)
+
+        # x-directed dual edges -> primal yz faces at x[i+1]
+        values_x = 0.25 * (
+            point_values[1:, :-1, :-1]
+            + point_values[1:, 1:, :-1]
+            + point_values[1:, 1:, 1:]
+            + point_values[1:, :-1, 1:]
+        )
+
+        # y-directed dual edges -> primal xz faces at y[j+1]
+        values_y = 0.25 * (
+            point_values[:-1, 1:, :-1]
+            + point_values[1:, 1:, :-1]
+            + point_values[1:, 1:, 1:]
+            + point_values[:-1, 1:, 1:]
+        )
+
+        # z-directed dual edges -> primal xy faces at z[k+1]
+        values_z = 0.25 * (
+            point_values[:-1, :-1, 1:]
+            + point_values[1:, :-1, 1:]
+            + point_values[1:, 1:, 1:]
+            + point_values[:-1, 1:, 1:]
+        )
+
+        return values_x, values_y, values_z
+
+    def _apply_stl_materials(self):
+        """Assign STL materials using the selected geometry representation."""
+
+        if self.grid.geometry_mode == "legacy":
+            self._apply_stl_materials_legacy()
+
+        elif self.grid.geometry_mode == "conformal":
+            self._apply_stl_materials_conformal()
+
+    def _apply_stl_materials_legacy(self):
+        """
+        Mask STL solids in the grid and assign user-defined materials.
+
+        Iterates over STL solids imported in the grid and updates ``ieps``,
+        ``imu`` and ``sigma`` according to the material provided for each
+        solid. Materials may be referenced by a library key (string) or given
+        as explicit tuples (eps_r, mu_r[, sigma]). Inverse permittivity and
+        inverse permeability values are stored in the corresponding Fields.
+
+        Notes
+        -----
+        - STL material values must be relative (eps_r, mu_r).
+        - Supply conductivity explicitly to enable conductive behaviour.
+        """
+        grid = self.grid.grid
+        self.stl_solids = self.grid.stl_solids
+        self.stl_materials = self.grid.stl_materials
+        self.stl_colors = self.grid.stl_colors
+
+        for key in self.stl_solids.keys():
+            # Retrieve mask and materials from grid
+            mask = np.reshape(grid[key], (self.Nx, self.Ny, self.Nz))
+            eps = self.stl_materials[key][0] * eps_0
+            mu = self.stl_materials[key][1] * mu_0
+            sigma = self.stl_materials[key][2]
+
+            # Boolean mask: any cell with non-zero subpixel fraction
+            occupied = mask.astype(bool)
+
+            # # Subpixel smoothing: arithmetic mean of ε and μ over the cell volume
+            # # ε_eff = f·ε + (1-f)·ε_bg  →  ieps = 1/ε_eff)
+            # TODO smooth to background / overlapping masks
+            if np.isinf(eps):
+                # Avoid 0 * inf outside PEC cells, which would make the
+                # inverse-permittivity tensor and all fields NaN.
+                eps_eff = np.where(occupied, eps, eps_0)
+            else:
+                eps_eff = mask * eps + (1.0 - mask) * eps_0
+            mu_eff = mask * mu + (1.0 - mask) * mu_0
+
+            # Conductivity of bulk material
+            if sigma > 0.0:
+                if self.use_sibc:  # bulk material is PEC
+                    eps_eff = np.inf
+                    sigma = 0.0
+                else:
+                    if sigma > 10 * eps / eps_0:
+                        print(
+                            f"[!] Warning: High conductivity sigma={sigma} S/m "
+                            f"for solid '{key}' with low permittivity epsilon_r={eps / eps_0} "
+                            f"will considerably reduce the maximal stable timestep.\n"
+                            f"Consider enabling SIBC approximation `use_sibc=True`"
+                        )
+                self.use_conductivity = True
+
+            # Update sigma tensor: arithmetic mean (σ_bg = 0)
+            sigma_eff = mask * sigma
+            self.sigma += self.sigma * (-1.0 * occupied)
+            self.sigma += occupied * sigma_eff
+
+            # Update ieps and imu tensors with subpixel-smoothed values
+            self.ieps += self.ieps * (-1.0 * occupied)
+            self.imu += self.imu * (-1.0 * occupied)
+            self.ieps += occupied * (1.0 / eps_eff)
+            self.imu += occupied * (1.0 / mu_eff)
+
+            # Apply SIBC if enabled
+            if self.stl_materials[key][2] > 0.0 and self.use_sibc:
+                self._apply_SIBC(key)
+
+    def _apply_stl_materials_conformal(self):
+        """
+        Assign STL materials using primal and dual point masks.
+
+        Electric permittivity and conductivity are averaged over the
+        dual faces associated with the stored primal electric edges.
+        Magnetic permeability is averaged over the primal faces associated
+        with the stored dual magnetic edges.
+        """
+        self.stl_solids = self.grid.stl_solids
+        self.stl_materials = self.grid.stl_materials
+        self.stl_colors = self.grid.stl_colors
+
+        # SIBC currently relies on cell-based surface masks and is therefore
+        # not yet compatible with the conformal material discretization.
+        if self.use_sibc and any(
+            self.stl_materials[key][2] > 0.0 for key in self.stl_solids.keys()
+        ):
+            raise NotImplementedError(
+                "SIBC for conductive STL materials is currently not supported "
+                "with geometry_mode='conformal'."
+            )
+
+        shape = (
+            self.Nx + 1,
+            self.Ny + 1,
+            self.Nz + 1,
+        )
+
+        # Initialize point-wise material values with the background material.
+        eps_dual = np.full(
+            shape,
+            self.eps_bg,
+            dtype=self.dtype,
+        )
+
+        sigma_dual = np.full(
+            shape,
+            self.sigma_bg,
+            dtype=self.dtype,
+        )
+
+        mu_primal = np.full(
+            shape,
+            self.mu_bg,
+            dtype=self.dtype,
+        )
+
+        # Assign STL material values to primal and dual grid points.
+        for key in self.stl_solids.keys():
+            primal_mask = self.grid.primal_point_masks[key]
+            dual_mask = self.grid.dual_point_masks[key]
+
+            eps = self.stl_materials[key][0] * eps_0
+            mu = self.stl_materials[key][1] * mu_0
+            sigma = self.stl_materials[key][2]
+
+            # TODO: Temporary workaround for FD SIBC implementation.
+            # Treat SIBC regions as PEC in the volumetric material assignment.
+            # The physical conductivity remains stored in stl_materials
+            # and will later be used to calculate Z_s(omega).
+            #
+            # This does not fix the underlying conformal material averaging.
+            if self.region_material_types[self.grid.region_key_to_id[key]] == "sibc":
+                eps = np.inf
+                sigma = 0.0
+
+            eps_dual[dual_mask] = eps
+            sigma_dual[dual_mask] = sigma
+            mu_primal[primal_mask] = mu
+
+            if sigma > 0.0:
+                self.use_conductivity = True
+
+                if sigma > 10 * eps / eps_0:
+                    print(
+                        f"[!] Warning: High conductivity sigma={sigma} S/m "
+                        f"for solid '{key}' with low permittivity "
+                        f"epsilon_r={eps / eps_0} will considerably reduce "
+                        f"the maximal stable timestep."
+                    )
+
+        # Average material values over the corresponding FIT faces.
+        eps_x, eps_y, eps_z = self._average_dual_points_to_primal_edges(eps_dual)
+
+        sigma_x, sigma_y, sigma_z = self._average_dual_points_to_primal_edges(
+            sigma_dual
+        )
+
+        mu_x, mu_y, mu_z = self._average_primal_points_to_dual_edges(mu_primal)
+
+        # ----------------------------------------------------------
+        # Replace the point-averaged material values by the
+        # conformal diagonal approximation wherever a resolved
+        # normal-normal interface treatment is available.
+        #
+        # All other DOFs retain the point-averaged values above.
+        # ----------------------------------------------------------
+
+        eps_components = {
+            "x": eps_x,
+            "y": eps_y,
+            "z": eps_z,
+        }
+
+        mu_components = {
+            "x": mu_x,
+            "y": mu_y,
+            "z": mu_z,
+        }
+
+        sigma_components = {
+            "x": sigma_x,
+            "y": sigma_y,
+            "z": sigma_z,
+        }
+
+        # ----------------------------------------------------------
+        # Geometry-based constitutive assignment (conformal FIT).
+        #
+        # Point averaging is retained only as a fallback for geometry
+        # configurations not yet represented by resolved interface data.
+        # For uncut edges with one normal region, use that region's
+        # material; for conductor-conductor primal edges, set ieps=0.
+        # For resolved conductor interfaces, use the *normal* part.
+        # Normal-normal material interfaces are handled afterwards by
+        # the existing diagonal-tensor approximation.
+        # ----------------------------------------------------------
+        if not self.region_material_types:
+            self._build_region_material_types()
+        if not hasattr(self, "region_material_properties"):
+            self._build_region_material_properties()
+
+        eps_regions = self.region_material_properties["eps_r"]
+        mu_regions = self.region_material_properties["mu_r"]
+        sigma_regions = self.region_material_properties["sigma"]
+        region_is_normal = np.zeros(len(eps_regions), dtype=bool)
+        region_is_conductor = np.zeros(len(eps_regions), dtype=bool)
+        for region_id, kind in self.region_material_types.items():
+            region_is_normal[region_id] = kind == "normal"
+            region_is_conductor[region_id] = kind in ("pec", "sibc")
+
+        for direction in ("x", "y", "z"):
+            # Electric DOFs correspond to primal edges.
+            start, end = self.grid._get_edge_region_ids("primal", direction)
+            start = self._edge_array_to_field_component(start, direction)
+            end = self._edge_array_to_field_component(end, direction)
+
+            same_normal = (start == end) & region_is_normal[start]
+            fully_conductor = region_is_conductor[start] & region_is_conductor[end]
+
+            # Assign the actual region material, not a four-point
+            # average that can be contaminated by a nearby PEC point.
+            eps_components[direction][same_normal] = (
+                eps_regions[start[same_normal]] * eps_0
+            )
+            sigma_components[direction][same_normal] = sigma_regions[start[same_normal]]
+
+            # Interior PEC/SIBC electric DOFs are eliminated through
+            # ieps=0, consistent with the existing material mask.
+            eps_components[direction][fully_conductor] = np.inf
+            sigma_components[direction][fully_conductor] = 0.0
+
+            primal_data = self.conformal_line_data.get("primal", {}).get(direction)
+            primal_mat = self.conformal_line_materials.get("primal", {}).get(direction)
+            if primal_data is not None and primal_mat is not None:
+                crossing_full = (
+                    primal_data["normal_to_conductor"]
+                    | primal_data["conductor_to_normal"]
+                )
+                crossing = self._edge_array_to_field_component(
+                    crossing_full, direction
+                ).astype(bool)
+                line_eps = self._edge_array_to_field_component(
+                    primal_mat["eps_r"], direction
+                )
+                line_sigma = self._edge_array_to_field_component(
+                    primal_mat["sigma"], direction
+                )
+                valid = (
+                    crossing
+                    & np.isfinite(line_eps)
+                    & (line_eps > 0.0)
+                    & np.isfinite(line_sigma)
+                    & (line_sigma >= 0.0)
+                )
+                eps_components[direction][valid] = line_eps[valid] * eps_0
+                sigma_components[direction][valid] = line_sigma[valid]
+
+            # The constitutive electric coefficient also belongs to the
+            # associated dual face. For conductor-cut dual faces use
+            # the already calculated normal-region surface material.
+            dual_face = self.conformal_face_data.get("dual", {}).get(direction)
+            dual_mat = self.conformal_face_materials.get("dual", {}).get(direction)
+            if dual_face is not None and dual_mat is not None:
+                cut_full = dual_face["normal_pec"] | dual_face["normal_sibc"]
+                cut = self._dual_face_array_to_primal_edge_component(
+                    cut_full, direction, fill_value=False
+                ).astype(bool)
+                face_eps = self._dual_face_array_to_primal_edge_component(
+                    dual_mat["eps_r"], direction
+                )
+                face_sigma = self._dual_face_array_to_primal_edge_component(
+                    dual_mat["sigma"], direction
+                )
+                valid = (
+                    cut
+                    & ~fully_conductor
+                    & np.isfinite(face_eps)
+                    & (face_eps > 0.0)
+                    & np.isfinite(face_sigma)
+                    & (face_sigma >= 0.0)
+                )
+                eps_components[direction][valid] = face_eps[valid] * eps_0
+                sigma_components[direction][valid] = face_sigma[valid]
+
+            # Magnetic DOFs correspond to dual edges and primal faces.
+            dual_start, dual_end = self.grid._get_edge_region_ids("dual", direction)
+            dual_start = self._edge_array_to_field_component(dual_start, direction)
+            dual_end = self._edge_array_to_field_component(dual_end, direction)
+            dual_same_normal = (dual_start == dual_end) & region_is_normal[dual_start]
+            mu_components[direction][dual_same_normal] = (
+                mu_regions[dual_start[dual_same_normal]] * mu_0
+            )
+
+            dual_data = self.conformal_line_data.get("dual", {}).get(direction)
+            dual_mat = self.conformal_line_materials.get("dual", {}).get(direction)
+            if dual_data is not None and dual_mat is not None:
+                crossing_full = (
+                    dual_data["normal_to_conductor"] | dual_data["conductor_to_normal"]
+                )
+                crossing = self._edge_array_to_field_component(
+                    crossing_full, direction
+                ).astype(bool)
+                line_mu = self._edge_array_to_field_component(
+                    dual_mat["mu_r"], direction
+                )
+                valid = crossing & np.isfinite(line_mu) & (line_mu > 0.0)
+                mu_components[direction][valid] = line_mu[valid] * mu_0
+
+            primal_face = self.conformal_face_data.get("primal", {}).get(direction)
+            primal_face_mat = self.conformal_face_materials.get("primal", {}).get(
+                direction
+            )
+            if primal_face is not None and primal_face_mat is not None:
+                cut_full = primal_face["normal_pec"] | primal_face["normal_sibc"]
+                cut = self._primal_face_array_to_dual_edge_component(
+                    cut_full, direction
+                ).astype(bool)
+                face_mu = self._primal_face_array_to_dual_edge_component(
+                    primal_face_mat["mu_r"], direction
+                )
+                valid = cut & np.isfinite(face_mu) & (face_mu > 0.0)
+                mu_components[direction][valid] = face_mu[valid] * mu_0
+
+        # The normal-normal diagonal approximation below deliberately
+        # takes precedence over the assignments above. Its purpose is
+        # to approximate anisotropic dielectric/magnetic interfaces.
+
+        diagonal_materials = getattr(
+            self,
+            "conformal_diagonal_materials",
+            None,
+        )
+
+        if diagonal_materials:
+            expected_shape = (
+                self.Nx,
+                self.Ny,
+                self.Nz,
+            )
+
+            for direction in (
+                "x",
+                "y",
+                "z",
+            ):
+                # --------------------------------------------------
+                # Permittivity
+                # --------------------------------------------------
+                eps_r_diag = diagonal_materials["eps_r"].get(
+                    direction,
+                    None,
+                )
+
+                if eps_r_diag is not None:
+                    eps_r_diag = np.asarray(
+                        eps_r_diag,
+                        dtype=float,
+                    )
+
+                    if eps_r_diag.shape != expected_shape:
+                        raise RuntimeError(
+                            f"Conformal eps_r {direction}-component "
+                            f"has shape {eps_r_diag.shape}, "
+                            f"expected {expected_shape}."
+                        )
+
+                    valid_eps = np.isfinite(eps_r_diag) & (eps_r_diag > 0.0)
+
+                    eps_components[direction][valid_eps] = eps_r_diag[valid_eps] * eps_0
+
+                # --------------------------------------------------
+                # Permeability
+                # --------------------------------------------------
+                mu_r_diag = diagonal_materials["mu_r"].get(
+                    direction,
+                    None,
+                )
+
+                if mu_r_diag is not None:
+                    mu_r_diag = np.asarray(
+                        mu_r_diag,
+                        dtype=float,
+                    )
+
+                    if mu_r_diag.shape != expected_shape:
+                        raise RuntimeError(
+                            f"Conformal mu_r {direction}-component "
+                            f"has shape {mu_r_diag.shape}, "
+                            f"expected {expected_shape}."
+                        )
+
+                    valid_mu = np.isfinite(mu_r_diag) & (mu_r_diag > 0.0)
+
+                    mu_components[direction][valid_mu] = mu_r_diag[valid_mu] * mu_0
+
+                # --------------------------------------------------
+                # Conductivity
+                # --------------------------------------------------
+                sigma_diag = diagonal_materials["sigma"].get(
+                    direction,
+                    None,
+                )
+
+                if sigma_diag is not None:
+                    sigma_diag = np.asarray(
+                        sigma_diag,
+                        dtype=float,
+                    )
+
+                    if sigma_diag.shape != expected_shape:
+                        raise RuntimeError(
+                            f"Conformal sigma {direction}-component "
+                            f"has shape {sigma_diag.shape}, "
+                            f"expected {expected_shape}."
+                        )
+
+                    valid_sigma = np.isfinite(sigma_diag) & (sigma_diag >= 0.0)
+
+                    sigma_components[direction][valid_sigma] = sigma_diag[valid_sigma]
+
+        # Convert physical material values to the quantities used
+        # in the explicit FIT update equations.
+        self.ieps.field_x = 1.0 / eps_components["x"]
+        self.ieps.field_y = 1.0 / eps_components["y"]
+        self.ieps.field_z = 1.0 / eps_components["z"]
+
+        self.imu.field_x = 1.0 / mu_components["x"]
+        self.imu.field_y = 1.0 / mu_components["y"]
+        self.imu.field_z = 1.0 / mu_components["z"]
+
+        self.sigma.field_x = sigma_components["x"]
+        self.sigma.field_y = sigma_components["y"]
+        self.sigma.field_z = sigma_components["z"]
+
+    def _apply_SIBC(self, key):
+        eps = self.stl_materials[key][0] * eps_0
+        mu = self.stl_materials[key][1] * mu_0
+        sigma = self.stl_materials[key][2]
+
+        # Mark surface cells for SIBC if conductivity is high
+        if self.verbose > 1:
+            print(f'    * Applying SIBC for solid "{key}" with sigma={sigma} S/m')
+
+        # Retrieve surface mask
+        surface_mask = self.grid._mark_cells_in_surface(key)
+        mask = np.reshape(surface_mask, (self.Nx, self.Ny, self.Nz)).astype(int)
+
+        # Calculate effective surface impedance and update tensors at the surface
+        Z_s = np.sqrt(np.pi * self.fmax * mu / sigma)
+        sigma_eff = 1 / Z_s  # SIBC surface conductivity [S]
+        eps_eff = (1 / Z_s - 1) * eps_0 + eps
+
+        # Update tensors
+        self.sigma += self.sigma * (-1.0 * mask)
+        self.sigma += mask * sigma_eff
+        self.ieps += self.ieps * (-1.0 * mask)
+        self.ieps += mask * 1.0 / eps_eff
+
+    def _one_step_with_abc(self):
+        """Wrap the selected backend timestep with the longitudinal Mur ABC."""
+        self._capture_abc()
+        self._one_step_backend()
+        self._apply_abc()
+
+    def _one_step(self):
+        if self.step_0:
+            self._set_ghosts_to_0()
+            self.step_0 = False
+            self._attrcleanup()
+            if self.source_type == "direct" or self.use_conductivity:
+                self.J_old = np.zeros_like(self.J.toarray())
+
+        self.H.fromarray(
+            self.H.toarray() - self.dt * self.tDsiDmuiDaC * self.E.toarray()
+        )
+
+        if self.source_type == "tfsf":
+            if not self.injection_done:
+                self.H.field_x -= (
+                    self.dt * self.imu.field_x * self.tf_dxz * self.E_trans.field_y
+                )
+                self.H.field_y -= (
+                    self.dt * self.imu.field_y * -self.tf_dyz * self.E_trans.field_x
+                )
+
+        # include current computation
+        if self.use_conductivity:
+            Jtemp = self.sigma.toarray() * self.E.toarray()
+            dJ = Jtemp - self.J_old
+            self.J.fromarray(self.J.toarray() + dJ)
+            self.J_old = Jtemp
+
+        self.E.fromarray(
+            self.E.toarray()
+            + self.dt
+            * (
+                self.itDaiDepsDstC * self.H.toarray()
+                - self.ieps.toarray() * self.J.toarray()
+            )
+        )
+
+        if self.source_type == "tfsf":
+            if not self.injection_done:
+                self.E.field_x += (
+                    self.dt * self.ieps.field_x * -self.tf_dtxz * self.H_trans.field_y
+                )
+                self.E.field_y += (
+                    self.dt * self.ieps.field_y * self.tf_dtyz * self.H_trans.field_x
+                )
+
+    def _one_step_cpml(self):
+        # Including the convolutional terms for the CPML update equations
+        if self.step_0:
+            self._set_ghosts_to_0()
+            self.step_0 = False
+            self._attrcleanup()
+            if self.source_type == "direct" or self.use_conductivity:
+                self.J_old = np.zeros_like(self.J.toarray())
+            if self.verbose > 1:
+                print("Starting time-stepping with CPML...")
+
+        # Compute the curl of E fields
+        dxyEz = self.dxy * self.E.field_z
+        dxzEy = self.dxz * self.E.field_y
+        dyxEz = self.dyx * self.E.field_z
+        dyzEx = self.dyz * self.E.field_x
+        dzxEy = self.dzx * self.E.field_y
+        dzyEx = self.dzy * self.E.field_x
+
+        # Manipulate the curl of E for Total-Field/Scattered-Field injection if applicable
+        if self.source_type == "tfsf":
+            if not self.injection_done:
+                dxzEy -= self.tf_dxz * self.E_trans.field_y
+                dyzEx -= self.tf_dyz * self.E_trans.field_x
+
+        # Update the CPML convolutional terms for the magnetic field components
+        if self.bc_low[0].lower() == "cpml":
+            self.psiHa_z_low = (
+                self.pml_b_H_x_low * self.psiHa_z_low
+                + self.pml_c_H_x_low * dzxEy[self.idx_x_low]
+            )
+            self.psiHb_y_low = (
+                self.pml_b_H_x_low * self.psiHb_y_low
+                + self.pml_c_H_x_low * dyxEz[self.idx_x_low]
+            )
+        if self.bc_low[1].lower() == "cpml":
+            self.psiHa_x_low = (
+                self.pml_b_H_y_low * self.psiHa_x_low
+                + self.pml_c_H_y_low * dxyEz[self.idx_y_low]
+            )
+            self.psiHb_z_low = (
+                self.pml_b_H_y_low * self.psiHb_z_low
+                + self.pml_c_H_y_low * dzyEx[self.idx_y_low]
+            )
+        if self.bc_low[2].lower() == "cpml":
+            self.psiHa_y_low = (
+                self.pml_b_H_z_low * self.psiHa_y_low
+                + self.pml_c_H_z_low * dyzEx[self.idx_z_low]
+            )
+            self.psiHb_x_low = (
+                self.pml_b_H_z_low * self.psiHb_x_low
+                + self.pml_c_H_z_low * dxzEy[self.idx_z_low]
+            )
+        if self.bc_high[0].lower() == "cpml":
+            self.psiHa_z_high = (
+                self.pml_b_H_x_high * self.psiHa_z_high
+                + self.pml_c_H_x_high * dzxEy[self.idx_x_high]
+            )
+            self.psiHb_y_high = (
+                self.pml_b_H_x_high * self.psiHb_y_high
+                + self.pml_c_H_x_high * dyxEz[self.idx_x_high]
+            )
+        if self.bc_high[1].lower() == "cpml":
+            self.psiHa_x_high = (
+                self.pml_b_H_y_high * self.psiHa_x_high
+                + self.pml_c_H_y_high * dxyEz[self.idx_y_high]
+            )
+            self.psiHb_z_high = (
+                self.pml_b_H_y_high * self.psiHb_z_high
+                + self.pml_c_H_y_high * dzyEx[self.idx_y_high]
+            )
+        if self.bc_high[2].lower() == "cpml":
+            self.psiHa_y_high = (
+                self.pml_b_H_z_high * self.psiHa_y_high
+                + self.pml_c_H_z_high * dyzEx[self.idx_z_high]
+            )
+            self.psiHb_x_high = (
+                self.pml_b_H_z_high * self.psiHb_x_high
+                + self.pml_c_H_z_high * dxzEy[self.idx_z_high]
+            )
+
+        # Update the magnetic field components using the curl of E
+        self.H.field_x -= self.dt * self.imu.field_x * (dxyEz - dxzEy)
+        self.H.field_y -= self.dt * self.imu.field_y * (dyzEx - dyxEz)
+        self.H.field_z -= self.dt * self.imu.field_z * (dzxEy - dzyEx)
+
+        # Add the CPML convolutional terms to the magnetic field components at the boundaries
+        if self.bc_low[0].lower() == "cpml":
+            self.H.field_y[self.idx_x_low] -= (
+                self.dt * self.imu.field_y[self.idx_x_low] * -self.psiHb_y_low
+            )
+            self.H.field_z[self.idx_x_low] -= (
+                self.dt * self.imu.field_z[self.idx_x_low] * self.psiHa_z_low
+            )
+        if self.bc_low[1].lower() == "cpml":
+            self.H.field_x[self.idx_y_low] -= (
+                self.dt * self.imu.field_x[self.idx_y_low] * self.psiHa_x_low
+            )
+            self.H.field_z[self.idx_y_low] -= (
+                self.dt * self.imu.field_z[self.idx_y_low] * -self.psiHb_z_low
+            )
+        if self.bc_low[2].lower() == "cpml":
+            self.H.field_x[self.idx_z_low] -= (
+                self.dt * self.imu.field_x[self.idx_z_low] * -self.psiHb_x_low
+            )
+            self.H.field_y[self.idx_z_low] -= (
+                self.dt * self.imu.field_y[self.idx_z_low] * self.psiHa_y_low
+            )
+        if self.bc_high[0].lower() == "cpml":
+            self.H.field_y[self.idx_x_high] -= (
+                self.dt * self.imu.field_y[self.idx_x_high] * -self.psiHb_y_high
+            )
+            self.H.field_z[self.idx_x_high] -= (
+                self.dt * self.imu.field_z[self.idx_x_high] * self.psiHa_z_high
+            )
+        if self.bc_high[1].lower() == "cpml":
+            self.H.field_x[self.idx_y_high] -= (
+                self.dt * self.imu.field_x[self.idx_y_high] * self.psiHa_x_high
+            )
+            self.H.field_z[self.idx_y_high] -= (
+                self.dt * self.imu.field_z[self.idx_y_high] * -self.psiHb_z_high
+            )
+        if self.bc_high[2].lower() == "cpml":
+            self.H.field_x[self.idx_z_high] -= (
+                self.dt * self.imu.field_x[self.idx_z_high] * -self.psiHb_x_high
+            )
+            self.H.field_y[self.idx_z_high] -= (
+                self.dt * self.imu.field_y[self.idx_z_high] * self.psiHa_y_high
+            )
+
+        if self.use_mpi:
+            self._mpi_communicate(self.H)
+
+        # Include current computation
+        if self.use_conductivity:
+            Jtemp = self.sigma.toarray() * self.E.toarray()
+            dJ = Jtemp - self.J_old
+            self.J.fromarray(self.J.toarray() + dJ)
+            self.J_old = Jtemp
+
+            if self.use_mpi:
+                self._mpi_communicate(self.J)
+
+        # Compute the curl of H fields
+        dtxyHz = self.dtxy * self.H.field_z
+        dtxzHy = self.dtxz * self.H.field_y
+        dtyxHz = self.dtyx * self.H.field_z
+        dtyzHx = self.dtyz * self.H.field_x
+        dtzxHy = self.dtzx * self.H.field_y
+        dtzyHx = self.dtzy * self.H.field_x
+
+        # Manipulate the curl of H for Total-Field/Scattered-Field injection if applicable
+        if self.source_type == "tfsf":
+            if not self.injection_done:
+                dtxzHy += self.tf_dtxz * self.H_trans.field_y
+                dtyzHx += self.tf_dtyz * self.H_trans.field_x
+
+        # Update the CPML convolutional terms for the electric field components
+        if self.bc_low[0].lower() == "cpml":
+            self.psiEa_z_low = (
+                self.pml_b_E_x_low * self.psiEa_z_low
+                + self.pml_c_E_x_low * dtzxHy[self.idx_x_low]
+            )
+            self.psiEb_y_low = (
+                self.pml_b_E_x_low * self.psiEb_y_low
+                + self.pml_c_E_x_low * dtyxHz[self.idx_x_low]
+            )
+        if self.bc_low[1].lower() == "cpml":
+            self.psiEa_x_low = (
+                self.pml_b_E_y_low * self.psiEa_x_low
+                + self.pml_c_E_y_low * dtxyHz[self.idx_y_low]
+            )
+            self.psiEb_z_low = (
+                self.pml_b_E_y_low * self.psiEb_z_low
+                + self.pml_c_E_y_low * dtzyHx[self.idx_y_low]
+            )
+        if self.bc_low[2].lower() == "cpml":
+            self.psiEa_y_low = (
+                self.pml_b_E_z_low * self.psiEa_y_low
+                + self.pml_c_E_z_low * dtyzHx[self.idx_z_low]
+            )
+            self.psiEb_x_low = (
+                self.pml_b_E_z_low * self.psiEb_x_low
+                + self.pml_c_E_z_low * dtxzHy[self.idx_z_low]
+            )
+        if self.bc_high[0].lower() == "cpml":
+            self.psiEa_z_high = (
+                self.pml_b_E_x_high * self.psiEa_z_high
+                + self.pml_c_E_x_high * dtzxHy[self.idx_x_high]
+            )
+            self.psiEb_y_high = (
+                self.pml_b_E_x_high * self.psiEb_y_high
+                + self.pml_c_E_x_high * dtyxHz[self.idx_x_high]
+            )
+        if self.bc_high[1].lower() == "cpml":
+            self.psiEa_x_high = (
+                self.pml_b_E_y_high * self.psiEa_x_high
+                + self.pml_c_E_y_high * dtxyHz[self.idx_y_high]
+            )
+            self.psiEb_z_high = (
+                self.pml_b_E_y_high * self.psiEb_z_high
+                + self.pml_c_E_y_high * dtzyHx[self.idx_y_high]
+            )
+        if self.bc_high[2].lower() == "cpml":
+            self.psiEa_y_high = (
+                self.pml_b_E_z_high * self.psiEa_y_high
+                + self.pml_c_E_z_high * dtyzHx[self.idx_z_high]
+            )
+            self.psiEb_x_high = (
+                self.pml_b_E_z_high * self.psiEb_x_high
+                + self.pml_c_E_z_high * dtxzHy[self.idx_z_high]
+            )
+
+        # Update the electric field components using the curl of H and the current density
+        self.E.field_x += (
+            self.dt * self.ieps.field_x * (dtxyHz - dtxzHy)
+            - self.dt * self.ieps.field_x * self.J.field_x
+        )
+        self.E.field_y += (
+            self.dt * self.ieps.field_y * (dtyzHx - dtyxHz)
+            - self.dt * self.ieps.field_y * self.J.field_y
+        )
+        self.E.field_z += (
+            self.dt * self.ieps.field_z * (dtzxHy - dtzyHx)
+            - self.dt * self.ieps.field_z * self.J.field_z
+        )
+
+        # Add the CPML convolutional terms to the electric field components at the boundaries
+        if self.bc_low[0].lower() == "cpml":
+            self.E.field_y[self.idx_x_low] += (
+                self.dt * self.ieps.field_y[self.idx_x_low] * -self.psiEb_y_low
+            )
+            self.E.field_z[self.idx_x_low] += (
+                self.dt * self.ieps.field_z[self.idx_x_low] * self.psiEa_z_low
+            )
+        if self.bc_low[1].lower() == "cpml":
+            self.E.field_x[self.idx_y_low] += (
+                self.dt * self.ieps.field_x[self.idx_y_low] * self.psiEa_x_low
+            )
+            self.E.field_z[self.idx_y_low] += (
+                self.dt * self.ieps.field_z[self.idx_y_low] * -self.psiEb_z_low
+            )
+        if self.bc_low[2].lower() == "cpml":
+            self.E.field_x[self.idx_z_low] += (
+                self.dt * self.ieps.field_x[self.idx_z_low] * -self.psiEb_x_low
+            )
+            self.E.field_y[self.idx_z_low] += (
+                self.dt * self.ieps.field_y[self.idx_z_low] * self.psiEa_y_low
+            )
+        if self.bc_high[0].lower() == "cpml":
+            self.E.field_y[self.idx_x_high] += (
+                self.dt * self.ieps.field_y[self.idx_x_high] * -self.psiEb_y_high
+            )
+            self.E.field_z[self.idx_x_high] += (
+                self.dt * self.ieps.field_z[self.idx_x_high] * self.psiEa_z_high
+            )
+        if self.bc_high[1].lower() == "cpml":
+            self.E.field_x[self.idx_y_high] += (
+                self.dt * self.ieps.field_x[self.idx_y_high] * self.psiEa_x_high
+            )
+            self.E.field_z[self.idx_y_high] += (
+                self.dt * self.ieps.field_z[self.idx_y_high] * -self.psiEb_z_high
+            )
+        if self.bc_high[2].lower() == "cpml":
+            self.E.field_x[self.idx_z_high] += (
+                self.dt * self.ieps.field_x[self.idx_z_high] * -self.psiEb_x_high
+            )
+            self.E.field_y[self.idx_z_high] += (
+                self.dt * self.ieps.field_y[self.idx_z_high] * self.psiEa_y_high
+            )
+
+        if self.use_mpi:
+            self._mpi_communicate(self.E)
+
+    def _one_step_mkl(self):
+        if self.step_0:
+            self._set_ghosts_to_0()
+            self.step_0 = False
+            self._attrcleanup()
+            if self.source_type == "direct" or self.use_conductivity:
+                self.J_old = np.zeros_like(self.J.toarray())
+
+        self.H.fromarray(
+            self.H.toarray()
+            - self.dt * dot_product_mkl(self.tDsiDmuiDaC, self.E.toarray())
+        )
+
+        if self.source_type == "tfsf":
+            if not self.injection_done:
+                self.H.field_x -= (
+                    self.dt
+                    * self.imu.field_x
+                    * dot_product_mkl(self.tf_dxz, self.E_trans.field_y)
+                )
+                self.H.field_y -= (
+                    self.dt
+                    * self.imu.field_y
+                    * -dot_product_mkl(self.tf_dyz, self.E_trans.field_x)
+                )
+
+        # include current computation
+        if self.use_conductivity:
+            Jtemp = self.sigma.toarray() * self.E.toarray()
+            dJ = Jtemp - self.J_old
+            self.J.fromarray(self.J.toarray() + dJ)
+            self.J_old = Jtemp
+
+        self.E.fromarray(
+            self.E.toarray()
+            + self.dt
+            * (
+                dot_product_mkl(self.itDaiDepsDstC, self.H.toarray())
+                - self.ieps.toarray() * self.J.toarray()
+            )
+        )
+
+        if self.source_type == "tfsf":
+            if not self.injection_done:
+                self.E.field_x += (
+                    self.dt
+                    * self.ieps.field_x
+                    * -dot_product_mkl(self.tf_dtxz, self.H_trans.field_y)
+                )
+                self.E.field_y += (
+                    self.dt
+                    * self.ieps.field_y
+                    * dot_product_mkl(self.tf_dtyz, self.H_trans.field_x)
+                )
+
+    def _one_step_cpml_mkl(self):
+        if self.step_0:
+            self._set_ghosts_to_0()
+            self.step_0 = False
+            self._attrcleanup()
+            if self.source_type == "direct" or self.use_conductivity:
+                self.J_old = np.zeros_like(self.J.toarray())
+
+        # Compute the curl of E fields using MKL dot products
+        dxyEz = dot_product_mkl(self.dxy, self.E.field_z)
+        dxzEy = dot_product_mkl(self.dxz, self.E.field_y)
+        dyxEz = dot_product_mkl(self.dyx, self.E.field_z)
+        dyzEx = dot_product_mkl(self.dyz, self.E.field_x)
+        dzxEy = dot_product_mkl(self.dzx, self.E.field_y)
+        dzyEx = dot_product_mkl(self.dzy, self.E.field_x)
+
+        # Manipulate the curl of E for Total-Field/Scattered-Field injection if applicable
+        if self.source_type == "tfsf":
+            if not self.injection_done:
+                dxzEy -= dot_product_mkl(self.tf_dxz, self.E_trans.field_y)
+                dyzEx -= dot_product_mkl(self.tf_dyz, self.E_trans.field_x)
+
+        # Update the CPML convolutional terms for the magnetic field components
+        if self.bc_low[0].lower() == "cpml":
+            self.psiHa_z_low = (
+                self.pml_b_H_x_low * self.psiHa_z_low
+                + self.pml_c_H_x_low * dzxEy[self.idx_x_low]
+            )
+            self.psiHb_y_low = (
+                self.pml_b_H_x_low * self.psiHb_y_low
+                + self.pml_c_H_x_low * dyxEz[self.idx_x_low]
+            )
+        if self.bc_low[1].lower() == "cpml":
+            self.psiHa_x_low = (
+                self.pml_b_H_y_low * self.psiHa_x_low
+                + self.pml_c_H_y_low * dxyEz[self.idx_y_low]
+            )
+            self.psiHb_z_low = (
+                self.pml_b_H_y_low * self.psiHb_z_low
+                + self.pml_c_H_y_low * dzyEx[self.idx_y_low]
+            )
+        if self.bc_low[2].lower() == "cpml":
+            self.psiHa_y_low = (
+                self.pml_b_H_z_low * self.psiHa_y_low
+                + self.pml_c_H_z_low * dyzEx[self.idx_z_low]
+            )
+            self.psiHb_x_low = (
+                self.pml_b_H_z_low * self.psiHb_x_low
+                + self.pml_c_H_z_low * dxzEy[self.idx_z_low]
+            )
+        if self.bc_high[0].lower() == "cpml":
+            self.psiHa_z_high = (
+                self.pml_b_H_x_high * self.psiHa_z_high
+                + self.pml_c_H_x_high * dzxEy[self.idx_x_high]
+            )
+            self.psiHb_y_high = (
+                self.pml_b_H_x_high * self.psiHb_y_high
+                + self.pml_c_H_x_high * dyxEz[self.idx_x_high]
+            )
+        if self.bc_high[1].lower() == "cpml":
+            self.psiHa_x_high = (
+                self.pml_b_H_y_high * self.psiHa_x_high
+                + self.pml_c_H_y_high * dxyEz[self.idx_y_high]
+            )
+            self.psiHb_z_high = (
+                self.pml_b_H_y_high * self.psiHb_z_high
+                + self.pml_c_H_y_high * dzyEx[self.idx_y_high]
+            )
+        if self.bc_high[2].lower() == "cpml":
+            self.psiHa_y_high = (
+                self.pml_b_H_z_high * self.psiHa_y_high
+                + self.pml_c_H_z_high * dyzEx[self.idx_z_high]
+            )
+            self.psiHb_x_high = (
+                self.pml_b_H_z_high * self.psiHb_x_high
+                + self.pml_c_H_z_high * dxzEy[self.idx_z_high]
+            )
+
+        # Update the magnetic field components using the curl of E
+        self.H.field_x -= self.dt * self.imu.field_x * (dxyEz - dxzEy)
+        self.H.field_y -= self.dt * self.imu.field_y * (dyzEx - dyxEz)
+        self.H.field_z -= self.dt * self.imu.field_z * (dzxEy - dzyEx)
+
+        # Add the CPML convolutional terms to the magnetic field components at the boundaries
+        if self.bc_low[0].lower() == "cpml":
+            self.H.field_y[self.idx_x_low] -= (
+                self.dt * self.imu.field_y[self.idx_x_low] * -self.psiHb_y_low
+            )
+            self.H.field_z[self.idx_x_low] -= (
+                self.dt * self.imu.field_z[self.idx_x_low] * self.psiHa_z_low
+            )
+        if self.bc_low[1].lower() == "cpml":
+            self.H.field_x[self.idx_y_low] -= (
+                self.dt * self.imu.field_x[self.idx_y_low] * self.psiHa_x_low
+            )
+            self.H.field_z[self.idx_y_low] -= (
+                self.dt * self.imu.field_z[self.idx_y_low] * -self.psiHb_z_low
+            )
+        if self.bc_low[2].lower() == "cpml":
+            self.H.field_x[self.idx_z_low] -= (
+                self.dt * self.imu.field_x[self.idx_z_low] * -self.psiHb_x_low
+            )
+            self.H.field_y[self.idx_z_low] -= (
+                self.dt * self.imu.field_y[self.idx_z_low] * self.psiHa_y_low
+            )
+        if self.bc_high[0].lower() == "cpml":
+            self.H.field_y[self.idx_x_high] -= (
+                self.dt * self.imu.field_y[self.idx_x_high] * -self.psiHb_y_high
+            )
+            self.H.field_z[self.idx_x_high] -= (
+                self.dt * self.imu.field_z[self.idx_x_high] * self.psiHa_z_high
+            )
+        if self.bc_high[1].lower() == "cpml":
+            self.H.field_x[self.idx_y_high] -= (
+                self.dt * self.imu.field_x[self.idx_y_high] * self.psiHa_x_high
+            )
+            self.H.field_z[self.idx_y_high] -= (
+                self.dt * self.imu.field_z[self.idx_y_high] * -self.psiHb_z_high
+            )
+        if self.bc_high[2].lower() == "cpml":
+            self.H.field_x[self.idx_z_high] -= (
+                self.dt * self.imu.field_x[self.idx_z_high] * -self.psiHb_x_high
+            )
+            self.H.field_y[self.idx_z_high] -= (
+                self.dt * self.imu.field_y[self.idx_z_high] * self.psiHa_y_high
+            )
+
+        if self.use_mpi:
+            self._mpi_communicate(self.H)
+
+        # Include current computation
+        if self.use_conductivity:
+            Jtemp = self.sigma.toarray() * self.E.toarray()
+            self.dJ = Jtemp - self.J_old
+            self.J.fromarray(self.J.toarray() + self.dJ)
+            self.J_old = Jtemp
+
+            if self.use_mpi:
+                self._mpi_communicate(self.J)
+
+        # Compute the curl of H fields using MKL dot products
+        dtxyHz = dot_product_mkl(self.dtxy, self.H.field_z)
+        dtxzHy = dot_product_mkl(self.dtxz, self.H.field_y)
+        dtyxHz = dot_product_mkl(self.dtyx, self.H.field_z)
+        dtyzHx = dot_product_mkl(self.dtyz, self.H.field_x)
+        dtzxHy = dot_product_mkl(self.dtzx, self.H.field_y)
+        dtzyHx = dot_product_mkl(self.dtzy, self.H.field_x)
+
+        # Manipulate the curl of H for Total-Field/Scattered-Field injection if applicable
+        if self.source_type == "tfsf":
+            if not self.injection_done:
+                dtxzHy += dot_product_mkl(self.tf_dtxz, self.H_trans.field_y)
+                dtyzHx += dot_product_mkl(self.tf_dtyz, self.H_trans.field_x)
+
+        # Update the CPML convolutional terms for the electric field components
+        if self.bc_low[0].lower() == "cpml":
+            self.psiEa_z_low = (
+                self.pml_b_E_x_low * self.psiEa_z_low
+                + self.pml_c_E_x_low * dtzxHy[self.idx_x_low]
+            )
+            self.psiEb_y_low = (
+                self.pml_b_E_x_low * self.psiEb_y_low
+                + self.pml_c_E_x_low * dtyxHz[self.idx_x_low]
+            )
+        if self.bc_low[1].lower() == "cpml":
+            self.psiEa_x_low = (
+                self.pml_b_E_y_low * self.psiEa_x_low
+                + self.pml_c_E_y_low * dtxyHz[self.idx_y_low]
+            )
+            self.psiEb_z_low = (
+                self.pml_b_E_y_low * self.psiEb_z_low
+                + self.pml_c_E_y_low * dtzyHx[self.idx_y_low]
+            )
+        if self.bc_low[2].lower() == "cpml":
+            self.psiEa_y_low = (
+                self.pml_b_E_z_low * self.psiEa_y_low
+                + self.pml_c_E_z_low * dtyzHx[self.idx_z_low]
+            )
+            self.psiEb_x_low = (
+                self.pml_b_E_z_low * self.psiEb_x_low
+                + self.pml_c_E_z_low * dtxzHy[self.idx_z_low]
+            )
+        if self.bc_high[0].lower() == "cpml":
+            self.psiEa_z_high = (
+                self.pml_b_E_x_high * self.psiEa_z_high
+                + self.pml_c_E_x_high * dtzxHy[self.idx_x_high]
+            )
+            self.psiEb_y_high = (
+                self.pml_b_E_x_high * self.psiEb_y_high
+                + self.pml_c_E_x_high * dtyxHz[self.idx_x_high]
+            )
+        if self.bc_high[1].lower() == "cpml":
+            self.psiEa_x_high = (
+                self.pml_b_E_y_high * self.psiEa_x_high
+                + self.pml_c_E_y_high * dtxyHz[self.idx_y_high]
+            )
+            self.psiEb_z_high = (
+                self.pml_b_E_y_high * self.psiEb_z_high
+                + self.pml_c_E_y_high * dtzyHx[self.idx_y_high]
+            )
+        if self.bc_high[2].lower() == "cpml":
+            self.psiEa_y_high = (
+                self.pml_b_E_z_high * self.psiEa_y_high
+                + self.pml_c_E_z_high * dtyzHx[self.idx_z_high]
+            )
+            self.psiEb_x_high = (
+                self.pml_b_E_z_high * self.psiEb_x_high
+                + self.pml_c_E_z_high * dtxzHy[self.idx_z_high]
+            )
+
+        # Update the electric field components using the curl of H and the current density
+        self.E.field_x += (
+            self.dt * self.ieps.field_x * (dtxyHz - dtxzHy)
+            - self.dt * self.ieps.field_x * self.J.field_x
+        )
+        self.E.field_y += (
+            self.dt * self.ieps.field_y * (dtyzHx - dtyxHz)
+            - self.dt * self.ieps.field_y * self.J.field_y
+        )
+        self.E.field_z += (
+            self.dt * self.ieps.field_z * (dtzxHy - dtzyHx)
+            - self.dt * self.ieps.field_z * self.J.field_z
+        )
+
+        # Add the CPML convolutional terms to the electric field components at the boundaries
+        if self.bc_low[0].lower() == "cpml":
+            self.E.field_y[self.idx_x_low] += (
+                self.dt * self.ieps.field_y[self.idx_x_low] * -self.psiEb_y_low
+            )
+            self.E.field_z[self.idx_x_low] += (
+                self.dt * self.ieps.field_z[self.idx_x_low] * self.psiEa_z_low
+            )
+        if self.bc_low[1].lower() == "cpml":
+            self.E.field_x[self.idx_y_low] += (
+                self.dt * self.ieps.field_x[self.idx_y_low] * self.psiEa_x_low
+            )
+            self.E.field_z[self.idx_y_low] += (
+                self.dt * self.ieps.field_z[self.idx_y_low] * -self.psiEb_z_low
+            )
+        if self.bc_low[2].lower() == "cpml":
+            self.E.field_x[self.idx_z_low] += (
+                self.dt * self.ieps.field_x[self.idx_z_low] * -self.psiEb_x_low
+            )
+            self.E.field_y[self.idx_z_low] += (
+                self.dt * self.ieps.field_y[self.idx_z_low] * self.psiEa_y_low
+            )
+        if self.bc_high[0].lower() == "cpml":
+            self.E.field_y[self.idx_x_high] += (
+                self.dt * self.ieps.field_y[self.idx_x_high] * -self.psiEb_y_high
+            )
+            self.E.field_z[self.idx_x_high] += (
+                self.dt * self.ieps.field_z[self.idx_x_high] * self.psiEa_z_high
+            )
+        if self.bc_high[1].lower() == "cpml":
+            self.E.field_x[self.idx_y_high] += (
+                self.dt * self.ieps.field_x[self.idx_y_high] * self.psiEa_x_high
+            )
+            self.E.field_z[self.idx_y_high] += (
+                self.dt * self.ieps.field_z[self.idx_y_high] * -self.psiEb_z_high
+            )
+        if self.bc_high[2].lower() == "cpml":
+            self.E.field_x[self.idx_z_high] += (
+                self.dt * self.ieps.field_x[self.idx_z_high] * -self.psiEb_x_high
+            )
+            self.E.field_y[self.idx_z_high] += (
+                self.dt * self.ieps.field_y[self.idx_z_high] * self.psiEa_y_high
+            )
+
+        if self.use_mpi:
+            self._mpi_communicate(self.E)
+
+    def _mpi_initialize(self):
+        self.comm = self.grid.comm
+        self.rank = self.grid.rank
+        self.size = self.grid.size
+
+        self.NZ = self.grid.NZ
+        self.ZMIN = self.grid.ZMIN
+        self.ZMAX = self.grid.ZMAX
+        self.Z = self.grid.Z
+
+    def _mpi_one_step(self):
+        if self.step_0:
+            self._set_ghosts_to_0()
+            self.step_0 = False
+            self._attrcleanup()
+            if self.source_type == "direct" or self.use_conductivity:
+                self.J_old = np.zeros_like(self.J.toarray())
+
+        self.H.fromarray(
+            self.H.toarray() - self.dt * self.tDsiDmuiDaC * self.E.toarray()
+        )
+
+        if self.source_type == "tfsf":
+            if not self.injection_done:
+                self.H.field_x -= (
+                    self.dt * self.imu.field_x * self.tf_dxz * self.E_trans.field_y
+                )
+                self.H.field_y -= (
+                    self.dt * self.imu.field_y * -self.tf_dyz * self.E_trans.field_x
+                )
+
+        self._mpi_communicate(self.H)
+        # include current computation
+        if self.use_conductivity:
+            Jtemp = self.sigma.toarray() * self.E.toarray()
+            dJ = Jtemp - self.J_old
+            self.J.fromarray(self.J.toarray() + dJ)
+            self.J_old = Jtemp
+        self._mpi_communicate(self.J)
+        self.E.fromarray(
+            self.E.toarray()
+            + self.dt
+            * (
+                self.itDaiDepsDstC * self.H.toarray()
+                - self.ieps.toarray() * self.J.toarray()
+            )
+        )
+
+        if self.source_type == "tfsf":
+            if not self.injection_done:
+                self.E.field_x += (
+                    self.dt * self.ieps.field_x * -self.tf_dtxz * self.H_trans.field_y
+                )
+                self.E.field_y += (
+                    self.dt * self.ieps.field_y * self.tf_dtyz * self.H_trans.field_x
+                )
+
+        self._mpi_communicate(self.E)
+
+    def _mpi_one_step_mkl(self):
+        if self.step_0:
+            self._set_ghosts_to_0()
+            self.step_0 = False
+            self._attrcleanup()
+            if self.source_type == "direct" or self.use_conductivity:
+                self.J_old = np.zeros_like(self.J.toarray())
+
+        self.H.fromarray(
+            self.H.toarray()
+            - self.dt * dot_product_mkl(self.tDsiDmuiDaC, self.E.toarray())
+        )
+
+        if self.source_type == "tfsf":
+            if not self.injection_done:
+                self.H.field_x -= (
+                    self.dt
+                    * self.imu.field_x
+                    * dot_product_mkl(self.tf_dxz, self.E_trans.field_y)
+                )
+                self.H.field_y -= (
+                    self.dt
+                    * self.imu.field_y
+                    * -dot_product_mkl(self.tf_dyz, self.E_trans.field_x)
+                )
+
+        self._mpi_communicate(self.H)
+        # include current computation
+        if self.use_conductivity:
+            Jtemp = self.sigma.toarray() * self.E.toarray()
+            dJ = Jtemp - self.J_old
+            self.J.fromarray(self.J.toarray() + dJ)
+            self.J_old = Jtemp
+        self._mpi_communicate(self.J)
+
+        self.E.fromarray(
+            self.E.toarray()
+            + self.dt
+            * (
+                dot_product_mkl(self.itDaiDepsDstC, self.H.toarray())
+                - self.ieps.toarray() * self.J.toarray()
+            )
+        )
+
+        if self.source_type == "tfsf":
+            if not self.injection_done:
+                self.E.field_x += (
+                    self.dt
+                    * self.ieps.field_x
+                    * -dot_product_mkl(self.tf_dtxz, self.H_trans.field_y)
+                )
+                self.E.field_y += (
+                    self.dt
+                    * self.ieps.field_y
+                    * dot_product_mkl(self.tf_dtyz, self.H_trans.field_x)
+                )
+
+        self._mpi_communicate(self.E)
+
+    def _mpi_communicate(self, field):
+        if self.use_gpu:
+            field.from_gpu()
+
+        # ghosts lo
+        if self.rank > 0:
+            for d in ["x", "y", "z"]:
+                self.comm.Sendrecv(
+                    field[:, :, 1, d],
+                    recvbuf=field[:, :, 0, d],
+                    dest=self.rank - 1,
+                    sendtag=0,
+                    source=self.rank - 1,
+                    recvtag=1,
+                )
+        # ghosts hi
+        if self.rank < self.size - 1:
+            for d in ["x", "y", "z"]:
+                self.comm.Sendrecv(
+                    field[:, :, -2, d],
+                    recvbuf=field[:, :, -1, d],
+                    dest=self.rank + 1,
+                    sendtag=1,
+                    source=self.rank + 1,
+                    recvtag=0,
+                )
+
+        if self.use_gpu:
+            field.to_gpu()
+
+    def mpi_gather(self, field, x=None, y=None, z=None, component=None):
+        """
+        Gather a component or slice of a distributed Field from all MPI ranks.
+
+        Assumes the field is split along the z-axis among ranks. The function
+        collects local buffers, removes ghost cells and concatenates rank
+        contributions to build a global NumPy array on the root rank (rank 0).
+
+        Parameters
+        ----------
+        field : str or wakis.Field
+            Field identifier ('E','H','J') optionally with a component suffix
+            (e.g. 'Ex'), or a ``wakis.Field`` object. If no component is given
+            the 'z' component is used by default.
+        x, y, z : int or slice, optional
+            Index or slice for each axis to gather. Defaults to the full range.
+        component : {'x','y','z'} or slice, optional
+            Component to gather when ``field`` is a Field object.
+
+        Returns
+        -------
+        numpy.ndarray or None
+            Assembled global array on rank 0; returns ``None`` on non-root ranks.
+        """
+
+        if x is None:
+            x = slice(0, self.Nx)
+        if y is None:
+            y = slice(0, self.Ny)
+        if z is None:
+            z = slice(0, self.NZ)
+
+        if type(field) is str:
+            if len(field) == 2:  # support for e.g. field='Ex'
+                component = field[1]
+                field = field[0]
+            elif len(field) == 4:  # support for Abs
+                component = field[1:]
+                field = field[0]
+            elif component is None:
+                component = "z"
+                print("[!] `component` not specified, using default component='z'")
+
+            if field == "E":
+                local = self.E[x, y, :, component].ravel()
+            elif field == "H":
+                local = self.H[x, y, :, component].ravel()
+            elif field == "J":
+                local = self.J[x, y, :, component].ravel()
+        else:
+            if component is None:
+                component = "z"
+                print("[!] `component` not specified, using default component='z'")
+            local = field[x, y, :, component].ravel()
+
+        buffer = self.comm.gather(local, root=0)
+        _field = None
+
+        if self.rank == 0:
+            if type(x) is int and type(y) is int:  # 1d array at x=a, y=b
+                nz = self.NZ // self.size
+                _field = np.zeros((self.NZ))
+                for r in range(self.size):
+                    zz = np.s_[r * nz : (r + 1) * nz]
+                    if r == 0:
+                        _field[zz] = np.reshape(buffer[r], (nz + self.grid.n_ghosts))[
+                            :-1
+                        ]
+                    elif r == (self.size - 1):
+                        _field[zz] = np.reshape(buffer[r], (nz + self.grid.n_ghosts))[
+                            1:
+                        ]
+                    else:
+                        _field[zz] = np.reshape(
+                            buffer[r], (nz + 2 * self.grid.n_ghosts)
+                        )[1:-1]
+                _field = _field[z]
+
+            elif type(x) is int:  # 2d slice at x=a
+                ny = y.stop - y.start
+                nz = self.NZ // self.size
+                _field = np.zeros((ny, self.NZ))
+                for r in range(self.size):
+                    zz = np.s_[r * nz : (r + 1) * nz]
+                    if r == 0:
+                        _field[:, zz] = np.reshape(
+                            buffer[r], (ny, nz + self.grid.n_ghosts)
+                        )[:, :-1]
+                    elif r == (self.size - 1):
+                        _field[:, zz] = np.reshape(
+                            buffer[r], (ny, nz + self.grid.n_ghosts)
+                        )[:, 1:]
+                    else:
+                        _field[:, zz] = np.reshape(
+                            buffer[r], (ny, nz + 2 * self.grid.n_ghosts)
+                        )[:, 1:-1]
+                _field = _field[:, z]
+
+            elif type(y) is int:  # 2d slice at y=a
+                nx = x.stop - x.start
+                nz = self.NZ // self.size
+                _field = np.zeros((nx, self.NZ))
+                for r in range(self.size):
+                    zz = np.s_[r * nz : (r + 1) * nz]
+                    if r == 0:
+                        _field[:, zz] = np.reshape(
+                            buffer[r], (nx, nz + self.grid.n_ghosts)
+                        )[:, :-1]
+                    elif r == (self.size - 1):
+                        _field[:, zz] = np.reshape(
+                            buffer[r], (nx, nz + self.grid.n_ghosts)
+                        )[:, 1:]
+                    else:
+                        _field[:, zz] = np.reshape(
+                            buffer[r], (nx, nz + 2 * self.grid.n_ghosts)
+                        )[:, 1:-1]
+                _field = _field[:, z]
+
+            else:  # both type slice -> 3d array
+                nx = x.stop - x.start
+                ny = y.stop - y.start
+                nz = self.NZ // self.size
+                _field = np.zeros((nx, ny, self.NZ))
+                for r in range(self.size):
+                    zz = np.s_[r * nz : (r + 1) * nz]
+                    if r == 0:
+                        _field[:, :, zz] = np.reshape(
+                            buffer[r], (nx, ny, nz + self.grid.n_ghosts)
+                        )[:, :, :-1]
+                    elif r == (self.size - 1):
+                        _field[:, :, zz] = np.reshape(
+                            buffer[r], (nx, ny, nz + self.grid.n_ghosts)
+                        )[:, :, 1:]
+                    else:
+                        _field[:, :, zz] = np.reshape(
+                            buffer[r], (nx, ny, nz + 2 * self.grid.n_ghosts)
+                        )[:, :, 1:-1]
+                _field = _field[:, :, z]
+
+        return _field
+
+    def mpi_gather_asField(self, field):
+        """
+        Gather distributed field data from MPI ranks and return a global Field.
+
+        Collects the full 3-component field (E, H or J) from each rank and
+        reconstructs a single ``wakis.Field`` on the root rank. Ghost cells are
+        removed when reassembling the per-rank buffers.
+
+        Parameters
+        ----------
+        field : str or wakis.Field
+            Identifier ('E','H','J') or a Field-like object to gather.
+
+        Returns
+        -------
+        wakis.Field or None
+            Global Field object assembled on rank 0. Returns ``None`` on other
+            ranks.
+        """
+
+        _field = Field(self.Nx, self.Ny, self.NZ)
+
+        for d in ["x", "y", "z"]:
+            if type(field) is str:
+                if field == "E":
+                    local = self.E[:, :, :, d].ravel()
+                elif field == "H":
+                    local = self.H[:, :, :, d].ravel()
+                elif field == "J":
+                    local = self.J[:, :, :, d].ravel()
+            else:
+                local = field[:, :, :, d].ravel()
+
+            buffer = self.comm.gather(local, root=0)
+            if self.rank == 0:
+                nz = self.NZ // self.size
+                for r in range(self.size):
+                    zz = np.s_[r * nz : (r + 1) * nz]
+                    if r == 0:
+                        _field[:, :, zz, d] = np.reshape(
+                            buffer[r],
+                            (self.Nx, self.Ny, nz + self.grid.n_ghosts),
+                        )[:, :, :-1]
+                    elif r == (self.size - 1):
+                        _field[:, :, zz, d] = np.reshape(
+                            buffer[r],
+                            (self.Nx, self.Ny, nz + self.grid.n_ghosts),
+                        )[:, :, 1:]
+                    else:
+                        _field[:, :, zz, d] = np.reshape(
+                            buffer[r],
+                            (self.Nx, self.Ny, nz + 2 * self.grid.n_ghosts),
+                        )[:, :, 1:-1]
+
+        return _field
+
+    def _set_ghosts_to_0(self):
+        """
+        Zero-out ghost-cell field values used for MPI and boundary exchange.
+
+        Clears any initial condition values that were accidentally placed in
+        ghost cells so that subsequent MPI sends/receives and boundary updates
+        behave correctly.
+        """
+        # Set H ghost quantities to 0
+        for d in ["x", "y", "z"]:  # tangential to zero
+            if d != "x" and self.bc_high[0].lower() != "periodic":
+                self.H[-1, :, :, d] = 0.0
+            if d != "y" and self.bc_high[1].lower() != "periodic":
+                self.H[:, -1, :, d] = 0.0
+            if d != "z" and self.bc_high[2].lower() != "periodic":
+                self.H[:, :, -1, d] = 0.0
+
+        # Set E ghost quantities to 0
+        if self.bc_high[0].lower() != "periodic":
+            self.E[-1, :, :, "x"] = 0.0
+        if self.bc_high[1].lower() != "periodic":
+            self.E[:, -1, :, "y"] = 0.0
+        if self.bc_high[2].lower() != "periodic":
+            self.E[:, :, -1, "z"] = 0.0
+
+    def _apply_conductors(self):
+        """
+        Apply PEC conductor masking by zeroing inverse-permittivity inside
+        conductor volumes.
+
+        This enforces tangential electric field cancellation inside conductor
+        regions by setting the local 1/epsilon to zero.
+        """
+        self.flag_in_conductors = (
+            self.grid.flag_int_cell_yz[:-1, :, :]
+            + self.grid.flag_int_cell_zx[:, :-1, :]
+            + self.grid.flag_int_cell_xy[:, :, :-1]
+        )
+
+        self.ieps *= self.flag_in_conductors
+
+    def _set_field_in_conductors_to_0(self):
+        """
+        Zero dynamic fields inside conductor masks.
+
+        Ensures that any initial E/H fields mapped into conductor regions are
+        removed before time-stepping, avoiding non-physical behaviour.
+        """
+        self.flag_cleanup = (
+            self.grid.flag_int_cell_yz[:-1, :, :]
+            + self.grid.flag_int_cell_zx[:, :-1, :]
+            + self.grid.flag_int_cell_xy[:, :, :-1]
+        )
+
+        self.H *= self.flag_cleanup
+        self.E *= self.flag_cleanup
+
+    def _attrcleanup(self):
+        # Fields
+        del self.L, self.tL, self.iA, self.itA
+        if hasattr(self, "BC"):
+            del self.BC
+            del self.Dbc
+            del self.Dbc_x, self.Dbc_y, self.Dbc_z
+
+        # Matrices
+        del self.Px, self.Py, self.Pz
+        del self.Ds, self.iDa, self.tDs, self.itDa
+        del self.C
+
+    def save_state(self, filename="solver_state.h5", close=True):
+        """
+        Save dynamic solver state (H, E, J) to an HDF5 file.
+
+        Writes the core dynamic fields to ``filename``. When running under MPI
+        the distributed fields are gathered to the root rank before saving.
+
+        Parameters
+        ----------
+        filename : str, optional
+            Output HDF5 filename. Default is "solver_state.h5".
+        close : bool, optional
+            If True (default) the file is closed before returning. If False an
+            open ``h5py.File`` is returned for caller-managed operations.
+
+        Returns
+        -------
+        h5py.File or None
+            Open file object when ``close`` is False, otherwise None.
+        """
+
+        if self.use_mpi:  # MPI savestate
+            H = self.mpi_gather_asField("H")
+            E = self.mpi_gather_asField("E")
+            J = self.mpi_gather_asField("J")
+            state = None
+
+            if self.rank == 0:
+                state = h5py.File(filename, "w")
+                state.create_dataset("H", data=H.toarray())
+                state.create_dataset("E", data=E.toarray())
+                state.create_dataset("J", data=J.toarray())
+            # TODO: check for MPI-GPU
+
+        elif self.use_gpu:  # GPU savestate
+            state = h5py.File(filename, "w")
+            state.create_dataset("H", data=self.H.toarray().get())
+            state.create_dataset("E", data=self.E.toarray().get())
+            state.create_dataset("J", data=self.J.toarray().get())
+
+        else:  # CPU savestate
+            state = h5py.File(filename, "w")
+            state.create_dataset("H", data=self.H.toarray())
+            state.create_dataset("E", data=self.E.toarray())
+            state.create_dataset("J", data=self.J.toarray())
+
+        if close and state is not None:
+            state.close()
+        else:
+            return state  # Caller must close this manually
+
+    def load_state(self, filename="solver_state.h5"):
+        """
+        Load dynamic solver state (H, E, J) from an HDF5 file and restore them.
+
+        Parameters
+        ----------
+        filename : str, optional
+            Input HDF5 filename. Default is "solver_state.h5".
+
+        Notes
+        -----
+        Currently performs a simple load from a single-file state. MPI-aware
+        redistribution of loaded arrays to worker ranks is TODO.
+        """
+
+        if self.use_mpi:  # TODO: test
+            if self.rank == 0:
+                with h5py.File(filename, "r") as f:
+                    state = {"E": f["E"][:], "H": f["H"][:], "J": f["J"][:]}
+                zz = np.s_[: self.Nz]
+            elif self.rank == self.size - 1:
+                state = None
+                zz = np.s_[(self.NZ - self.Nz) :]
+            else:
+                state = None
+                zlo = self.rank * self.Nz
+                zz = np.s_[zlo : zlo + self.Nz]
+
+            state = self.comm.bcast(state, root=0)
+            for d in [0, 1, 2]:  # x,y,z
+                self.E[:, :, :, d] = state["E"].reshape(
+                    (self.Nx, self.Ny, self.NZ, 3), order="F"
+                )[:, :, zz, d]
+                self.H[:, :, :, d] = state["H"].reshape(
+                    (self.Nx, self.Ny, self.NZ, 3), order="F"
+                )[:, :, zz, d]
+                self.J[:, :, :, d] = state["J"].reshape(
+                    (self.Nx, self.Ny, self.NZ, 3), order="F"
+                )[:, :, zz, d]
+
+        else:  # CPU/GPU loadstate
+            with h5py.File(filename, "r") as state:
+                self.E.fromarray(state["E"][:])
+                self.H.fromarray(state["H"][:])
+                self.J.fromarray(state["J"][:])
+
+    def read_state(self, filename="solver_state.h5"):
+        """
+        Open an HDF5 file for read-only access without loading its contents.
+
+        Returns an open ``h5py.File`` object that the caller must close when
+        finished. This is useful for inspecting saved state without restoring
+        it into the solver.
+
+        Parameters
+        ----------
+        filename : str, optional
+            Input HDF5 filename. Default is "solver_state.h5".
+
+        Returns
+        -------
+        h5py.File
+            Open HDF5 file object in read mode.
+        """
+        return h5py.File(filename, "r")
+
+    def reset_fields(self):
+        """
+        Reset dynamic field arrays (E, H, J) to zero across the simulation.
+
+        Useful when reusing a ``SolverFIT3D`` instance for a new run without
+        reconstructing the entire object.
+        """
+        for d in ["x", "y", "z"]:
+            self.E[:, :, :, d] = 0.0
+            self.H[:, :, :, d] = 0.0
+            self.J[:, :, :, d] = 0.0
+
+    def update_logger(self, attrs):
+        """
+        Copy selected solver attributes into the internal ``Logger`` object.
+
+        Parameters
+        ----------
+        attrs : iterable of str
+            Names of attributes to copy to ``self.logger.solver``. Special case
+            'grid' copies the grid logger reference instead of a value.
+        """
+        for atr in attrs:
+            if atr == "grid":
+                self.logger.grid = self.grid.logger.grid
+            else:
+                self.logger.solver[atr] = getattr(self, atr)

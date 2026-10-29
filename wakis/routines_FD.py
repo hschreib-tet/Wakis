@@ -316,9 +316,15 @@ class RoutinesFDMixin:
         eigenvectors,
         wake=None,
         skip_cells=0,
+        include_sibc=False,
+        sibc_mode="resonance",
+        return_modal_parameters=False,
     ):
         """
-        Compute the longitudinal impedance from lossless electric eigenmodes.
+        Compute the longitudinal impedance from electric eigenmodes.
+
+        Optionally include diagonal first-order SIBC modal admittances,
+        evaluated at each eigenfrequency or at every evaluation frequency.
 
         The modal expansion is based on
 
@@ -347,6 +353,22 @@ class RoutinesFDMixin:
             Number of cells excluded at each end of the longitudinal
             integration path. Default is zero.
 
+        include_sibc : bool, optional
+            Include the diagonal SIBC perturbation for each PEC mode,
+            evaluated at its own eigenfrequency (narrowband approximation).
+            Default is False, matching the original lossless calculation.
+
+        sibc_mode : {"resonance", "frequency"}, optional
+            SIBC correction frequency evaluation: ``"resonance"`` freezes
+            each Y_n at its PEC eigenfrequency (fast narrowband model);
+            ``"frequency"`` evaluates Y_n(f) over the full spectrum.
+            Ignored if include_sibc=False.
+
+        return_modal_parameters : bool, optional
+            If True, also return a dictionary containing the complex
+            modal SIBC admittances, loss conductances, quality factors,
+            and first-order frequency shifts. Default is False.
+
         Returns
         -------
         Z_long : ndarray
@@ -356,6 +378,9 @@ class RoutinesFDMixin:
             Individual modal impedance contributions with shape
 
                 (n_modes, n_frequencies).
+
+        modal_parameters : dict, optional
+            Returned only if ``return_modal_parameters=True``.
         """
 
         frequencies = np.asarray(
@@ -562,22 +587,79 @@ class RoutinesFDMixin:
 
         omega_n = 2.0 * np.pi * eigenfrequencies
 
-        denominator = Cn[:, None] * (omega_n[:, None] ** 2 - omega[None, :] ** 2)
-
-        with np.errstate(
-            divide="ignore",
-            invalid="ignore",
-        ):
-            Z_modes = (
-                1j * omega[None, :] * test_coupling * source_coupling / denominator
-            )
-
-        Z_long = np.sum(
-            Z_modes,
-            axis=0,
+        # Parallel-LC modal admittance (same as the original lossless
+        # formula after multiplying numerator and denominator by j*omega).
+        Ln = 1.0 / (Cn * omega_n**2)
+        Y_lc = 1j * omega[None, :] * Cn[:, None] + 1.0 / (
+            1j * omega[None, :] * Ln[:, None]
         )
 
-        return (
-            Z_long,
-            Z_modes,
+        if sibc_mode not in ("resonance", "frequency"):
+            raise ValueError("sibc_mode must be 'resonance' or 'frequency'.")
+
+        # Reference admittances at each PEC eigenfrequency, for physical
+        # modal parameters Q_n and delta omega_n in either SIBC mode.
+        Yn = np.zeros(n_modes, dtype=np.complex128)
+        Y_sibc = np.zeros((n_modes, len(frequencies)), dtype=np.complex128)
+
+        if include_sibc:
+            if not getattr(self, "has_sibc", False):
+                raise ValueError(
+                    "include_sibc=True requires a solver with SIBC "
+                    "geometry (self.has_sibc is False)."
+                )
+
+            # Delta A(w) = C_red.T diag(Mnu*(1/D(w)-1)) C_red/(j*w)
+            # Project on PEC eigenvectors. Conjugation in |curl e|**2
+            # matches vdot(curl_n, DeltaM @ curl_n).
+            curls = self.C_red @ eigenvectors
+            curl_power = np.abs(curls) ** 2
+            mnu_diag = np.asarray(self.Mnu.diagonal())
+
+            def modal_sibc_admittance(omega_value):
+                D = self._build_sibc_diagonal(float(omega_value))
+                delta_mnu = mnu_diag * (1.0 / D - 1.0)
+                return (curl_power.T @ delta_mnu) / (1j * omega_value)
+
+            # Evaluate at resonance for diagnostics, irrespective of mode.
+            for n, omega_mode in enumerate(omega_n):
+                Yn[n] = modal_sibc_admittance(omega_mode)[n]
+
+            if sibc_mode == "resonance":
+                Y_sibc = np.broadcast_to(Yn[:, None], Y_sibc.shape)
+            else:
+                # No full FD linear solve is needed for this evaluation.
+                for i, omega_value in enumerate(omega):
+                    Y_sibc[:, i] = modal_sibc_admittance(omega_value)
+
+        Y_total = Y_lc + Y_sibc
+        with np.errstate(divide="ignore", invalid="ignore"):
+            Z_modes = test_coupling * source_coupling / Y_total
+
+        Z_long = np.sum(Z_modes, axis=0)
+
+        if not return_modal_parameters:
+            return Z_long, Z_modes
+
+        Gn = np.real(Yn)
+        Bn = np.imag(Yn)
+        Qn = np.full(n_modes, np.inf, dtype=float)
+        positive_loss = Gn > 0
+        Qn[positive_loss] = (
+            omega_n[positive_loss] * Cn[positive_loss] / Gn[positive_loss]
         )
+        # First-order shift; positive Im(delta_omega) denotes decay for
+        # the exp(+j*omega*t) convention.
+        delta_omega = 1j * Yn / (2.0 * Cn)
+        modal_parameters = {
+            "Cn": Cn,
+            "Ln": Ln,
+            "Yn": Yn,  # values at each eigenfrequency
+            "sibc_mode": sibc_mode,
+            "Gn": Gn,
+            "Bn": Bn,
+            "Qn": Qn,
+            "delta_omega": delta_omega,
+            "shift_hz": np.real(delta_omega) / (2.0 * np.pi),
+        }
+        return Z_long, Z_modes, modal_parameters

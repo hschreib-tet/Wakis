@@ -2568,28 +2568,22 @@ class GridFIT3D(PlotMixin):
                         node_index = None
                         target_region = None
 
-                        # ------------------------------
-                        # normal -> PEC
-                        #
-                        # Active normal fraction = alpha
-                        # ------------------------------
-                        if start_type == "normal" and end_type == "pec" and alpha < eta:
+                        # Normal -> conductor (PEC or SIBC)
+                        if (
+                            start_type == "normal"
+                            and end_type in ("pec", "sibc")
+                            and alpha < eta
+                        ):
                             node_index = start_index
-
                             target_region = end_region
 
-                        # ------------------------------
-                        # PEC -> normal
-                        #
-                        # Active normal fraction = 1-alpha
-                        # ------------------------------
+                        # Conductor -> Normal (PEC or SIBC)
                         elif (
-                            start_type == "pec"
+                            start_type in ("pec", "sibc")
                             and end_type == "normal"
                             and (1.0 - alpha) < eta
                         ):
                             node_index = end_index
-
                             target_region = start_region
 
                         if node_index is None:
@@ -2875,7 +2869,7 @@ class GridFIT3D(PlotMixin):
 
                     # normal -> PEC:
                     # interface at the PEC end point.
-                    if start_type == "normal" and end_type == "pec":
+                    if start_type == "normal" and end_type in ("pec", "sibc"):
                         metadata = snapped_points.get(end_index)
 
                         if metadata is not None and metadata["region_id"] == end_region:
@@ -2883,7 +2877,7 @@ class GridFIT3D(PlotMixin):
 
                     # PEC -> normal:
                     # interface at the PEC start point.
-                    elif start_type == "pec" and end_type == "normal":
+                    elif start_type in ("pec", "sibc") and end_type == "normal":
                         metadata = snapped_points.get(start_index)
 
                         if (
