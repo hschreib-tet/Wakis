@@ -1582,16 +1582,12 @@ class GridFIT3D(PlotMixin):
             "z": np.asarray(z, dtype=float),
         }[direction]
 
-        spacing = np.abs(np.diff(axis_coordinates))
+        spacing = np.diff(axis_coordinates)
 
-        positive_spacing = spacing[spacing > 0.0]
+        if np.any(spacing <= 0.0):
+            raise ValueError("Grid coordinates must be strictly increasing.")
 
-        if positive_spacing.size == 0:
-            raise RuntimeError(
-                f"No finite {direction}-edge length available on the {grid_type} grid."
-            )
-
-        line_extension = np.min(positive_spacing)
+        line_extension = np.min(spacing)
 
         if direction == "x":
             j, k = transverse_index
@@ -5015,20 +5011,14 @@ class GridFIT3D(PlotMixin):
                 self.geometry_mode = str(geometry_mode).lower()
 
             else:
-                # Backward compatibility:
-                # Files containing primal point masks were produced by
-                # the conformal geometry pipeline.
+                # Backward compatibility with older HDF5 files.
                 has_primal_point_masks = any(
                     name.startswith("grid_primal_points_") for name in hf.keys()
                 )
 
-                if has_primal_point_masks:
-                    self.geometry_mode = "conformal"
+                self.geometry_mode = "conformal" if has_primal_point_masks else "legacy"
 
-            if self.geometry_mode not in (
-                "legacy",
-                "conformal",
-            ):
+            if self.geometry_mode not in ("legacy", "conformal"):
                 raise ValueError(
                     f"Invalid geometry_mode stored in HDF5 file: {self.geometry_mode}"
                 )
