@@ -2885,6 +2885,148 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             "z": sigma_z,
         }
 
+        # ----------------------------------------------------------
+        # Geometry-based constitutive assignment (conformal FIT).
+        #
+        # Point averaging is retained only as a fallback for geometry
+        # configurations not yet represented by resolved interface data.
+        # For uncut edges with one normal region, use that region's
+        # material; for conductor-conductor primal edges, set ieps=0.
+        # For resolved conductor interfaces, use the *normal* part.
+        # Normal-normal material interfaces are handled afterwards by
+        # the existing diagonal-tensor approximation.
+        # ----------------------------------------------------------
+        if not self.region_material_types:
+            self._build_region_material_types()
+        if not hasattr(self, "region_material_properties"):
+            self._build_region_material_properties()
+
+        eps_regions = self.region_material_properties["eps_r"]
+        mu_regions = self.region_material_properties["mu_r"]
+        sigma_regions = self.region_material_properties["sigma"]
+        region_is_normal = np.zeros(len(eps_regions), dtype=bool)
+        region_is_conductor = np.zeros(len(eps_regions), dtype=bool)
+        for region_id, kind in self.region_material_types.items():
+            region_is_normal[region_id] = kind == "normal"
+            region_is_conductor[region_id] = kind in ("pec", "sibc")
+
+        for direction in ("x", "y", "z"):
+            # Electric DOFs correspond to primal edges.
+            start, end = self.grid._get_edge_region_ids("primal", direction)
+            start = self._edge_array_to_field_component(start, direction)
+            end = self._edge_array_to_field_component(end, direction)
+
+            same_normal = (start == end) & region_is_normal[start]
+            fully_conductor = region_is_conductor[start] & region_is_conductor[end]
+
+            # Assign the actual region material, not a four-point
+            # average that can be contaminated by a nearby PEC point.
+            eps_components[direction][same_normal] = (
+                eps_regions[start[same_normal]] * eps_0
+            )
+            sigma_components[direction][same_normal] = sigma_regions[start[same_normal]]
+
+            # Interior PEC/SIBC electric DOFs are eliminated through
+            # ieps=0, consistent with the existing material mask.
+            eps_components[direction][fully_conductor] = np.inf
+            sigma_components[direction][fully_conductor] = 0.0
+
+            primal_data = self.conformal_line_data.get("primal", {}).get(direction)
+            primal_mat = self.conformal_line_materials.get("primal", {}).get(direction)
+            if primal_data is not None and primal_mat is not None:
+                crossing_full = (
+                    primal_data["normal_to_conductor"]
+                    | primal_data["conductor_to_normal"]
+                )
+                crossing = self._edge_array_to_field_component(
+                    crossing_full, direction
+                ).astype(bool)
+                line_eps = self._edge_array_to_field_component(
+                    primal_mat["eps_r"], direction
+                )
+                line_sigma = self._edge_array_to_field_component(
+                    primal_mat["sigma"], direction
+                )
+                valid = (
+                    crossing
+                    & np.isfinite(line_eps)
+                    & (line_eps > 0.0)
+                    & np.isfinite(line_sigma)
+                    & (line_sigma >= 0.0)
+                )
+                eps_components[direction][valid] = line_eps[valid] * eps_0
+                sigma_components[direction][valid] = line_sigma[valid]
+
+            # The constitutive electric coefficient also belongs to the
+            # associated dual face. For conductor-cut dual faces use
+            # the already calculated normal-region surface material.
+            dual_face = self.conformal_face_data.get("dual", {}).get(direction)
+            dual_mat = self.conformal_face_materials.get("dual", {}).get(direction)
+            if dual_face is not None and dual_mat is not None:
+                cut_full = dual_face["normal_pec"] | dual_face["normal_sibc"]
+                cut = self._dual_face_array_to_primal_edge_component(
+                    cut_full, direction, fill_value=False
+                ).astype(bool)
+                face_eps = self._dual_face_array_to_primal_edge_component(
+                    dual_mat["eps_r"], direction
+                )
+                face_sigma = self._dual_face_array_to_primal_edge_component(
+                    dual_mat["sigma"], direction
+                )
+                valid = (
+                    cut
+                    & ~fully_conductor
+                    & np.isfinite(face_eps)
+                    & (face_eps > 0.0)
+                    & np.isfinite(face_sigma)
+                    & (face_sigma >= 0.0)
+                )
+                eps_components[direction][valid] = face_eps[valid] * eps_0
+                sigma_components[direction][valid] = face_sigma[valid]
+
+            # Magnetic DOFs correspond to dual edges and primal faces.
+            dual_start, dual_end = self.grid._get_edge_region_ids("dual", direction)
+            dual_start = self._edge_array_to_field_component(dual_start, direction)
+            dual_end = self._edge_array_to_field_component(dual_end, direction)
+            dual_same_normal = (dual_start == dual_end) & region_is_normal[dual_start]
+            mu_components[direction][dual_same_normal] = (
+                mu_regions[dual_start[dual_same_normal]] * mu_0
+            )
+
+            dual_data = self.conformal_line_data.get("dual", {}).get(direction)
+            dual_mat = self.conformal_line_materials.get("dual", {}).get(direction)
+            if dual_data is not None and dual_mat is not None:
+                crossing_full = (
+                    dual_data["normal_to_conductor"] | dual_data["conductor_to_normal"]
+                )
+                crossing = self._edge_array_to_field_component(
+                    crossing_full, direction
+                ).astype(bool)
+                line_mu = self._edge_array_to_field_component(
+                    dual_mat["mu_r"], direction
+                )
+                valid = crossing & np.isfinite(line_mu) & (line_mu > 0.0)
+                mu_components[direction][valid] = line_mu[valid] * mu_0
+
+            primal_face = self.conformal_face_data.get("primal", {}).get(direction)
+            primal_face_mat = self.conformal_face_materials.get("primal", {}).get(
+                direction
+            )
+            if primal_face is not None and primal_face_mat is not None:
+                cut_full = primal_face["normal_pec"] | primal_face["normal_sibc"]
+                cut = self._primal_face_array_to_dual_edge_component(
+                    cut_full, direction
+                ).astype(bool)
+                face_mu = self._primal_face_array_to_dual_edge_component(
+                    primal_face_mat["mu_r"], direction
+                )
+                valid = cut & np.isfinite(face_mu) & (face_mu > 0.0)
+                mu_components[direction][valid] = face_mu[valid] * mu_0
+
+        # The normal-normal diagonal approximation below deliberately
+        # takes precedence over the assignments above. Its purpose is
+        # to approximate anisotropic dielectric/magnetic interfaces.
+
         diagonal_materials = getattr(
             self,
             "conformal_diagonal_materials",
