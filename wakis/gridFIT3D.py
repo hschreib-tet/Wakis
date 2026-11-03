@@ -9,6 +9,7 @@ import warnings
 import h5py
 import numpy as np
 import pyvista as pv
+import vtk
 from scipy.ndimage import gaussian_filter
 from scipy.optimize import least_squares
 
@@ -1665,70 +1666,100 @@ class GridFIT3D(PlotMixin):
             if surface_id == 0:
                 continue
 
-            if key not in surface_cache:
-                surface_cache[key] = self.read_stl(key)
+        if key not in surface_cache:
+            surface_cache[key] = self.read_stl(key)
 
-            surface = surface_cache[key]
+        surface = surface_cache[key]
 
-            points, cell_ids = surface.ray_trace(
-                start_point,
-                end_point,
-                first_point=False,
+        # Cache one static locator per STL surface.
+        # It can be reused for all grid lines.
+        if not hasattr(self, "_conformal_stl_locators"):
+            self._conformal_stl_locators = {}
+
+        if key not in self._conformal_stl_locators:
+            locator = vtk.vtkStaticCellLocator()
+            locator.SetDataSet(surface)
+            locator.BuildLocator()
+
+            self._conformal_stl_locators[key] = locator
+
+        locator = self._conformal_stl_locators[key]
+
+        # Intersect the complete grid line with the STL.
+        vtk_points = vtk.vtkPoints()
+        vtk_cell_ids = vtk.vtkIdList()
+
+        locator.IntersectWithLine(
+            start_point,
+            end_point,
+            1e-8,
+            vtk_points,
+            vtk_cell_ids,
+        )
+
+        points = np.array(
+            [vtk_points.GetPoint(n) for n in range(vtk_points.GetNumberOfPoints())],
+            dtype=float,
+        ).reshape(-1, 3)
+
+        cell_ids = np.array(
+            [vtk_cell_ids.GetId(n) for n in range(vtk_cell_ids.GetNumberOfIds())],
+            dtype=int,
+        )
+
+        for point, cell_id in zip(
+            np.asarray(points, dtype=float),
+            np.asarray(cell_ids, dtype=int),
+        ):
+            result = self._locate_intersection_edge(
+                grid_type,
+                direction,
+                point,
+                alpha_tolerance=alpha_tolerance,
             )
 
-            for point, cell_id in zip(
-                np.asarray(points, dtype=float),
-                np.asarray(cell_ids, dtype=int),
-            ):
-                result = self._locate_intersection_edge(
-                    grid_type,
-                    direction,
-                    point,
-                    alpha_tolerance=alpha_tolerance,
+            if result is None:
+                continue
+
+            edge_axis_index, alpha = result
+
+            if direction == "x":
+                edge_index = (
+                    edge_axis_index,
+                    int(transverse_index[0]),
+                    int(transverse_index[1]),
                 )
 
-                if result is None:
-                    continue
-
-                edge_axis_index, alpha = result
-
-                if direction == "x":
-                    edge_index = (
-                        edge_axis_index,
-                        int(transverse_index[0]),
-                        int(transverse_index[1]),
-                    )
-
-                elif direction == "y":
-                    edge_index = (
-                        int(transverse_index[0]),
-                        edge_axis_index,
-                        int(transverse_index[1]),
-                    )
-
-                else:
-                    edge_index = (
-                        int(transverse_index[0]),
-                        int(transverse_index[1]),
-                        edge_axis_index,
-                    )
-
-                normal = self._get_triangle_normal(
-                    surface,
-                    cell_id,
+            elif direction == "y":
+                edge_index = (
+                    int(transverse_index[0]),
+                    edge_axis_index,
+                    int(transverse_index[1]),
                 )
 
-                hit = {
-                    "alpha": alpha,
-                    "surface_id": int(surface_id),
-                    "cell_id": int(cell_id),
-                    "normal": normal,
-                }
+            else:
+                edge_index = (
+                    int(transverse_index[0]),
+                    int(transverse_index[1]),
+                    edge_axis_index,
+                )
 
-                edge_hits.setdefault(
-                    edge_index,
-                    [],
-                ).append(hit)
+            normal = self._get_triangle_normal(
+                surface,
+                cell_id,
+            )
+
+            hit = {
+                "alpha": alpha,
+                "surface_id": int(surface_id),
+                "cell_id": int(cell_id),
+                "normal": normal,
+            }
+
+            edge_hits.setdefault(
+                edge_index,
+                [],
+            ).append(hit)
 
         return edge_hits
 
