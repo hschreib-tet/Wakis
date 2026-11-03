@@ -3,6 +3,8 @@
 # Copyright (c) CERN, 2024.                   #
 # ########################################### #
 
+import warnings
+
 import numpy as np
 from scipy.sparse import diags
 from scipy.sparse.linalg import eigsh, spsolve
@@ -91,17 +93,76 @@ class SolverFIT3D_FD(
             alpha_fraction = np.asarray(
                 line_data["effective_length_fraction"], dtype=float
             )
-            invalid = crossing & (
-                ~resolved | ~np.isfinite(alpha_fraction) | (alpha_fraction <= 0.0)
+            # Conductor crossings without a usable conformal line fraction
+            unresolved = crossing & (~resolved | ~np.isfinite(alpha_fraction))
+
+            # Resolved crossings with zero or negative active length
+            zero_length = (
+                crossing
+                & resolved
+                & np.isfinite(alpha_fraction)
+                & (alpha_fraction <= 0.0)
             )
 
-            # The full arrays include high-side edges absent from Field.
-            # Only validate edges that actually belong to the solver DOFs.
-            invalid_stored = self._edge_array_to_field_component(invalid, direction)
-            if np.any(invalid_stored):
+            unresolved_stored = self._edge_array_to_field_component(
+                unresolved, direction
+            )
+
+            zero_length_stored = self._edge_array_to_field_component(
+                zero_length, direction
+            )
+
+            n_unresolved = np.count_nonzero(unresolved_stored)
+            n_zero = np.count_nonzero(zero_length_stored)
+
+            if n_unresolved:
+                # Conservative fallback: only PEC is handled here.
+                # SIBC needs a separate treatment.
+                unresolved_sibc = unresolved & (
+                    (
+                        start_conductor
+                        & np.isin(
+                            start_ids,
+                            [
+                                rid
+                                for rid, kind in self.region_material_types.items()
+                                if kind == "sibc"
+                            ],
+                        )
+                    )
+                    | (
+                        end_conductor
+                        & np.isin(
+                            end_ids,
+                            [
+                                rid
+                                for rid, kind in self.region_material_types.items()
+                                if kind == "sibc"
+                            ],
+                        )
+                    )
+                )
+
+                if np.any(
+                    self._edge_array_to_field_component(unresolved_sibc, direction)
+                ):
+                    raise RuntimeError(
+                        f"Unresolved SIBC geometry on stored {direction}-edges."
+                    )
+
+                warnings.warn(
+                    f"{n_unresolved} unresolved PEC crossings on "
+                    f"stored {direction}-edges. "
+                    "Using full edge lengths as a fallback, "
+                    "consistent with the TD metric fallback.",
+                    RuntimeWarning,
+                )
+
+            if n_zero:
                 raise RuntimeError(
-                    f"Unsupported normal-to-conductor geometry on "
-                    f"{np.count_nonzero(invalid_stored)} stored {direction}-edges."
+                    f"{n_zero} resolved conductor crossings with "
+                    f"non-positive active length on "
+                    f"stored {direction}-edges."
                 )
 
             active_component = self._edge_array_to_field_component(
