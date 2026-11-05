@@ -336,9 +336,14 @@ class SolverFIT3D_FD(
                 region_id = int(segment["surface_id"])
                 if self.region_material_types[region_id] != "sibc":
                     continue
-                if not classified["normal_sibc"][index] or not geom["resolved"][index]:
+                # Ignore SIBC interfaces without an adjacent normal region.
+                if not classified["normal_sibc"][index]:
+                    continue
+
+                # A real normal-SIBC interface must be geometrically resolved.
+                if not geom["resolved"][index]:
                     raise RuntimeError(
-                        f"Unresolved/unsupported SIBC face: primal {direction} {index}"
+                        f"Unresolved SIBC face: primal {direction} {index}"
                     )
                 field_ids = classified["normal_region_ids"][index]
                 wall_ids = classified["conductor_region_ids"][index]
@@ -368,7 +373,9 @@ class SolverFIT3D_FD(
                     or field_material[1] <= 0
                 ):
                     raise ValueError(f"Invalid SIBC material: {direction} {index}")
-                g[index] = length * sin_theta / area
+                # g[index] = length * sin_theta / area
+                g[index] = length / (area * sin_theta)
+                # g[index] = length * 1 / area
                 sig[index] = wall_material[2]
                 mu_wall[index] = wall_material[1]
                 mu_field[index] = field_material[1]
