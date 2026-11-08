@@ -96,13 +96,19 @@ class RoutinesFDMixin:
         xt = self.wake.xtest
         yt = self.wake.ytest
 
-        ixs = np.abs(self.x - xs).argmin()
+        # Ez(i, j, :) lies on the primal grid lines (grid.x[i], grid.y[j]),
+        # as for the time-domain beam source; self.x / self.y are cell
+        # centres and would shift the beam by half a cell or more.
+        x_ez = self.grid.x[: self.Nx]
+        y_ez = self.grid.y[: self.Ny]
 
-        iys = np.abs(self.y - ys).argmin()
+        ixs = np.abs(x_ez - xs).argmin()
 
-        ixt = np.abs(self.x - xt).argmin()
+        iys = np.abs(y_ez - ys).argmin()
 
-        iyt = np.abs(self.y - yt).argmin()
+        ixt = np.abs(x_ez - xt).argmin()
+
+        iyt = np.abs(y_ez - yt).argmin()
 
         # ----------------------------------------------------------
         # Frequencies to solve
@@ -413,13 +419,17 @@ class RoutinesFDMixin:
 
         velocity = beta * c_light
 
-        ixs = np.abs(self.x - self.wake.xsource).argmin()
+        # Ez lines on the primal grid lines (see impedance_sweep).
+        x_ez = self.grid.x[: self.Nx]
+        y_ez = self.grid.y[: self.Ny]
 
-        iys = np.abs(self.y - self.wake.ysource).argmin()
+        ixs = np.abs(x_ez - self.wake.xsource).argmin()
 
-        ixt = np.abs(self.x - self.wake.xtest).argmin()
+        iys = np.abs(y_ez - self.wake.ysource).argmin()
 
-        iyt = np.abs(self.y - self.wake.ytest).argmin()
+        ixt = np.abs(x_ez - self.wake.xtest).argmin()
+
+        iyt = np.abs(y_ez - self.wake.ytest).argmin()
 
         # ----------------------------------------------------------
         # Longitudinal integration path
