@@ -151,8 +151,9 @@ def test_dual_face_mapping_matches_curl_transpose(plain_solver):
 
 def test_cut_areas_and_face_materials_use_same_dofs(tmp_path):
     """
-    Inclined PEC plane: every DOF with a reduced face area must be the DOF
-    that receives the material of that same cut face, and vice versa.
+    Inclined PEC plane: every H DOF with a reduced primal face area must be
+    the DOF that receives the material of that same cut face, and vice
+    versa. Conductor walls leave the dual grid uncut.
     """
     stl_file = tmp_path / "inclined_pec.stl"
     surface = pv.Box(bounds=(-3, 3, -3, 3, -6, 0.0)).triangulate()
@@ -190,18 +191,18 @@ def test_cut_areas_and_face_materials_use_same_dofs(tmp_path):
     )
 
     for d in AXES:
-        dual_cut = solver.conformal_face_data["dual"][d]["normal_pec"]
-        e_material = solver._dual_face_array_to_primal_edge_component(
-            dual_cut, d, fill_value=False
-        ).astype(bool)
-        e_area = solver.tA_fraction.to_matrix(d) < 1.0 - 1e-12
-
         primal_cut = solver.conformal_face_data["primal"][d]["normal_pec"]
         h_material = solver._primal_face_array_to_dual_edge_component(
             primal_cut, d
         ).astype(bool)
         h_area = solver.A_fraction.to_matrix(d) < 1.0 - 1e-12
 
-        assert np.any(e_area) and np.any(h_area)
-        np.testing.assert_array_equal(e_area, e_material)
+        assert np.any(h_area)
         np.testing.assert_array_equal(h_area, h_material)
+
+        # No dual intersections or cut dual faces at a PEC wall.
+        assert not np.any(grid.interface_intersections["dual"][d]["has_crossing"])
+        assert not np.any(solver.conformal_face_data["dual"][d]["normal_pec"])
+
+    np.testing.assert_array_equal(solver.tL.toarray(), grid.tL.toarray())
+    np.testing.assert_array_equal(solver.itA.toarray(), grid.itA.toarray())

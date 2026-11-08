@@ -67,7 +67,10 @@ class GridFIT3D(PlotMixin):
         stl_method="legacy",
         geometry_mode="legacy",
         bg_material_type=None,
-        conformal_pec_snap_fraction=0.0,
+        conformal_stabilization=None,
+        conformal_stabilization_fraction=None,
+        conformal_min_edge_fraction=None,
+        conformal_pec_snap_fraction=None,
         subpixel_smoothing=False,
         subpixel_smoothing_factor=4,
         subpixel_smoothing_threshold=0.3,
@@ -157,10 +160,35 @@ class GridFIT3D(PlotMixin):
             Material treatment of region 0. Required by the conformal
             geometry pipeline when PEC snapping is enabled. Default is
             None.
+        conformal_stabilization : {None, "snapping", "area_floor"}, optional
+            Treatment of small cut cells at PEC/SIBC walls in conformal mode,
+            which otherwise limit the stable time step. Default is None.
+
+            ``"snapping"``: normal-conductor edges whose active normal
+            fraction is below ``conformal_stabilization_fraction`` are
+            removed by moving the wall onto the adjacent grid point. This
+            changes the discretized geometry by up to fraction * cell size.
+
+            ``"area_floor"``: the geometry is kept. In the time-stepping
+            metric, primal faces cut by a conductor use at least
+            ``conformal_stabilization_fraction`` as area fraction (relaxed
+            Dey-Mittra), and edges with an active fraction below
+            ``conformal_min_edge_fraction`` are treated as inside the
+            conductor. Without the edge elimination, raised areas next to
+            nearly covered edges create spurious low-frequency modes.
+        conformal_stabilization_fraction : float, optional
+            Snapping: minimum active normal edge fraction, 0 < value < 0.5.
+            Area floor: minimum area fraction of conductor-cut faces,
+            0 < value <= 1. Default is 0.1 for both.
+        conformal_min_edge_fraction : float, optional
+            Area floor only: conductor-cut edges with a smaller active
+            fraction are eliminated (E set to zero), 0 <= value < 0.5.
+            Default (None) uses the area floor value. With this choice no
+            spurious localized modes were found while the mesh resolves the
+            wavelength with at least about 6 cells.
         conformal_pec_snap_fraction : float, optional
-            Minimum active normal edge fraction at normal-PEC interfaces.
-            Smaller normal fractions are removed by snapping the interface
-            onto the adjacent grid point. Default is 0.0 (disabled).
+            Deprecated. Equivalent to ``conformal_stabilization="snapping"``
+            with ``conformal_stabilization_fraction`` set to this value.
 
         Attributes
         ----------
@@ -208,23 +236,12 @@ class GridFIT3D(PlotMixin):
                     f"{VALID_MATERIAL_TYPES}."
                 )
 
-        self.conformal_pec_snap_fraction = float(conformal_pec_snap_fraction)
-
-        if (
-            self.geometry_mode == "conformal"
-            and self.conformal_pec_snap_fraction > 0.0
-            and self.bg_material_type is None
-        ):
-            raise ValueError(
-                "Conformal PEC snapping requires "
-                "bg_material_type to be specified "
-                "in GridFIT3D."
-            )
-
-        if not (0.0 <= self.conformal_pec_snap_fraction < 0.5):
-            raise ValueError(
-                "conformal_pec_snap_fraction must satisfy 0 <= value < 0.5."
-            )
+        self._set_conformal_stabilization(
+            conformal_stabilization,
+            conformal_stabilization_fraction,
+            conformal_min_edge_fraction,
+            conformal_pec_snap_fraction,
+        )
 
         # Primary and dual edges whose endpoints belong to different regions
         self.interface_edge_masks = {
@@ -559,8 +576,107 @@ class GridFIT3D(PlotMixin):
                 stl_tol=self.stl_tol,
                 geometry_mode=self.geometry_mode,
                 stl_method=self.stl_method,
+                bg_material_type=self.bg_material_type,
+                conformal_stabilization=self.conformal_stabilization,
+                conformal_stabilization_fraction=self._get_stabilization_fraction(),
+                conformal_min_edge_fraction=self.conformal_min_edge_fraction or None,
             )
         return _grid
+
+    def _get_stabilization_fraction(self):
+        """Fraction of the active small-cut-cell treatment (None if off)."""
+        if self.conformal_stabilization == "snapping":
+            return self.conformal_pec_snap_fraction
+        if self.conformal_stabilization == "area_floor":
+            return self.conformal_area_floor
+        return None
+
+    def _set_conformal_stabilization(
+        self,
+        method,
+        fraction,
+        min_edge_fraction,
+        legacy_snap_fraction,
+    ):
+        """
+        Validate and store the small-cut-cell treatment.
+
+        Sets ``conformal_stabilization`` ("none", "snapping" or
+        "area_floor"), ``conformal_pec_snap_fraction`` (used by snapping),
+        ``conformal_area_floor`` and ``conformal_min_edge_fraction`` (used
+        by the solver for the area floor). Unused values are 0.
+        """
+        if legacy_snap_fraction is not None and float(legacy_snap_fraction) > 0.0:
+            warnings.warn(
+                "conformal_pec_snap_fraction is deprecated; use "
+                "conformal_stabilization='snapping' and "
+                "conformal_stabilization_fraction instead.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+
+            if method not in (None, "snapping"):
+                raise ValueError(
+                    "conformal_pec_snap_fraction cannot be combined with "
+                    f"conformal_stabilization={method!r}."
+                )
+
+            if fraction is not None and float(fraction) != float(legacy_snap_fraction):
+                raise ValueError(
+                    "Conflicting conformal_pec_snap_fraction and "
+                    "conformal_stabilization_fraction."
+                )
+
+            method = "snapping"
+            fraction = float(legacy_snap_fraction)
+
+        method = "none" if method is None else str(method).lower()
+
+        if method not in ("none", "snapping", "area_floor"):
+            raise ValueError(
+                "conformal_stabilization must be None, 'snapping' or 'area_floor'."
+            )
+
+        fraction = 0.1 if fraction is None else float(fraction)
+        min_edge_fraction = (
+            min(fraction, 0.49)
+            if min_edge_fraction is None
+            else float(min_edge_fraction)
+        )
+
+        self.conformal_stabilization = method
+        self.conformal_pec_snap_fraction = 0.0
+        self.conformal_area_floor = 0.0
+        self.conformal_min_edge_fraction = 0.0
+
+        if method == "snapping":
+            if not (0.0 < fraction < 0.5):
+                raise ValueError(
+                    "Snapping requires 0 < conformal_stabilization_fraction < 0.5."
+                )
+
+            if self.geometry_mode == "conformal" and self.bg_material_type is None:
+                raise ValueError(
+                    "Conformal PEC snapping requires "
+                    "bg_material_type to be specified "
+                    "in GridFIT3D."
+                )
+
+            self.conformal_pec_snap_fraction = fraction
+
+        elif method == "area_floor":
+            if not (0.0 < fraction <= 1.0):
+                raise ValueError(
+                    "Area floor requires 0 < conformal_stabilization_fraction <= 1."
+                )
+
+            if not (0.0 <= min_edge_fraction < 0.5):
+                raise ValueError(
+                    "conformal_min_edge_fraction must satisfy 0 <= value < 0.5."
+                )
+
+            self.conformal_area_floor = fraction
+            self.conformal_min_edge_fraction = min_edge_fraction
 
     def _prepare_stl_material_types(self):
         """
@@ -2074,17 +2190,54 @@ class GridFIT3D(PlotMixin):
             key=priority,
         )
 
+    def _get_region_normal_flags(self):
+        """
+        Return a boolean array: True where a region ID is a normal material.
+
+        If ``bg_material_type`` is not given, the background is treated as
+        normal. This is conservative: it can only add dual-grid work, never
+        drop a normal-normal interface.
+        """
+        flags = np.zeros(len(self.region_id_to_key), dtype=bool)
+
+        flags[0] = self.bg_material_type in (None, "normal")
+
+        for region_id, key in self.region_id_to_key.items():
+            if region_id == 0:
+                continue
+            flags[region_id] = self.stl_material_types[key] == "normal"
+
+        return flags
+
+    def _get_normal_normal_edge_mask(self, grid_type, direction):
+        """
+        Edges whose two endpoints lie in different normal-material regions.
+        """
+        start, end = self._get_edge_region_ids(grid_type, direction)
+        is_normal = self._get_region_normal_flags()
+
+        return (start != end) & is_normal[start] & is_normal[end]
+
     def _build_interface_intersections(
         self,
         alpha_tolerance=1e-8,
     ):
         """
-        Compute all STL intersections with primal and dual grid edges.
+        Compute STL intersections with primal and dual grid edges.
 
         Intersections are obtained by tracing complete grid lines through all
         STL surfaces. Therefore, intersections are also detected when an STL
         region is thinner than one grid edge and both edge endpoints belong
         to the same effective region.
+
+        Primal grid: all interfaces are traced. They define the conformal
+        cuts at PEC/SIBC walls and the material interfaces.
+
+        Dual grid: only edges between two different normal materials are
+        kept, and only grid lines containing such edges are traced. Dual
+        intersections are needed solely for the effective materials at
+        dielectric/magnetic interfaces; PEC/SIBC walls never cut the dual
+        metrics.
         """
         surface_cache = {}
 
@@ -2172,6 +2325,17 @@ class GridFIT3D(PlotMixin):
 
                 raw_hits = {}
 
+                # Dual grid: restrict to normal-normal interface edges and
+                # trace only the grid lines that contain such edges.
+                if grid_type == "dual":
+                    scope = self._get_normal_normal_edge_mask(grid_type, direction)
+                    traced_lines = np.any(scope, axis="xyz".index(direction))
+                    transverse_indices = (
+                        index for index in transverse_indices if traced_lines[index]
+                    )
+                else:
+                    scope = None
+
                 for transverse_index in transverse_indices:
                     line_hits = self._trace_grid_line(
                         grid_type,
@@ -2182,6 +2346,9 @@ class GridFIT3D(PlotMixin):
                     )
 
                     for edge_index, hits in line_hits.items():
+                        if scope is not None and not scope[edge_index]:
+                            continue
+
                         raw_hits.setdefault(
                             edge_index,
                             [],
@@ -2483,6 +2650,9 @@ class GridFIT3D(PlotMixin):
 
         The operation is monotonic: normal points may become PEC,
         but PEC points are never converted back to normal.
+
+        Only the primal grid is snapped. Conductor walls do not cut the dual
+        metrics, so dual points keep their geometric classification.
         """
         eta = self.conformal_pec_snap_fraction
 
@@ -2531,10 +2701,7 @@ class GridFIT3D(PlotMixin):
 
             # Rebuild endpoint topology from the current
             # effective point regions.
-            for grid_type in (
-                "primal",
-                "dual",
-            ):
+            for grid_type in ("primal",):
                 self.interface_edge_masks[grid_type] = (
                     self._build_edge_transition_masks(self.region_ids[grid_type])
                 )
@@ -2542,10 +2709,7 @@ class GridFIT3D(PlotMixin):
             # ------------------------------------------------------
             # Find small active normal portions.
             # ------------------------------------------------------
-            for grid_type in (
-                "primal",
-                "dual",
-            ):
+            for grid_type in ("primal",):
                 for direction in (
                     "x",
                     "y",
@@ -2642,10 +2806,7 @@ class GridFIT3D(PlotMixin):
             # ------------------------------------------------------
             n_changes = 0
 
-            for grid_type in (
-                "primal",
-                "dual",
-            ):
+            for grid_type in ("primal",):
                 regions = self.region_ids[grid_type]
 
                 for (
@@ -2973,6 +3134,12 @@ class GridFIT3D(PlotMixin):
                 "z",
             ):
                 endpoint_mask = self.interface_edge_masks[grid_type][direction]
+
+                # Dual intersections only exist for normal-normal edges.
+                if grid_type == "dual":
+                    endpoint_mask = endpoint_mask & self._get_normal_normal_edge_mask(
+                        grid_type, direction
+                    )
 
                 resolved_mask = self.resolved_interface_edge_masks[grid_type][direction]
 
