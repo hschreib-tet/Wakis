@@ -310,7 +310,9 @@ class SolverFIT3D_FD(
 
         First-order approximation: H is taken tangential to the wall, with
         its face-normal component as the FIT unknown. Geometry coefficient
-        g = cut_length / (active_face_area * sin(theta)).
+        g = cut_length / (active_face_area * sin(theta)), where the active
+        face area is the one used in Mnu (floored with the area-floor
+        treatment), so both terms convert b -> H identically.
         The normal-region permeability used in the conversion b -> H is saved
         separately; SIBC material permeability belongs in Zs, not here.
         """
@@ -355,7 +357,19 @@ class SolverFIT3D_FD(
                     or wall_ids[0] != region_id
                 ):
                     raise RuntimeError(f"Ambiguous SIBC interface: {direction} {index}")
-                area = float(geom["region_areas"][index][field_ids[0]])
+                # Use the same face area as the reluctance matrix Mnu (iDa),
+                # i.e. the area that converts b -> H in the regular FIT
+                # term. With conformal_stabilization="area_floor" this is the
+                # floored area; the SIBC term must use the same H.
+                if index[axis] < (self.Nx, self.Ny, self.Nz)[axis]:
+                    area = 1.0 / float(self.iA.to_matrix(direction)[index])
+                else:
+                    # High-side face without stored H DOF (dropped below).
+                    area = max(
+                        float(geom["region_areas"][index][field_ids[0]]),
+                        getattr(self, "conformal_area_floor", 0.0)
+                        * float(geom["face_area"][index]),
+                    )
                 normal = np.asarray(segment["normal"], dtype=float)
                 length = float(segment["length"])
                 if normal.shape != (3,) or not np.all(np.isfinite(normal)):
