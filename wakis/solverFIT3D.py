@@ -280,21 +280,18 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         self.tL = self.grid.tL
         self.itA = self.grid.itA
 
+        # Conformal PEC/SIBC cuts modify only the primal metrics (edge
+        # lengths L and face areas A), as in Dey-Mittra-type schemes. The
+        # dual metrics tL and itA keep their full grid values: cutting them
+        # as well removes the conductor volume twice, which lowers the
+        # stable time step and the accuracy.
         self.L_fraction = None
-        self.tL_fraction = None
         self.L_eff = None
-        self.tL_eff = None
 
         self.A_fraction = None
-        self.tA_fraction = None
         self.A_eff = None
-        self.tA_eff = None
 
-        if (
-            use_stl
-            and self.conformal_line_data["primal"]
-            and self.conformal_line_data["dual"]
-        ):
+        if use_stl and self.conformal_line_data["primal"]:
             self._build_conformal_effective_lengths()
 
         if (
@@ -329,15 +326,13 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             )
             == "conformal"
             and self.L_eff is not None
-            and self.tL_eff is not None
             and self.A_eff is not None
-            and self.tA_eff is not None
         ):
             # ----------------------------------------------------------
-            # Activate conformal geometry metrics.
+            # Activate conformal primal metrics.
             #
-            # From this point on, self.L, self.tL, self.iA and self.itA
-            # represent the metrics actually used by the solver.
+            # From this point on, self.L and self.iA represent the
+            # metrics actually used by the solver.
             # ----------------------------------------------------------
 
             self.L = Field(
@@ -346,27 +341,13 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
                 self.Nz,
             )
 
-            self.tL = Field(
-                self.Nx,
-                self.Ny,
-                self.Nz,
-            )
-
             self.L.fromarray(self.L_eff.toarray().copy())
 
-            self.tL.fromarray(self.tL_eff.toarray().copy())
-
             A_values = self.A_eff.toarray()
-            tA_values = self.tA_eff.toarray()
 
             if np.any(A_values <= 0.0):
                 raise RuntimeError(
                     "Conformal primal effective face area must be positive."
-                )
-
-            if np.any(tA_values <= 0.0):
-                raise RuntimeError(
-                    "Conformal dual effective face area must be positive."
                 )
 
             self.iA = Field(
@@ -375,15 +356,7 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
                 self.Nz,
             )
 
-            self.itA = Field(
-                self.Nx,
-                self.Ny,
-                self.Nz,
-            )
-
             self.iA.fromarray(1.0 / A_values)
-
-            self.itA.fromarray(1.0 / tA_values)
 
         self.update_logger(["grid", "background", "bg_material_type"])
 
@@ -1149,7 +1122,7 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
 
         Material properties are averaged only over the active normal
         portion of each face. Geometric area reduction is handled
-        separately through A_eff / tA_eff.
+        separately through A_eff.
 
         Primal faces:
             mu_r
@@ -2282,210 +2255,90 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
 
     def _build_conformal_effective_lengths(self):
         """
-        Build effective primal and dual edge lengths for the current
-        conformal single-crossing treatment.
+        Build effective primal edge lengths at conformal conductor cuts.
 
-        Normal-normal edges retain their full length.
+        Normal-normal edges retain their full length. Normal-PEC/SIBC edges
+        retain only the fraction of the edge in the normal region. Hidden,
+        missing and unsupported interface cases keep their grid length.
 
-        Normal-PEC/SIBC edges retain only the fraction of the edge in the
-        normal region.
-
-        Hidden, missing, and currently unsupported interface cases retain
-        their original grid length.
-
-        The original grid metrics self.L and self.tL are not modified.
+        Dual edge lengths are never cut (Dey-Mittra-type treatment).
+        The original grid metric self.L is not modified.
         """
-        self.L_fraction = Field(
-            self.Nx,
-            self.Ny,
-            self.Nz,
-        )
+        self.L_fraction = Field(self.Nx, self.Ny, self.Nz)
+        self.L_eff = Field(self.Nx, self.Ny, self.Nz)
 
-        self.tL_fraction = Field(
-            self.Nx,
-            self.Ny,
-            self.Nz,
-        )
+        for direction in ("x", "y", "z"):
+            line_data = self.conformal_line_data["primal"][direction]
 
-        self.L_eff = Field(
-            self.Nx,
-            self.Ny,
-            self.Nz,
-        )
+            full_fraction = np.ones(
+                line_data["effective_length_fraction"].shape,
+                dtype=float,
+            )
 
-        self.tL_eff = Field(
-            self.Nx,
-            self.Ny,
-            self.Nz,
-        )
+            supported = line_data["supported"]
 
-        for (
-            grid_type,
-            base_lengths,
-            fraction_field,
-            effective_lengths,
-        ) in (
-            (
-                "primal",
-                self.L,
+            full_fraction[supported] = line_data["effective_length_fraction"][supported]
+
+            field_fraction = self._edge_array_to_field_component(
+                full_fraction,
+                direction,
+            )
+
+            setattr(
                 self.L_fraction,
+                f"field_{direction}",
+                field_fraction.copy(),
+            )
+
+            setattr(
                 self.L_eff,
-            ),
-            (
-                "dual",
-                self.tL,
-                self.tL_fraction,
-                self.tL_eff,
-            ),
-        ):
-            for direction in (
-                "x",
-                "y",
-                "z",
-            ):
-                line_data = self.conformal_line_data[grid_type][direction]
-
-                full_fraction = np.ones(
-                    line_data["effective_length_fraction"].shape,
-                    dtype=float,
-                )
-
-                supported = line_data["supported"]
-
-                full_fraction[supported] = line_data["effective_length_fraction"][
-                    supported
-                ]
-
-                if grid_type == "primal":
-                    field_fraction = self._edge_array_to_field_component(
-                        full_fraction,
-                        direction,
-                    )
-                else:
-                    # Low-side half dual edges are never cut here.
-                    field_fraction = self._dual_edge_array_to_field_component(
-                        full_fraction,
-                        direction,
-                        fill_value=1.0,
-                    )
-
-                base_component = base_lengths.to_matrix(direction)
-
-                setattr(
-                    fraction_field,
-                    f"field_{direction}",
-                    field_fraction.copy(),
-                )
-
-                setattr(
-                    effective_lengths,
-                    f"field_{direction}",
-                    (base_component * field_fraction),
-                )
+                f"field_{direction}",
+                self.L.to_matrix(direction) * field_fraction,
+            )
 
     def _build_conformal_effective_areas(self):
         """
-        Build effective primal and dual face areas from conformal
-        interface-area fractions.
+        Build effective primal face areas from conformal interface-area
+        fractions. Hx(i,j,k) belongs to primal x-face (i,j,k).
 
-        Original grid metrics self.iA and self.itA remain unchanged.
+        Dual face areas are never cut (Dey-Mittra-type treatment).
+        The original grid metric self.iA is not modified.
         """
-        self.A_fraction = Field(
-            self.Nx,
-            self.Ny,
-            self.Nz,
-        )
+        self.A_fraction = Field(self.Nx, self.Ny, self.Nz)
+        self.A_eff = Field(self.Nx, self.Ny, self.Nz)
 
-        self.tA_fraction = Field(
-            self.Nx,
-            self.Ny,
-            self.Nz,
-        )
+        for direction in ("x", "y", "z"):
+            data = self.conformal_face_data["primal"][direction]
 
-        self.A_eff = Field(
-            self.Nx,
-            self.Ny,
-            self.Nz,
-        )
+            # Unsupported/unresolved faces retain their original area.
+            full_fraction = np.ones(
+                data["supported"].shape,
+                dtype=float,
+            )
 
-        self.tA_eff = Field(
-            self.Nx,
-            self.Ny,
-            self.Nz,
-        )
+            supported = data["supported"]
 
-        configurations = (
-            (
-                "primal",
+            full_fraction[supported] = data["effective_area_fraction"][supported]
+
+            field_fraction = self._face_array_to_field_component(
+                full_fraction,
+                direction,
+            )
+
+            # Grid stores inverse face areas.
+            base_area = np.divide(1.0, self.iA.to_matrix(direction))
+
+            setattr(
                 self.A_fraction,
+                f"field_{direction}",
+                field_fraction.copy(),
+            )
+
+            setattr(
                 self.A_eff,
-                self.iA,
-            ),
-            (
-                "dual",
-                self.tA_fraction,
-                self.tA_eff,
-                self.itA,
-            ),
-        )
-
-        for (
-            grid_type,
-            fraction_field,
-            effective_area_field,
-            inverse_area_field,
-        ) in configurations:
-            for direction in (
-                "x",
-                "y",
-                "z",
-            ):
-                data = self.conformal_face_data[grid_type][direction]
-
-                # Unsupported/unresolved faces retain their
-                # original area for now.
-                full_fraction = np.ones(
-                    data["supported"].shape,
-                    dtype=float,
-                )
-
-                supported = data["supported"]
-
-                full_fraction[supported] = data["effective_area_fraction"][supported]
-
-                if grid_type == "primal":
-                    # Hx(i,j,k) <-> primal x-face (i,j,k).
-                    field_fraction = self._face_array_to_field_component(
-                        full_fraction,
-                        direction,
-                    )
-                else:
-                    # Ex(i,j,k) <-> dual x-face (i,j-1,k-1), as defined by
-                    # C^T. This is the same face used for the electric face
-                    # materials. Truncated low-side dual faces stay uncut.
-                    field_fraction = self._dual_face_array_to_primal_edge_component(
-                        full_fraction,
-                        direction,
-                        fill_value=1.0,
-                    )
-
-                # Grid stores inverse face areas.
-                base_area = np.divide(
-                    1.0,
-                    inverse_area_field.to_matrix(direction),
-                )
-
-                setattr(
-                    fraction_field,
-                    f"field_{direction}",
-                    field_fraction.copy(),
-                )
-
-                setattr(
-                    effective_area_field,
-                    f"field_{direction}",
-                    (base_area * field_fraction),
-                )
+                f"field_{direction}",
+                base_area * field_fraction,
+            )
 
     def _move_CPML_to_mkl(self):
         self.dxy = mkl_sparse_mat(self.dxy)
@@ -2651,6 +2504,118 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         self.tDsiDmuiDaC = self.iDa * self.iDmu * self.C * self.Ds
         self.itDaiDepsDstC = self.iDeps * self.itDa * self.C.transpose() * self.tDs
         self.step_0 = False
+
+    def compute_stable_timestep(self, n_report=10, tol=1e-6, verbose=True):
+        """
+        Compute the exact maximal stable time step of the leapfrog update.
+
+        The explicit FIT update
+
+            H^{n+1/2} = H^{n-1/2} - dt * iDa iDmu C Ds e^n
+            e^{n+1}   = e^n + dt * iDeps itDa C^T tDs H^{n+1/2}
+
+        is stable if dt < 2 / omega_max, where omega_max^2 is the largest
+        eigenvalue of Meps^-1 C^T Mnu C with the diagonal matrices
+
+            Meps^-1 = Ds iDeps itDa,     Mnu = tDs iDmu iDa.
+
+        The eigenvalue is computed from the symmetric form
+        S = Meps^-1/2 C^T Mnu C Meps^-1/2, using the operators of the
+        current solver (including boundary conditions, conformal metrics
+        and materials). Losses (sigma) and CPML terms are not included.
+
+        Parameters
+        ----------
+        n_report : int, optional
+            Number of electric and magnetic DOFs reported in which the
+            limiting (fastest) mode is concentrated.
+        tol : float, optional
+            Relative tolerance of the eigenvalue solver.
+        verbose : bool, optional
+            Print a short summary.
+
+        Returns
+        -------
+        dict
+            ``dt_max``, ``omega_max``, ``dt`` (current solver time step),
+            ``dt_ratio`` (dt / dt_max, must be < 1), ``dt_cfl`` (standard
+            CFL limit of the uncut grid), ``stable`` and the lists
+            ``top_E`` / ``top_H`` with (component, (i, j, k), energy share).
+        """
+        from scipy.sparse.linalg import eigsh
+
+        def _diag(matrix):
+            values = matrix.diagonal()
+            if hasattr(values, "get"):  # cupy array
+                values = values.get()
+            return np.asarray(values, dtype=float)
+
+        inv_meps = _diag(self.Ds) * _diag(self.iDeps) * _diag(self.itDa)
+        m_nu = _diag(self.tDs) * _diag(self.iDmu) * _diag(self.iDa)
+
+        if np.any(~np.isfinite(inv_meps)) or np.any(~np.isfinite(m_nu)):
+            raise RuntimeError("Non-finite metric/material entries.")
+
+        C = self.C.tocsr().astype(float)
+        sqrt_inv_meps = np.sqrt(np.clip(inv_meps, 0.0, None))
+
+        D = diags(sqrt_inv_meps)
+        S = (D @ C.transpose() @ diags(m_nu) @ C @ D).tocsr()
+
+        eigenvalues, vectors = eigsh(S, k=1, which="LA", tol=tol)
+        lambda_max = float(eigenvalues[0])
+        u = vectors[:, 0]
+
+        omega_max = np.sqrt(lambda_max)
+        dt_max = 2.0 / omega_max
+
+        dt_cfl = 1.0 / (
+            c_light
+            * np.sqrt(
+                1 / np.min(self.grid.dx) ** 2
+                + 1 / np.min(self.grid.dy) ** 2
+                + 1 / np.min(self.grid.dz) ** 2
+            )
+        )
+
+        # Energy shares of the limiting mode on electric and magnetic DOFs.
+        share_E = u**2
+        h = np.sqrt(m_nu) * (C @ (sqrt_inv_meps * u))
+        share_H = h**2 / max(lambda_max, np.finfo(float).tiny)
+
+        def _locate(flat):
+            component, rest = divmod(int(flat), self.N)
+            i = rest % self.Nx
+            j = (rest // self.Nx) % self.Ny
+            k = rest // (self.Nx * self.Ny)
+            return "xyz"[component], (i, j, k)
+
+        def _top(shares):
+            order = np.argsort(shares)[::-1][:n_report]
+            return [(*_locate(r), float(shares[r])) for r in order]
+
+        dt = float(self.dt)
+
+        result = {
+            "dt_max": dt_max,
+            "omega_max": omega_max,
+            "dt": dt,
+            "dt_ratio": dt / dt_max,
+            "dt_cfl": dt_cfl,
+            "stable": dt < dt_max,
+            "top_E": _top(share_E),
+            "top_H": _top(share_H),
+        }
+
+        if verbose:
+            print(
+                f"Stable time step: dt_max = {dt_max:.4e} s "
+                f"({dt_max / dt_cfl:.3f} x uncut CFL limit), "
+                f"solver dt = {dt:.4e} s, dt/dt_max = {dt / dt_max:.3f} "
+                f"-> {'stable' if dt < dt_max else 'UNSTABLE'}"
+            )
+
+        return result
 
     @staticmethod
     def _average_dual_points_to_primal_edges(point_values):
@@ -3043,33 +3008,6 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
                 eps_components[direction][valid] = line_eps[valid] * eps_0
                 sigma_components[direction][valid] = line_sigma[valid]
 
-            # The constitutive electric coefficient also belongs to the
-            # associated dual face. For conductor-cut dual faces use
-            # the already calculated normal-region surface material.
-            dual_face = self.conformal_face_data.get("dual", {}).get(direction)
-            dual_mat = self.conformal_face_materials.get("dual", {}).get(direction)
-            if dual_face is not None and dual_mat is not None:
-                cut_full = dual_face["normal_pec"] | dual_face["normal_sibc"]
-                cut = self._dual_face_array_to_primal_edge_component(
-                    cut_full, direction, fill_value=False
-                ).astype(bool)
-                face_eps = self._dual_face_array_to_primal_edge_component(
-                    dual_mat["eps_r"], direction
-                )
-                face_sigma = self._dual_face_array_to_primal_edge_component(
-                    dual_mat["sigma"], direction
-                )
-                valid = (
-                    cut
-                    & ~fully_conductor
-                    & np.isfinite(face_eps)
-                    & (face_eps > 0.0)
-                    & np.isfinite(face_sigma)
-                    & (face_sigma >= 0.0)
-                )
-                eps_components[direction][valid] = face_eps[valid] * eps_0
-                sigma_components[direction][valid] = face_sigma[valid]
-
             # Magnetic DOFs correspond to dual edges and primal faces.
             dual_start, dual_end = self.grid._get_edge_region_ids("dual", direction)
             # Low-side half dual edges (fill -1) keep the averaged value.
@@ -3087,21 +3025,6 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             mu_components[direction][dual_same_normal] = (
                 mu_regions[dual_start[dual_same_normal]] * mu_0
             )
-
-            dual_data = self.conformal_line_data.get("dual", {}).get(direction)
-            dual_mat = self.conformal_line_materials.get("dual", {}).get(direction)
-            if dual_data is not None and dual_mat is not None:
-                crossing_full = (
-                    dual_data["normal_to_conductor"] | dual_data["conductor_to_normal"]
-                )
-                crossing = self._dual_edge_array_to_field_component(
-                    crossing_full, direction, fill_value=False
-                ).astype(bool)
-                line_mu = self._dual_edge_array_to_field_component(
-                    dual_mat["mu_r"], direction
-                )
-                valid = crossing & np.isfinite(line_mu) & (line_mu > 0.0)
-                mu_components[direction][valid] = line_mu[valid] * mu_0
 
             primal_face = self.conformal_face_data.get("primal", {}).get(direction)
             primal_face_mat = self.conformal_face_materials.get("primal", {}).get(

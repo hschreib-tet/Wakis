@@ -1598,19 +1598,6 @@ class TestGridFIT3DMeshing:
             expected_fraction,
         )
 
-        # Hx(i,j,k) belongs to dual x-edge (i-1, j, k) (curl matrix C).
-        # Hx(0,j,k) is the low-side half dual edge, which is never cut.
-        expected_dual_fraction = np.concatenate(([1.0], expected_fraction[:-1]))
-
-        np.testing.assert_allclose(
-            solver.tL_fraction.to_matrix("x")[
-                :,
-                0,
-                0,
-            ],
-            expected_dual_fraction,
-        )
-
         np.testing.assert_allclose(
             solver.L_eff.to_matrix("x")[
                 :,
@@ -1625,19 +1612,9 @@ class TestGridFIT3DMeshing:
             * expected_fraction,
         )
 
-        np.testing.assert_allclose(
-            solver.tL_eff.to_matrix("x")[
-                :,
-                0,
-                0,
-            ],
-            solver.tL.to_matrix("x")[
-                :,
-                0,
-                0,
-            ]
-            * expected_dual_fraction,
-        )
+        # Conductor cuts never modify the dual edge lengths.
+        assert not hasattr(solver, "tL_eff")
+        np.testing.assert_array_equal(solver.tL.toarray(), grid.tL.toarray())
 
     def test_edge_array_to_field_component(self):
         grid = GridFIT3D(
@@ -1859,10 +1836,8 @@ class TestGridFIT3DMeshing:
             0,
         )
 
-        for grid_type in (
-            "primal",
-            "dual",
-        ):
+        # Conductor walls are traced on the primal grid only.
+        for grid_type in ("primal",):
             data = grid.interface_intersections[grid_type]["x"]
 
             data["alpha"][cut_edge] = 0.01
@@ -1883,10 +1858,7 @@ class TestGridFIT3DMeshing:
 
         # Before snapping, the second x-edge is the resolved
         # normal -> PEC interior cut.
-        for grid_type in (
-            "primal",
-            "dual",
-        ):
+        for grid_type in ("primal",):
             assert grid.interior_interface_edge_masks[grid_type]["x"][cut_edge]
 
             assert grid.resolved_interface_edge_masks[grid_type]["x"][cut_edge]
@@ -1914,10 +1886,15 @@ class TestGridFIT3DMeshing:
             0,
         )
 
-        for grid_type in (
-            "primal",
-            "dual",
-        ):
+        # Only the primal grid is snapped: conductor walls never cut the
+        # dual metrics, so the dual points keep their classification.
+        np.testing.assert_array_equal(
+            grid.region_ids["dual"][:, 0, 0],
+            np.array([0, 0, 1], dtype=np.int32),
+        )
+        assert not grid.snapped_point_data["dual"]
+
+        for grid_type in ("primal",):
             # ------------------------------------------------------
             # Point topology changed from
             #
@@ -3241,36 +3218,16 @@ class TestGridFIT3DMeshing:
             ],
         )
 
-        # Dual z-face (i, j, k) belongs to Ez(i+1, j+1, k) (curl matrix C^T).
-        # With Ny = 1 these dual faces reach the high y boundary and have
-        # no stored electric DOF, so every stored dual area stays uncut.
-        dual_full_fraction = np.ones(face_shapes["z"], dtype=float)
-        dual_data = solver.conformal_face_data["dual"]["z"]
-        dual_full_fraction[dual_data["supported"]] = dual_data[
-            "effective_area_fraction"
-        ][dual_data["supported"]]
-
-        np.testing.assert_allclose(
-            solver.tA_fraction.to_matrix("z"),
-            solver._dual_face_array_to_primal_edge_component(
-                dual_full_fraction,
-                "z",
-                fill_value=1.0,
-            ),
-        )
+        # Conductor cuts never modify the dual face areas.
+        assert not hasattr(solver, "tA_eff")
+        np.testing.assert_array_equal(solver.itA.toarray(), grid.itA.toarray())
 
         # --------------------------------------------------
-        # Effective areas must be base area * fraction.
-        # Do not assume primal and dual base areas are equal.
+        # Effective primal areas must be base area * fraction.
         # --------------------------------------------------
         primal_base_area = np.divide(
             1.0,
             solver.iA.to_matrix("z")[:, 0, 0],
-        )
-
-        dual_base_area = np.divide(
-            1.0,
-            solver.itA.to_matrix("z")[:, 0, 0],
         )
 
         expected_fraction = np.array(
@@ -3284,11 +3241,6 @@ class TestGridFIT3DMeshing:
         np.testing.assert_allclose(
             solver.A_eff.to_matrix("z")[:, 0, 0],
             primal_base_area * expected_fraction,
-        )
-
-        np.testing.assert_allclose(
-            solver.tA_eff.to_matrix("z")[:, 0, 0],
-            dual_base_area * solver.tA_fraction.to_matrix("z")[:, 0, 0],
         )
 
         primal_materials = solver.conformal_face_materials["primal"]["z"]
@@ -4408,8 +4360,6 @@ class TestGridFIT3DMeshing:
             dual_face_index
         ] == pytest.approx(1.0)
 
-        assert solver.tA_fraction.to_matrix("y")[edge_index] == pytest.approx(1.0)
-
         eps_yy_solver = solver.conformal_diagonal_materials["eps_r"]["y"][edge_index]
 
         assert eps_yy_solver == pytest.approx(673.0 / 230.0)
@@ -4711,39 +4661,23 @@ class TestGridFIT3DMeshing:
         # PEC: dual y-face
         # ============================================================
         #
-        # Face fractions:
-        #
-        #     PEC        = 1/4
-        #     background = 3/4
-        #
-        # Only the normal background part remains active:
-        #
-        #     tA_fraction = 3/4
-        #
-        # Effective material on the active part:
-        #
-        #     eps_r = 2
+        # Conductor walls never cut the dual metrics, so the dual grid is
+        # not traced against the normal-PEC interface at all: the dual
+        # face stays unresolved and its area remains the grid value.
         # ============================================================
 
         dual_face_data_pec = solver_pec.conformal_face_data["dual"]["y"]
 
-        assert dual_face_data_pec["normal_pec"][dual_face_index]
+        assert not dual_face_data_pec["resolved"][dual_face_index]
 
-        assert dual_face_data_pec["effective_area_fraction"][
-            dual_face_index
-        ] == pytest.approx(3.0 / 4.0)
+        assert not dual_face_data_pec["normal_pec"][dual_face_index]
 
-        assert solver_pec.tA_fraction.to_matrix("y")[edge_index] == pytest.approx(
-            3.0 / 4.0
+        assert not hasattr(solver_pec, "tA_eff")
+
+        np.testing.assert_array_equal(
+            solver_pec.itA.toarray(),
+            grid_pec.itA.toarray(),
         )
-
-        assert solver_pec.tA_eff.to_matrix("y")[edge_index] == pytest.approx(3.0 / 4.0)
-
-        eps_face_pec = solver_pec.conformal_face_materials["dual"]["y"]["eps_r"][
-            dual_face_index
-        ]
-
-        assert eps_face_pec == pytest.approx(2.0)
 
         # ============================================================
         # PEC: primal z-face
@@ -4832,10 +4766,9 @@ class TestGridFIT3DMeshing:
             5.0 / 8.0
         )
 
-        # Dual y-face:
-        # active normal area = 3/4
+        # Dual y-face: conductor walls do not cut dual areas.
         assert solver_pec_applied.itA.to_matrix("y")[edge_index] == pytest.approx(
-            4.0 / 3.0
+            grid_pec.itA.to_matrix("y")[edge_index]
         )
 
         # Primal z-face:

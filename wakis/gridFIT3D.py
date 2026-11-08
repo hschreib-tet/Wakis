@@ -2074,17 +2074,54 @@ class GridFIT3D(PlotMixin):
             key=priority,
         )
 
+    def _get_region_normal_flags(self):
+        """
+        Return a boolean array: True where a region ID is a normal material.
+
+        If ``bg_material_type`` is not given, the background is treated as
+        normal. This is conservative: it can only add dual-grid work, never
+        drop a normal-normal interface.
+        """
+        flags = np.zeros(len(self.region_id_to_key), dtype=bool)
+
+        flags[0] = self.bg_material_type in (None, "normal")
+
+        for region_id, key in self.region_id_to_key.items():
+            if region_id == 0:
+                continue
+            flags[region_id] = self.stl_material_types[key] == "normal"
+
+        return flags
+
+    def _get_normal_normal_edge_mask(self, grid_type, direction):
+        """
+        Edges whose two endpoints lie in different normal-material regions.
+        """
+        start, end = self._get_edge_region_ids(grid_type, direction)
+        is_normal = self._get_region_normal_flags()
+
+        return (start != end) & is_normal[start] & is_normal[end]
+
     def _build_interface_intersections(
         self,
         alpha_tolerance=1e-8,
     ):
         """
-        Compute all STL intersections with primal and dual grid edges.
+        Compute STL intersections with primal and dual grid edges.
 
         Intersections are obtained by tracing complete grid lines through all
         STL surfaces. Therefore, intersections are also detected when an STL
         region is thinner than one grid edge and both edge endpoints belong
         to the same effective region.
+
+        Primal grid: all interfaces are traced. They define the conformal
+        cuts at PEC/SIBC walls and the material interfaces.
+
+        Dual grid: only edges between two different normal materials are
+        kept, and only grid lines containing such edges are traced. Dual
+        intersections are needed solely for the effective materials at
+        dielectric/magnetic interfaces; PEC/SIBC walls never cut the dual
+        metrics.
         """
         surface_cache = {}
 
@@ -2172,6 +2209,17 @@ class GridFIT3D(PlotMixin):
 
                 raw_hits = {}
 
+                # Dual grid: restrict to normal-normal interface edges and
+                # trace only the grid lines that contain such edges.
+                if grid_type == "dual":
+                    scope = self._get_normal_normal_edge_mask(grid_type, direction)
+                    traced_lines = np.any(scope, axis="xyz".index(direction))
+                    transverse_indices = (
+                        index for index in transverse_indices if traced_lines[index]
+                    )
+                else:
+                    scope = None
+
                 for transverse_index in transverse_indices:
                     line_hits = self._trace_grid_line(
                         grid_type,
@@ -2182,6 +2230,9 @@ class GridFIT3D(PlotMixin):
                     )
 
                     for edge_index, hits in line_hits.items():
+                        if scope is not None and not scope[edge_index]:
+                            continue
+
                         raw_hits.setdefault(
                             edge_index,
                             [],
@@ -2483,6 +2534,9 @@ class GridFIT3D(PlotMixin):
 
         The operation is monotonic: normal points may become PEC,
         but PEC points are never converted back to normal.
+
+        Only the primal grid is snapped. Conductor walls do not cut the dual
+        metrics, so dual points keep their geometric classification.
         """
         eta = self.conformal_pec_snap_fraction
 
@@ -2531,10 +2585,7 @@ class GridFIT3D(PlotMixin):
 
             # Rebuild endpoint topology from the current
             # effective point regions.
-            for grid_type in (
-                "primal",
-                "dual",
-            ):
+            for grid_type in ("primal",):
                 self.interface_edge_masks[grid_type] = (
                     self._build_edge_transition_masks(self.region_ids[grid_type])
                 )
@@ -2542,10 +2593,7 @@ class GridFIT3D(PlotMixin):
             # ------------------------------------------------------
             # Find small active normal portions.
             # ------------------------------------------------------
-            for grid_type in (
-                "primal",
-                "dual",
-            ):
+            for grid_type in ("primal",):
                 for direction in (
                     "x",
                     "y",
@@ -2642,10 +2690,7 @@ class GridFIT3D(PlotMixin):
             # ------------------------------------------------------
             n_changes = 0
 
-            for grid_type in (
-                "primal",
-                "dual",
-            ):
+            for grid_type in ("primal",):
                 regions = self.region_ids[grid_type]
 
                 for (
@@ -2973,6 +3018,12 @@ class GridFIT3D(PlotMixin):
                 "z",
             ):
                 endpoint_mask = self.interface_edge_masks[grid_type][direction]
+
+                # Dual intersections only exist for normal-normal edges.
+                if grid_type == "dual":
+                    endpoint_mask = endpoint_mask & self._get_normal_normal_edge_mask(
+                        grid_type, direction
+                    )
 
                 resolved_mask = self.resolved_interface_edge_masks[grid_type][direction]
 
