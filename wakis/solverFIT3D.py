@@ -565,7 +565,9 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
 
             self.tau = (1 / self.ieps.toarray()[mask]) / self.sigma.toarray()[mask]
 
-            if self.dt > self.tau.min():
+            # A conductive STL may end up without any active conductive DOF,
+            # e.g. a conformal PEC/SIBC wall whose DOFs are all eliminated.
+            if self.tau.size and self.dt > self.tau.min():
                 self.dt = self.tau.min()
 
         if self.verbose > 1:
