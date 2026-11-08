@@ -1725,9 +1725,15 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         """
         Map primal-face data to the associated stored dual-edge DOFs.
 
-            Hx(i,j,k) <-> primal x-face (i+1, j,   k)
-            Hy(i,j,k) <-> primal y-face (i,   j+1, k)
-            Hz(i,j,k) <-> primal z-face (i,   j,   k+1)
+        The curl matrix C defines the magnetic DOF Hx(i,j,k) as the flux
+        through the primal x-face at x[i]:
+
+            Hx(i,j,k) <-> primal x-face (i, j, k)
+            Hy(i,j,k) <-> primal y-face (i, j, k)
+            Hz(i,j,k) <-> primal z-face (i, j, k)
+
+        The high-side boundary faces (x[Nx], y[Ny], z[Nz]) have no stored
+        magnetic DOF.
         """
         face_values = np.asarray(face_values)
 
@@ -1759,25 +1765,85 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
                 f"got {face_values.shape}."
             )
 
+        return self._face_array_to_field_component(
+            face_values,
+            direction,
+        )
+
+    def _dual_edge_array_to_field_component(
+        self,
+        edge_values,
+        direction,
+        fill_value=np.nan,
+    ):
+        """
+        Map a full dual-edge array to the stored magnetic DOFs.
+
+        Dual x-edge (i, j, k) connects the dual points tx[i] and tx[i+1]
+        and therefore pierces the primal x-face at x[i+1]. Since Hx(i,j,k)
+        belongs to the primal x-face at x[i] (see
+        ``_primal_face_array_to_dual_edge_component``):
+
+            Hx(i,j,k) <-> dual x-edge (i-1, j,   k)
+            Hy(i,j,k) <-> dual y-edge (i,   j-1, k)
+            Hz(i,j,k) <-> dual z-edge (i,   j,   k-1)
+
+        The low-side DOFs (i=0, j=0 or k=0 along the edge direction) belong
+        to half dual edges between the domain boundary and the first dual
+        point. These are not part of the dual-edge arrays and are set to
+        ``fill_value``.
+        """
+        edge_values = np.asarray(edge_values)
+
+        expected_shapes = {
+            "x": (self.Nx, self.Ny + 1, self.Nz + 1),
+            "y": (self.Nx + 1, self.Ny, self.Nz + 1),
+            "z": (self.Nx + 1, self.Ny + 1, self.Nz),
+        }
+
+        if direction not in expected_shapes:
+            raise ValueError(f"Unknown edge direction '{direction}'.")
+
+        if edge_values.shape != expected_shapes[direction]:
+            raise ValueError(
+                f"Expected dual {direction}-edge array shape "
+                f"{expected_shapes[direction]}, "
+                f"got {edge_values.shape}."
+            )
+
+        dtype = np.result_type(
+            edge_values.dtype,
+            np.asarray(fill_value).dtype,
+        )
+
+        result = np.full(
+            (self.Nx, self.Ny, self.Nz),
+            fill_value,
+            dtype=dtype,
+        )
+
         if direction == "x":
-            return face_values[
-                1 : self.Nx + 1,
-                :,
-                :,
+            result[1:, :, :] = edge_values[
+                : self.Nx - 1,
+                : self.Ny,
+                : self.Nz,
             ]
 
-        if direction == "y":
-            return face_values[
-                :,
-                1 : self.Ny + 1,
-                :,
+        elif direction == "y":
+            result[:, 1:, :] = edge_values[
+                : self.Nx,
+                : self.Ny - 1,
+                : self.Nz,
             ]
 
-        return face_values[
-            :,
-            :,
-            1 : self.Nz + 1,
-        ]
+        else:
+            result[:, :, 1:] = edge_values[
+                : self.Nx,
+                : self.Ny,
+                : self.Nz - 1,
+            ]
+
+        return result
 
     @staticmethod
     def _combine_conformal_diagonal_component(
@@ -2116,14 +2182,15 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             # Normal / harmonic contribution
             # ------------------------------------------------------
 
-            mu_perp = self._edge_array_to_field_component(
+            mu_perp = self._dual_edge_array_to_field_component(
                 dual_line_materials["mu_r"],
                 direction,
             )
 
-            magnetic_line_mask = self._edge_array_to_field_component(
+            magnetic_line_mask = self._dual_edge_array_to_field_component(
                 dual_line_data["normal_normal"],
                 direction,
+                fill_value=False,
             ).astype(bool)
 
             line_normals = np.asarray(
@@ -2149,7 +2216,7 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
                 / line_norm[valid_line_normal]
             ) ** 2
 
-            magnetic_line_n2 = self._edge_array_to_field_component(
+            magnetic_line_n2 = self._dual_edge_array_to_field_component(
                 magnetic_line_n2_full,
                 direction,
             )
@@ -2289,10 +2356,18 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
                     supported
                 ]
 
-                field_fraction = self._edge_array_to_field_component(
-                    full_fraction,
-                    direction,
-                )
+                if grid_type == "primal":
+                    field_fraction = self._edge_array_to_field_component(
+                        full_fraction,
+                        direction,
+                    )
+                else:
+                    # Low-side half dual edges are never cut here.
+                    field_fraction = self._dual_edge_array_to_field_component(
+                        full_fraction,
+                        direction,
+                        fill_value=1.0,
+                    )
 
                 base_component = base_lengths.to_matrix(direction)
 
@@ -2378,10 +2453,21 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
 
                 full_fraction[supported] = data["effective_area_fraction"][supported]
 
-                field_fraction = self._face_array_to_field_component(
-                    full_fraction,
-                    direction,
-                )
+                if grid_type == "primal":
+                    # Hx(i,j,k) <-> primal x-face (i,j,k).
+                    field_fraction = self._face_array_to_field_component(
+                        full_fraction,
+                        direction,
+                    )
+                else:
+                    # Ex(i,j,k) <-> dual x-face (i,j-1,k-1), as defined by
+                    # C^T. This is the same face used for the electric face
+                    # materials. Truncated low-side dual faces stay uncut.
+                    field_fraction = self._dual_face_array_to_primal_edge_component(
+                        full_fraction,
+                        direction,
+                        fill_value=1.0,
+                    )
 
                 # Grid stores inverse face areas.
                 base_area = np.divide(
@@ -2672,28 +2758,28 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         """
         point_values = np.asarray(point_values)
 
-        # x-directed dual edges -> primal yz faces at x[i+1]
+        # Hx(i,j,k) -> primal yz face at x[i] (see curl matrix C)
         values_x = 0.25 * (
-            point_values[1:, :-1, :-1]
-            + point_values[1:, 1:, :-1]
-            + point_values[1:, 1:, 1:]
-            + point_values[1:, :-1, 1:]
+            point_values[:-1, :-1, :-1]
+            + point_values[:-1, 1:, :-1]
+            + point_values[:-1, 1:, 1:]
+            + point_values[:-1, :-1, 1:]
         )
 
-        # y-directed dual edges -> primal xz faces at y[j+1]
+        # Hy(i,j,k) -> primal xz face at y[j]
         values_y = 0.25 * (
-            point_values[:-1, 1:, :-1]
-            + point_values[1:, 1:, :-1]
-            + point_values[1:, 1:, 1:]
-            + point_values[:-1, 1:, 1:]
+            point_values[:-1, :-1, :-1]
+            + point_values[1:, :-1, :-1]
+            + point_values[1:, :-1, 1:]
+            + point_values[:-1, :-1, 1:]
         )
 
-        # z-directed dual edges -> primal xy faces at z[k+1]
+        # Hz(i,j,k) -> primal xy face at z[k]
         values_z = 0.25 * (
-            point_values[:-1, :-1, 1:]
-            + point_values[1:, :-1, 1:]
-            + point_values[1:, 1:, 1:]
-            + point_values[:-1, 1:, 1:]
+            point_values[:-1, :-1, :-1]
+            + point_values[1:, :-1, :-1]
+            + point_values[1:, 1:, :-1]
+            + point_values[:-1, 1:, :-1]
         )
 
         return values_x, values_y, values_z
@@ -2986,9 +3072,18 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
 
             # Magnetic DOFs correspond to dual edges and primal faces.
             dual_start, dual_end = self.grid._get_edge_region_ids("dual", direction)
-            dual_start = self._edge_array_to_field_component(dual_start, direction)
-            dual_end = self._edge_array_to_field_component(dual_end, direction)
-            dual_same_normal = (dual_start == dual_end) & region_is_normal[dual_start]
+            # Low-side half dual edges (fill -1) keep the averaged value.
+            dual_start = self._dual_edge_array_to_field_component(
+                dual_start, direction, fill_value=-1
+            )
+            dual_end = self._dual_edge_array_to_field_component(
+                dual_end, direction, fill_value=-1
+            )
+            has_dual_edge = dual_start >= 0
+            dual_same_normal = has_dual_edge & (dual_start == dual_end)
+            dual_same_normal[has_dual_edge] &= region_is_normal[
+                dual_start[has_dual_edge]
+            ]
             mu_components[direction][dual_same_normal] = (
                 mu_regions[dual_start[dual_same_normal]] * mu_0
             )
@@ -2999,10 +3094,10 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
                 crossing_full = (
                     dual_data["normal_to_conductor"] | dual_data["conductor_to_normal"]
                 )
-                crossing = self._edge_array_to_field_component(
-                    crossing_full, direction
+                crossing = self._dual_edge_array_to_field_component(
+                    crossing_full, direction, fill_value=False
                 ).astype(bool)
-                line_mu = self._edge_array_to_field_component(
+                line_mu = self._dual_edge_array_to_field_component(
                     dual_mat["mu_r"], direction
                 )
                 valid = crossing & np.isfinite(line_mu) & (line_mu > 0.0)
