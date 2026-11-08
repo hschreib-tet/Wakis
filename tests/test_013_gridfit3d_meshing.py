@@ -1697,7 +1697,8 @@ class TestGridFIT3DMeshing:
             1,
             geometry_mode="conformal",
             bg_material_type="normal",
-            conformal_pec_snap_fraction=0.05,
+            conformal_stabilization="snapping",
+            conformal_stabilization_fraction=0.05,
             verbose=0,
         )
 

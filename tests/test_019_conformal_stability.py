@@ -143,3 +143,157 @@ def test_dielectric_interface_keeps_dual_geometry(tmp_path):
         np.any(np.isfinite(solver.conformal_diagonal_materials["mu_r"][d]))
         for d in ("x", "y", "z")
     )
+
+
+# ----------------------------------------------------------------------
+# Small-cut-cell treatment: snapping or area floor
+# ----------------------------------------------------------------------
+
+
+def _unit_grid(**kwargs):
+    return GridFIT3D(0, 1, 0, 1, 0, 1, 2, 2, 2, verbose=0, **kwargs)
+
+
+def test_stabilization_selector_validation():
+    grid = _unit_grid(conformal_stabilization="area_floor")
+    assert grid.conformal_stabilization == "area_floor"
+    assert grid.conformal_area_floor == pytest.approx(0.1)
+    # The edge threshold defaults to the floor value.
+    assert grid.conformal_min_edge_fraction == pytest.approx(0.1)
+    assert grid.conformal_pec_snap_fraction == 0.0
+
+    grid = _unit_grid(
+        geometry_mode="conformal",
+        bg_material_type="normal",
+        conformal_stabilization="snapping",
+        conformal_stabilization_fraction=0.2,
+    )
+    assert grid.conformal_pec_snap_fraction == pytest.approx(0.2)
+    assert grid.conformal_area_floor == 0.0
+
+    assert _unit_grid().conformal_stabilization == "none"
+
+    with pytest.raises(ValueError):
+        _unit_grid(conformal_stabilization="merging")
+    with pytest.raises(ValueError):
+        _unit_grid(
+            conformal_stabilization="snapping", conformal_stabilization_fraction=0.6
+        )
+    with pytest.raises(ValueError):
+        _unit_grid(
+            conformal_stabilization="area_floor", conformal_stabilization_fraction=0.0
+        )
+    with pytest.raises(ValueError):
+        # snapping in conformal mode needs the background material type
+        _unit_grid(geometry_mode="conformal", conformal_stabilization="snapping")
+
+
+def test_deprecated_snap_fraction_maps_to_snapping():
+    with pytest.warns(DeprecationWarning):
+        grid = _unit_grid(
+            geometry_mode="conformal",
+            bg_material_type="normal",
+            conformal_pec_snap_fraction=0.1,
+        )
+    assert grid.conformal_stabilization == "snapping"
+    assert grid.conformal_pec_snap_fraction == pytest.approx(0.1)
+
+    with pytest.raises(ValueError):
+        _unit_grid(
+            conformal_pec_snap_fraction=0.1, conformal_stabilization="area_floor"
+        )
+
+
+def _slanted_grid(stl_file, **kwargs):
+    return GridFIT3D(
+        -0.2,
+        0.2,
+        -0.2,
+        0.2,
+        -0.2,
+        0.2,
+        12,
+        12,
+        12,
+        stl_solids={"cav": str(stl_file)},
+        stl_materials={"cav": "vacuum"},
+        stl_material_types={"cav": "normal"},
+        bg_material_type="pec",
+        geometry_mode="conformal",
+        stl_method="interior_points",
+        verbose=0,
+        **kwargs,
+    )
+
+
+def _localized_low_modes(solver, f_max, n_modes=30, max_participation=30):
+    """Count eigenmodes below f_max carried by only a few DOFs."""
+    from scipy.sparse import diags
+    from scipy.sparse.linalg import eigsh
+
+    inv_meps = solver.Ds.diagonal() * solver.iDeps.diagonal() * solver.itDa.diagonal()
+    active = np.flatnonzero(inv_meps > 0)
+    m_nu = solver.tDs.diagonal() * solver.iDmu.diagonal() * solver.iDa.diagonal()
+    C = solver.C.tocsr().astype(float)[:, active]
+    K = (C.T @ diags(m_nu) @ C).tocsc()
+    M = diags(1.0 / inv_meps[active]).tocsc()
+
+    lam, vectors = eigsh(K, k=n_modes, M=M, sigma=(2 * np.pi * 0.3 * f_max) ** 2)
+    count = 0
+    for value, v in zip(lam, vectors.T):
+        f = np.sqrt(max(value, 0.0)) / (2 * np.pi)
+        if f < 0.1 * f_max or f > f_max:  # static null space / above band
+            continue
+        w = np.abs((M @ v) * v)
+        if w.sum() ** 2 / np.sum(w**2) < max_participation:
+            count += 1
+    return count
+
+
+def test_area_floor_is_stable_without_spurious_modes(tmp_path):
+    stl_file = tmp_path / "cav.stl"
+    box = pv.Box(bounds=(-0.15, 0.15, -0.11, 0.11, -0.085, 0.085)).triangulate()
+    box.rotate_z(20).rotate_x(10).save(stl_file)
+
+    exact = _slanted_grid(stl_file)
+    floored = _slanted_grid(stl_file, conformal_stabilization="area_floor")
+
+    s_exact = _solver(exact)
+    s_floor = _solver(floored)
+
+    # Exact cuts are unstable at the default cfln = 0.5, the floor is not.
+    assert not s_exact.compute_stable_timestep(verbose=False)["stable"]
+    assert s_floor.compute_stable_timestep(verbose=False)["stable"]
+
+    # The geometry and the cut edge lengths are untouched ...
+    for d in ("x", "y", "z"):
+        np.testing.assert_array_equal(
+            exact.interface_intersections["primal"][d]["alpha"],
+            floored.interface_intersections["primal"][d]["alpha"],
+        )
+    np.testing.assert_array_equal(s_exact.L.toarray(), s_floor.L.toarray())
+    np.testing.assert_array_equal(
+        s_exact.A_fraction.toarray(), s_floor.A_fraction_geometric.toarray()
+    )
+
+    # ... only small conductor-cut areas are raised.
+    raised = s_floor.A_fraction.toarray() != s_floor.A_fraction_geometric.toarray()
+    assert s_floor.n_area_floored == np.count_nonzero(raised) > 0
+    np.testing.assert_allclose(s_floor.A_fraction.toarray()[raised], 0.1)
+    assert s_floor.n_edges_eliminated > 0
+
+    # Raised areas next to nearly covered edges would create localized
+    # low-frequency modes; the edge elimination must keep them out of the
+    # band the mesh resolves (here: at least 8 cells per wavelength).
+    from scipy.constants import c
+
+    f_max = c / (8 * np.max(floored.dx))
+    assert _localized_low_modes(s_floor, f_max) == 0
+
+    # Without the edge elimination they do appear in that band.
+    no_elimination = _slanted_grid(
+        stl_file,
+        conformal_stabilization="area_floor",
+        conformal_min_edge_fraction=0.0,
+    )
+    assert _localized_low_modes(_solver(no_elimination), f_max) > 0

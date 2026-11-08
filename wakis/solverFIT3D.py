@@ -173,6 +173,12 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         self.grid = grid
         self.background = bg
 
+        # Small-cut-cell treatment chosen in GridFIT3D (area floor case).
+        self.conformal_area_floor = float(getattr(grid, "conformal_area_floor", 0.0))
+        self.conformal_min_edge_fraction = float(
+            getattr(grid, "conformal_min_edge_fraction", 0.0)
+        )
+
         self.bg_material_type = getattr(
             self.grid,
             "bg_material_type",
@@ -488,6 +494,7 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
 
         if self.use_stl:
             self._apply_stl_materials()
+            self._eliminate_small_conformal_edges()
 
         # Fill PML BCs
         if self.activate_pml:
@@ -2301,11 +2308,21 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         Build effective primal face areas from conformal interface-area
         fractions. Hx(i,j,k) belongs to primal x-face (i,j,k).
 
+        With ``GridFIT3D(conformal_stabilization="area_floor")``, faces cut
+        by a PEC/SIBC wall use at least ``conformal_area_floor``
+        as area fraction (relaxed Dey-Mittra), which bounds the reduction of
+        the stable time step. ``A_fraction_geometric`` keeps the exact
+        geometric fractions; ``n_area_floored`` counts the raised faces.
+
         Dual face areas are never cut (Dey-Mittra-type treatment).
         The original grid metric self.iA is not modified.
         """
         self.A_fraction = Field(self.Nx, self.Ny, self.Nz)
+        self.A_fraction_geometric = Field(self.Nx, self.Ny, self.Nz)
         self.A_eff = Field(self.Nx, self.Ny, self.Nz)
+        self.n_area_floored = 0
+
+        area_floor = getattr(self, "conformal_area_floor", 0.0)
 
         for direction in ("x", "y", "z"):
             data = self.conformal_face_data["primal"][direction]
@@ -2319,6 +2336,22 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
             supported = data["supported"]
 
             full_fraction[supported] = data["effective_area_fraction"][supported]
+
+            setattr(
+                self.A_fraction_geometric,
+                f"field_{direction}",
+                self._face_array_to_field_component(full_fraction, direction).copy(),
+            )
+
+            if area_floor > 0.0:
+                conductor_cut = data["normal_pec"] | data["normal_sibc"]
+                floored = conductor_cut & (full_fraction < area_floor)
+                full_fraction[floored] = area_floor
+                self.n_area_floored += int(
+                    np.count_nonzero(
+                        self._face_array_to_field_component(floored, direction)
+                    )
+                )
 
             field_fraction = self._face_array_to_field_component(
                 full_fraction,
@@ -2504,6 +2537,34 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
         self.tDsiDmuiDaC = self.iDa * self.iDmu * self.C * self.Ds
         self.itDaiDepsDstC = self.iDeps * self.itDa * self.C.transpose() * self.tDs
         self.step_0 = False
+
+    def _eliminate_small_conformal_edges(self):
+        """
+        Area-floor treatment: remove nearly covered conductor-cut edges.
+
+        Primal edges cut by a PEC/SIBC wall whose active fraction is below
+        ``conformal_min_edge_fraction`` are treated as inside the conductor
+        (ieps = 0). With raised face areas, such edges would otherwise
+        couple only weakly to the field and form spurious low-frequency
+        modes. Region IDs and the stored geometry are not changed.
+        """
+        self.n_edges_eliminated = 0
+
+        threshold = getattr(self, "conformal_min_edge_fraction", 0.0)
+
+        if (
+            threshold <= 0.0
+            or getattr(self, "conformal_area_floor", 0.0) <= 0.0
+            or self.L_fraction is None
+        ):
+            return
+
+        for direction in ("x", "y", "z"):
+            ieps = np.array(self.ieps.to_matrix(direction))
+            tiny = (self.L_fraction.to_matrix(direction) < threshold) & (ieps != 0.0)
+            ieps[tiny] = 0.0
+            setattr(self.ieps, f"field_{direction}", ieps)
+            self.n_edges_eliminated += int(np.count_nonzero(tiny))
 
     def compute_stable_timestep(self, n_report=10, tol=1e-6, verbose=True):
         """

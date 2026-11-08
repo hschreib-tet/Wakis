@@ -67,7 +67,10 @@ class GridFIT3D(PlotMixin):
         stl_method="legacy",
         geometry_mode="legacy",
         bg_material_type=None,
-        conformal_pec_snap_fraction=0.0,
+        conformal_stabilization=None,
+        conformal_stabilization_fraction=None,
+        conformal_min_edge_fraction=None,
+        conformal_pec_snap_fraction=None,
         subpixel_smoothing=False,
         subpixel_smoothing_factor=4,
         subpixel_smoothing_threshold=0.3,
@@ -157,10 +160,35 @@ class GridFIT3D(PlotMixin):
             Material treatment of region 0. Required by the conformal
             geometry pipeline when PEC snapping is enabled. Default is
             None.
+        conformal_stabilization : {None, "snapping", "area_floor"}, optional
+            Treatment of small cut cells at PEC/SIBC walls in conformal mode,
+            which otherwise limit the stable time step. Default is None.
+
+            ``"snapping"``: normal-conductor edges whose active normal
+            fraction is below ``conformal_stabilization_fraction`` are
+            removed by moving the wall onto the adjacent grid point. This
+            changes the discretized geometry by up to fraction * cell size.
+
+            ``"area_floor"``: the geometry is kept. In the time-stepping
+            metric, primal faces cut by a conductor use at least
+            ``conformal_stabilization_fraction`` as area fraction (relaxed
+            Dey-Mittra), and edges with an active fraction below
+            ``conformal_min_edge_fraction`` are treated as inside the
+            conductor. Without the edge elimination, raised areas next to
+            nearly covered edges create spurious low-frequency modes.
+        conformal_stabilization_fraction : float, optional
+            Snapping: minimum active normal edge fraction, 0 < value < 0.5.
+            Area floor: minimum area fraction of conductor-cut faces,
+            0 < value <= 1. Default is 0.1 for both.
+        conformal_min_edge_fraction : float, optional
+            Area floor only: conductor-cut edges with a smaller active
+            fraction are eliminated (E set to zero), 0 <= value < 0.5.
+            Default (None) uses the area floor value. With this choice no
+            spurious localized modes were found while the mesh resolves the
+            wavelength with at least about 6 cells.
         conformal_pec_snap_fraction : float, optional
-            Minimum active normal edge fraction at normal-PEC interfaces.
-            Smaller normal fractions are removed by snapping the interface
-            onto the adjacent grid point. Default is 0.0 (disabled).
+            Deprecated. Equivalent to ``conformal_stabilization="snapping"``
+            with ``conformal_stabilization_fraction`` set to this value.
 
         Attributes
         ----------
@@ -208,23 +236,12 @@ class GridFIT3D(PlotMixin):
                     f"{VALID_MATERIAL_TYPES}."
                 )
 
-        self.conformal_pec_snap_fraction = float(conformal_pec_snap_fraction)
-
-        if (
-            self.geometry_mode == "conformal"
-            and self.conformal_pec_snap_fraction > 0.0
-            and self.bg_material_type is None
-        ):
-            raise ValueError(
-                "Conformal PEC snapping requires "
-                "bg_material_type to be specified "
-                "in GridFIT3D."
-            )
-
-        if not (0.0 <= self.conformal_pec_snap_fraction < 0.5):
-            raise ValueError(
-                "conformal_pec_snap_fraction must satisfy 0 <= value < 0.5."
-            )
+        self._set_conformal_stabilization(
+            conformal_stabilization,
+            conformal_stabilization_fraction,
+            conformal_min_edge_fraction,
+            conformal_pec_snap_fraction,
+        )
 
         # Primary and dual edges whose endpoints belong to different regions
         self.interface_edge_masks = {
@@ -559,8 +576,107 @@ class GridFIT3D(PlotMixin):
                 stl_tol=self.stl_tol,
                 geometry_mode=self.geometry_mode,
                 stl_method=self.stl_method,
+                bg_material_type=self.bg_material_type,
+                conformal_stabilization=self.conformal_stabilization,
+                conformal_stabilization_fraction=self._get_stabilization_fraction(),
+                conformal_min_edge_fraction=self.conformal_min_edge_fraction or None,
             )
         return _grid
+
+    def _get_stabilization_fraction(self):
+        """Fraction of the active small-cut-cell treatment (None if off)."""
+        if self.conformal_stabilization == "snapping":
+            return self.conformal_pec_snap_fraction
+        if self.conformal_stabilization == "area_floor":
+            return self.conformal_area_floor
+        return None
+
+    def _set_conformal_stabilization(
+        self,
+        method,
+        fraction,
+        min_edge_fraction,
+        legacy_snap_fraction,
+    ):
+        """
+        Validate and store the small-cut-cell treatment.
+
+        Sets ``conformal_stabilization`` ("none", "snapping" or
+        "area_floor"), ``conformal_pec_snap_fraction`` (used by snapping),
+        ``conformal_area_floor`` and ``conformal_min_edge_fraction`` (used
+        by the solver for the area floor). Unused values are 0.
+        """
+        if legacy_snap_fraction is not None and float(legacy_snap_fraction) > 0.0:
+            warnings.warn(
+                "conformal_pec_snap_fraction is deprecated; use "
+                "conformal_stabilization='snapping' and "
+                "conformal_stabilization_fraction instead.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+
+            if method not in (None, "snapping"):
+                raise ValueError(
+                    "conformal_pec_snap_fraction cannot be combined with "
+                    f"conformal_stabilization={method!r}."
+                )
+
+            if fraction is not None and float(fraction) != float(legacy_snap_fraction):
+                raise ValueError(
+                    "Conflicting conformal_pec_snap_fraction and "
+                    "conformal_stabilization_fraction."
+                )
+
+            method = "snapping"
+            fraction = float(legacy_snap_fraction)
+
+        method = "none" if method is None else str(method).lower()
+
+        if method not in ("none", "snapping", "area_floor"):
+            raise ValueError(
+                "conformal_stabilization must be None, 'snapping' or 'area_floor'."
+            )
+
+        fraction = 0.1 if fraction is None else float(fraction)
+        min_edge_fraction = (
+            min(fraction, 0.49)
+            if min_edge_fraction is None
+            else float(min_edge_fraction)
+        )
+
+        self.conformal_stabilization = method
+        self.conformal_pec_snap_fraction = 0.0
+        self.conformal_area_floor = 0.0
+        self.conformal_min_edge_fraction = 0.0
+
+        if method == "snapping":
+            if not (0.0 < fraction < 0.5):
+                raise ValueError(
+                    "Snapping requires 0 < conformal_stabilization_fraction < 0.5."
+                )
+
+            if self.geometry_mode == "conformal" and self.bg_material_type is None:
+                raise ValueError(
+                    "Conformal PEC snapping requires "
+                    "bg_material_type to be specified "
+                    "in GridFIT3D."
+                )
+
+            self.conformal_pec_snap_fraction = fraction
+
+        elif method == "area_floor":
+            if not (0.0 < fraction <= 1.0):
+                raise ValueError(
+                    "Area floor requires 0 < conformal_stabilization_fraction <= 1."
+                )
+
+            if not (0.0 <= min_edge_fraction < 0.5):
+                raise ValueError(
+                    "conformal_min_edge_fraction must satisfy 0 <= value < 0.5."
+                )
+
+            self.conformal_area_floor = fraction
+            self.conformal_min_edge_fraction = min_edge_fraction
 
     def _prepare_stl_material_types(self):
         """
