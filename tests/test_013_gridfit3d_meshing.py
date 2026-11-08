@@ -420,51 +420,50 @@ class TestGridFIT3DMeshing:
         # Interior faces
         # ----------------------------------------------------------
 
-        # x-directed dual edge -> primal yz face at x[i+1]
+        # Hx(i,j,k) -> primal yz face at x[i] (curl matrix C)
         i, j, k = 1, 2, 3
         expected = 0.25 * (
-            values[i + 1, j, k]
-            + values[i + 1, j + 1, k]
-            + values[i + 1, j + 1, k + 1]
-            + values[i + 1, j, k + 1]
+            values[i, j, k]
+            + values[i, j + 1, k]
+            + values[i, j + 1, k + 1]
+            + values[i, j, k + 1]
         )
         assert values_x[i, j, k] == pytest.approx(expected)
 
-        # y-directed dual edge -> primal xz face at y[j+1]
+        # Hy(i,j,k) -> primal xz face at y[j]
         i, j, k = 1, 1, 3
         expected = 0.25 * (
-            values[i, j + 1, k]
-            + values[i + 1, j + 1, k]
-            + values[i + 1, j + 1, k + 1]
-            + values[i, j + 1, k + 1]
+            values[i, j, k]
+            + values[i + 1, j, k]
+            + values[i + 1, j, k + 1]
+            + values[i, j, k + 1]
         )
         assert values_y[i, j, k] == pytest.approx(expected)
 
-        # z-directed dual edge -> primal xy face at z[k+1]
+        # Hz(i,j,k) -> primal xy face at z[k]
         i, j, k = 1, 2, 1
         expected = 0.25 * (
-            values[i, j, k + 1]
-            + values[i + 1, j, k + 1]
-            + values[i + 1, j + 1, k + 1]
-            + values[i, j + 1, k + 1]
+            values[i, j, k]
+            + values[i + 1, j, k]
+            + values[i + 1, j + 1, k]
+            + values[i, j + 1, k]
         )
         assert values_z[i, j, k] == pytest.approx(expected)
 
         # ----------------------------------------------------------
-        # High-side boundary
+        # Low-side boundary
         # ----------------------------------------------------------
 
-        # Last stored x-directed dual edge terminates at x[Nx].
-        # All four primal points of its associated face exist.
-        i = Nx - 1
+        # Hx(0,j,k) belongs to the boundary face at x[0].
+        i = 0
         j = Ny - 1
         k = Nz - 1
 
         expected = 0.25 * (
-            values[Nx, Ny - 1, Nz - 1]
-            + values[Nx, Ny, Nz - 1]
-            + values[Nx, Ny, Nz]
-            + values[Nx, Ny - 1, Nz]
+            values[0, Ny - 1, Nz - 1]
+            + values[0, Ny, Nz - 1]
+            + values[0, Ny, Nz]
+            + values[0, Ny - 1, Nz]
         )
         assert values_x[i, j, k] == pytest.approx(expected)
 
@@ -1598,13 +1597,17 @@ class TestGridFIT3DMeshing:
             expected_fraction,
         )
 
+        # Hx(i,j,k) belongs to dual x-edge (i-1, j, k) (curl matrix C).
+        # Hx(0,j,k) is the low-side half dual edge, which is never cut.
+        expected_dual_fraction = np.concatenate(([1.0], expected_fraction[:-1]))
+
         np.testing.assert_allclose(
             solver.tL_fraction.to_matrix("x")[
                 :,
                 0,
                 0,
             ],
-            expected_fraction,
+            expected_dual_fraction,
         )
 
         np.testing.assert_allclose(
@@ -1632,7 +1635,7 @@ class TestGridFIT3DMeshing:
                 0,
                 0,
             ]
-            * expected_fraction,
+            * expected_dual_fraction,
         )
 
     def test_edge_array_to_field_component(self):
@@ -3237,13 +3240,22 @@ class TestGridFIT3DMeshing:
             ],
         )
 
+        # Dual z-face (i, j, k) belongs to Ez(i+1, j+1, k) (curl matrix C^T).
+        # With Ny = 1 these dual faces reach the high y boundary and have
+        # no stored electric DOF, so every stored dual area stays uncut.
+        dual_full_fraction = np.ones(face_shapes["z"], dtype=float)
+        dual_data = solver.conformal_face_data["dual"]["z"]
+        dual_full_fraction[dual_data["supported"]] = dual_data[
+            "effective_area_fraction"
+        ][dual_data["supported"]]
+
         np.testing.assert_allclose(
-            solver.tA_fraction.to_matrix("z")[:, 0, 0],
-            [
-                1.0,
-                0.25,
-                0.25,
-            ],
+            solver.tA_fraction.to_matrix("z"),
+            solver._dual_face_array_to_primal_edge_component(
+                dual_full_fraction,
+                "z",
+                fill_value=1.0,
+            ),
         )
 
         # --------------------------------------------------
@@ -3275,7 +3287,7 @@ class TestGridFIT3DMeshing:
 
         np.testing.assert_allclose(
             solver.tA_eff.to_matrix("z")[:, 0, 0],
-            dual_base_area * expected_fraction,
+            dual_base_area * solver.tA_fraction.to_matrix("z")[:, 0, 0],
         )
 
         primal_materials = solver.conformal_face_materials["primal"]["z"]
@@ -4395,7 +4407,7 @@ class TestGridFIT3DMeshing:
             dual_face_index
         ] == pytest.approx(1.0)
 
-        assert solver.tA_fraction.to_matrix("y")[dual_face_index] == pytest.approx(1.0)
+        assert solver.tA_fraction.to_matrix("y")[edge_index] == pytest.approx(1.0)
 
         eps_yy_solver = solver.conformal_diagonal_materials["eps_r"]["y"][edge_index]
 
@@ -4486,16 +4498,13 @@ class TestGridFIT3DMeshing:
             "z",
         )
 
-        dual_edge_index = (
-            primal_face_index[0],
-            primal_face_index[1],
-            primal_face_index[2] - 1,
-        )
+        # Hz(i,j,k) is the flux through primal z-face (i,j,k) (curl matrix C).
+        dual_edge_index = primal_face_index
 
         assert dual_edge_index == (
             2,
             1,
-            1,
+            2,
         )
 
         assert mu_parallel[dual_edge_index] == pytest.approx(23.0 / 8.0)
@@ -4723,13 +4732,11 @@ class TestGridFIT3DMeshing:
             dual_face_index
         ] == pytest.approx(3.0 / 4.0)
 
-        assert solver_pec.tA_fraction.to_matrix("y")[dual_face_index] == pytest.approx(
+        assert solver_pec.tA_fraction.to_matrix("y")[edge_index] == pytest.approx(
             3.0 / 4.0
         )
 
-        assert solver_pec.tA_eff.to_matrix("y")[dual_face_index] == pytest.approx(
-            3.0 / 4.0
-        )
+        assert solver_pec.tA_eff.to_matrix("y")[edge_index] == pytest.approx(3.0 / 4.0)
 
         eps_face_pec = solver_pec.conformal_face_materials["dual"]["y"]["eps_r"][
             dual_face_index
@@ -4826,7 +4833,7 @@ class TestGridFIT3DMeshing:
 
         # Dual y-face:
         # active normal area = 3/4
-        assert solver_pec_applied.itA.to_matrix("y")[dual_face_index] == pytest.approx(
+        assert solver_pec_applied.itA.to_matrix("y")[edge_index] == pytest.approx(
             4.0 / 3.0
         )
 

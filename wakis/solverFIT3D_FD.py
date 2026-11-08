@@ -303,12 +303,14 @@ class SolverFIT3D_FD(
     def _build_sibc_geometry(self):
         """Prepare scalar SIBC coefficients on *primal faces* once.
 
-        Stored magnetic unknowns correspond to primal faces shifted in the
-        normal direction. Therefore use _primal_face_array_to_dual_edge_component,
-        NOT _face_array_to_field_component (which uses low-side faces).
+        Stored magnetic unknown Hx(i,j,k) is the flux through primal face
+        (i,j,k), as defined by the curl matrix C (see
+        _primal_face_array_to_dual_edge_component). High-side boundary
+        faces have no stored magnetic DOF.
 
-        First-order approximation: H is taken parallel to the FIT face normal.
-        Geometry coefficient g = cut_length * sin(theta) / active_face_area.
+        First-order approximation: H is taken tangential to the wall, with
+        its face-normal component as the FIT unknown. Geometry coefficient
+        g = cut_length / (active_face_area * sin(theta)).
         The normal-region permeability used in the conversion b -> H is saved
         separately; SIBC material permeability belongs in Zs, not here.
         """
@@ -373,14 +375,29 @@ class SolverFIT3D_FD(
                     or field_material[1] <= 0
                 ):
                     raise ValueError(f"Invalid SIBC material: {direction} {index}")
-                # g[index] = length * sin_theta / area
                 g[index] = length / (area * sin_theta)
-                # g[index] = length * 1 / area
                 sig[index] = wall_material[2]
                 mu_wall[index] = wall_material[1]
                 mu_field[index] = field_material[1]
 
-            # Shift from primal face index to stored magnetic H DOF.
+            # High-side primal faces are not represented in the
+            # stored magnetic DOF space.
+            high = [slice(None)] * 3
+            high[axis] = -1
+
+            if np.any(g[tuple(high)] > 0):
+                bc = self.bc_high[axis].lower()
+
+                if bc not in ("pec", "electric"):
+                    raise NotImplementedError(
+                        f"SIBC on high-side {direction} faces "
+                        "requires explicit boundary treatment"
+                    )
+
+                # Outer PEC boundary: tangential E is zero.
+                # No additional SIBC correction is required.
+
+            # Map primal faces to stored magnetic H DOFs.
             # WAKIS uses x-fastest indexing, corresponding to order="F".
             offset = axis * self.N
             target = slice(offset, offset + self.N)
@@ -400,23 +417,6 @@ class SolverFIT3D_FD(
             self.sibc_mu_field[target] = self._primal_face_array_to_dual_edge_component(
                 mu_field, direction
             ).ravel(order="F")
-
-        # Low-side primal faces are not represented in the
-        # stored magnetic DOF space.
-        low = [slice(None)] * 3
-        low[axis] = 0
-
-        if np.any(g[tuple(low)] > 0):
-            bc = self.bc_low[axis].lower()
-
-            if bc not in ("pec", "electric"):
-                raise NotImplementedError(
-                    f"SIBC on low-side {direction} faces "
-                    "requires explicit boundary treatment"
-                )
-
-            # Outer PEC boundary: tangential E is zero.
-            # No additional SIBC correction is required.
 
         self.has_sibc = bool(np.any(self.sibc_g > 0))
 
