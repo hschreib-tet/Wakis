@@ -491,7 +491,8 @@ class TestGridFIT3DMeshing:
         dual_mask[1, 1, 1] = True
         dual_mask[1, 0, 1] = True
 
-        # For mu_x[0, 0, 0], the associated primal yz face uses
+        # For mu_x[1, 0, 0], the associated primal yz face at x[1]
+        # (curl matrix C) uses
         #
         # (1,0,0), (1,1,0), (1,1,1), (1,0,1).
         #
@@ -579,7 +580,7 @@ class TestGridFIT3DMeshing:
         # mu_eff / mu_0 = (3 + 3 + 3 + 1) / 4 = 2.5
         expected_mu = 2.5 * mu_0
 
-        assert solver.imu.field_x[0, 0, 0] == pytest.approx(1.0 / expected_mu)
+        assert solver.imu.field_x[1, 0, 0] == pytest.approx(1.0 / expected_mu)
 
         # Conductive material must enable conductivity treatment.
         assert solver.use_conductivity
