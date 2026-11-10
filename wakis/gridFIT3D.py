@@ -70,7 +70,6 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
         conformal_stabilization=None,
         conformal_stabilization_fraction=None,
         conformal_min_edge_fraction=None,
-        conformal_pec_snap_fraction=None,
         subpixel_smoothing=False,
         subpixel_smoothing_factor=4,
         subpixel_smoothing_threshold=0.3,
@@ -157,17 +156,11 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
         verbose : int or bool, optional
             Enable verbose output on the terminal. Use `verbose=2` for more detail.
         bg_material_type : str, optional
-            Material treatment of region 0. Required by the conformal
-            geometry pipeline when PEC snapping is enabled. Default is
-            None.
-        conformal_stabilization : {None, "snapping", "area_floor"}, optional
+            Material treatment of region 0, used by the conformal geometry
+            pipeline to classify interfaces. Default is None.
+        conformal_stabilization : {None, "area_floor"}, optional
             Treatment of small cut cells at PEC/SIBC walls in conformal mode,
             which otherwise limit the stable time step. Default is None.
-
-            ``"snapping"``: normal-conductor edges whose active normal
-            fraction is below ``conformal_stabilization_fraction`` are
-            removed by moving the wall onto the adjacent grid point. This
-            changes the discretized geometry by up to fraction * cell size.
 
             ``"area_floor"``: the geometry is kept. In the time-stepping
             metric, primal faces cut by a conductor use at least
@@ -177,18 +170,14 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
             conductor. Without the edge elimination, raised areas next to
             nearly covered edges create spurious low-frequency modes.
         conformal_stabilization_fraction : float, optional
-            Snapping: minimum active normal edge fraction, 0 < value < 0.5.
             Area floor: minimum area fraction of conductor-cut faces,
-            0 < value <= 1. Default is 0.1 for both.
+            0 < value <= 1. Default is 0.1.
         conformal_min_edge_fraction : float, optional
             Area floor only: conductor-cut edges with a smaller active
             fraction are eliminated (E set to zero), 0 <= value < 0.5.
             Default (None) uses the area floor value. With this choice no
             spurious localized modes were found while the mesh resolves the
             wavelength with at least about 6 cells.
-        conformal_pec_snap_fraction : float, optional
-            Deprecated. Equivalent to ``conformal_stabilization="snapping"``
-            with ``conformal_stabilization_fraction`` set to this value.
 
         Attributes
         ----------
@@ -240,7 +229,6 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
             conformal_stabilization,
             conformal_stabilization_fraction,
             conformal_min_edge_fraction,
-            conformal_pec_snap_fraction,
         )
 
         # Primary and dual edges whose endpoints belong to different regions
@@ -256,16 +244,6 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
         }
 
         self.interior_interface_edge_masks = {
-            "primal": {},
-            "dual": {},
-        }
-
-        self.endpoint_interface_edge_masks = {
-            "primal": {},
-            "dual": {},
-        }
-
-        self.snapped_point_data = {
             "primal": {},
             "dual": {},
         }
