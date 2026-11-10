@@ -146,7 +146,7 @@ def test_dielectric_interface_keeps_dual_geometry(tmp_path):
 
 
 # ----------------------------------------------------------------------
-# Small-cut-cell treatment: snapping or area floor
+# Small-cut-cell treatment: area floor
 # ----------------------------------------------------------------------
 
 
@@ -160,47 +160,22 @@ def test_stabilization_selector_validation():
     assert grid.conformal_area_floor == pytest.approx(0.1)
     # The edge threshold defaults to the floor value.
     assert grid.conformal_min_edge_fraction == pytest.approx(0.1)
-    assert grid.conformal_pec_snap_fraction == 0.0
-
-    grid = _unit_grid(
-        geometry_mode="conformal",
-        bg_material_type="normal",
-        conformal_stabilization="snapping",
-        conformal_stabilization_fraction=0.2,
-    )
-    assert grid.conformal_pec_snap_fraction == pytest.approx(0.2)
-    assert grid.conformal_area_floor == 0.0
 
     assert _unit_grid().conformal_stabilization == "none"
+    assert _unit_grid().conformal_area_floor == 0.0
 
     with pytest.raises(ValueError):
         _unit_grid(conformal_stabilization="merging")
     with pytest.raises(ValueError):
-        _unit_grid(
-            conformal_stabilization="snapping", conformal_stabilization_fraction=0.6
-        )
+        # PEC snapping was removed in favor of the area floor
+        _unit_grid(conformal_stabilization="snapping")
     with pytest.raises(ValueError):
         _unit_grid(
             conformal_stabilization="area_floor", conformal_stabilization_fraction=0.0
         )
     with pytest.raises(ValueError):
-        # snapping in conformal mode needs the background material type
-        _unit_grid(geometry_mode="conformal", conformal_stabilization="snapping")
-
-
-def test_deprecated_snap_fraction_maps_to_snapping():
-    with pytest.warns(DeprecationWarning):
-        grid = _unit_grid(
-            geometry_mode="conformal",
-            bg_material_type="normal",
-            conformal_pec_snap_fraction=0.1,
-        )
-    assert grid.conformal_stabilization == "snapping"
-    assert grid.conformal_pec_snap_fraction == pytest.approx(0.1)
-
-    with pytest.raises(ValueError):
         _unit_grid(
-            conformal_pec_snap_fraction=0.1, conformal_stabilization="area_floor"
+            conformal_stabilization="area_floor", conformal_min_edge_fraction=0.5
         )
 
 
