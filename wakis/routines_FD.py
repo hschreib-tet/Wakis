@@ -97,10 +97,9 @@ class RoutinesFDMixin:
         yt = self.wake.ytest
 
         # Ez(i, j, :) lies on the primal grid lines (grid.x[i], grid.y[j]),
-        # as for the time-domain beam source; self.x / self.y are cell
-        # centres and would shift the beam by half a cell or more.
-        x_ez = self.grid.x[: self.Nx]
-        y_ez = self.grid.y[: self.Ny]
+        # as for the time-domain beam source.
+        x_ez = self.grid.x
+        y_ez = self.grid.y
 
         ixs = np.abs(x_ez - xs).argmin()
 
@@ -167,7 +166,11 @@ class RoutinesFDMixin:
             dtype=np.complex128,
         )
 
-        z_path = self.z
+        # Physical Ez edges k = 0 ... Nz-2 at the primal edge midpoints
+        # tz[1:Nz], as for the time-domain beam source. The last stored Ez
+        # is a zero-length ghost edge of the symmetric FIT stencil.
+        ez_path = slice(0, self.Nz - 1)
+        z_path = self.tz[1 : self.Nz]
 
         # ----------------------------------------------------------
         # Check beam trajectory once
@@ -178,7 +181,7 @@ class RoutinesFDMixin:
         source[
             ixs,
             iys,
-            :,
+            ez_path,
             "z",
         ] = 1.0
 
@@ -230,7 +233,7 @@ class RoutinesFDMixin:
             source[
                 ixs,
                 iys,
-                :,
+                ez_path,
                 "z",
             ] = current * np.exp(-1j * k * z_path)
 
@@ -263,7 +266,7 @@ class RoutinesFDMixin:
                     -e_field[
                         ixt,
                         iyt,
-                        :,
+                        ez_path,
                         "z",
                     ]
                     @ test_phase
@@ -445,8 +448,8 @@ class RoutinesFDMixin:
         velocity = beta * c_light
 
         # Ez lines on the primal grid lines (see impedance_sweep).
-        x_ez = self.grid.x[: self.Nx]
-        y_ez = self.grid.y[: self.Ny]
+        x_ez = self.grid.x
+        y_ez = self.grid.y
 
         ixs = np.abs(x_ez - self.wake.xsource).argmin()
 
@@ -463,18 +466,16 @@ class RoutinesFDMixin:
         if skip_cells < 0:
             raise ValueError("skip_cells must be non-negative.")
 
-        if 2 * skip_cells >= self.Nz:
+        # Physical Ez edges k = 0 ... Nz-2 at the primal edge midpoints
+        # tz[1:Nz]; the last stored Ez is a zero-length ghost edge.
+        n_edges = self.Nz - 1
+
+        if 2 * skip_cells >= n_edges:
             raise ValueError("skip_cells removes the complete z path.")
 
-        if skip_cells == 0:
-            z_slice = slice(None)
-        else:
-            z_slice = slice(
-                skip_cells,
-                -skip_cells,
-            )
+        z_slice = slice(skip_cells, n_edges - skip_cells)
 
-        z_path = self.z[z_slice]
+        z_path = self.tz[1 : self.Nz][z_slice]
 
         # ----------------------------------------------------------
         # Reconstruct longitudinal grid voltages of each mode

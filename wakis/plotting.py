@@ -1817,7 +1817,7 @@ class PlotMixinSolver:
                 k,
             )
 
-            valid_next = i + 1 < grid.Nx
+            valid_next = i + 1 < len(grid.x) - 1
 
         elif direction == "y":
             next_index = (
@@ -1826,7 +1826,7 @@ class PlotMixinSolver:
                 k,
             )
 
-            valid_next = j + 1 < grid.Ny
+            valid_next = j + 1 < len(grid.y) - 1
 
         elif direction == "z":
             next_index = (
@@ -1835,7 +1835,7 @@ class PlotMixinSolver:
                 k + 1,
             )
 
-            valid_next = k + 1 < grid.Nz
+            valid_next = k + 1 < len(grid.z) - 1
 
         else:
             raise ValueError(f"Unknown edge direction '{direction}'.")
@@ -2550,8 +2550,8 @@ class PlotMixinSolver:
                 i = slice_index
 
                 # y-directed edges
-                for j in range(grid.Ny):
-                    for k in range(grid.Nz + 1):
+                for j in range(len(y) - 1):
+                    for k in range(len(z)):
                         p0 = np.array(
                             [
                                 x[i],
@@ -2582,8 +2582,8 @@ class PlotMixinSolver:
                         )
 
                 # z-directed edges
-                for j in range(grid.Ny + 1):
-                    for k in range(grid.Nz):
+                for j in range(len(y)):
+                    for k in range(len(z) - 1):
                         p0 = np.array(
                             [
                                 x[i],
@@ -2617,8 +2617,8 @@ class PlotMixinSolver:
                 j = slice_index
 
                 # x-directed edges
-                for i in range(grid.Nx):
-                    for k in range(grid.Nz + 1):
+                for i in range(len(x) - 1):
+                    for k in range(len(z)):
                         p0 = np.array(
                             [
                                 x[i],
@@ -2649,8 +2649,8 @@ class PlotMixinSolver:
                         )
 
                 # z-directed edges
-                for i in range(grid.Nx + 1):
-                    for k in range(grid.Nz):
+                for i in range(len(x)):
+                    for k in range(len(z) - 1):
                         p0 = np.array(
                             [
                                 x[i],
@@ -2684,8 +2684,8 @@ class PlotMixinSolver:
                 k = slice_index
 
                 # x-directed edges
-                for i in range(grid.Nx):
-                    for j in range(grid.Ny + 1):
+                for i in range(len(x) - 1):
+                    for j in range(len(y)):
                         p0 = np.array(
                             [
                                 x[i],
@@ -2716,8 +2716,8 @@ class PlotMixinSolver:
                         )
 
                 # y-directed edges
-                for i in range(grid.Nx + 1):
-                    for j in range(grid.Ny):
+                for i in range(len(x)):
+                    for j in range(len(y) - 1):
                         p0 = np.array(
                             [
                                 x[i],

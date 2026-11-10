@@ -22,15 +22,9 @@ class TestBoundaryConditions:
         """
         Regression test for PEC boundary masking.
 
-        WAKIS stores only Nx*Ny*Nz DOFs per field component.
-        Therefore, tangential E-field DOFs exist explicitly on the
-        low-side boundaries, but not on the high-side boundaries.
-
-        Low-side PEC boundaries must mask the corresponding stored
-        tangential E-field DOFs.
-
-        High-side PEC boundaries must not mask the last stored
-        interior field layer.
+        With the symmetric FIT stencil, Nx, Ny, Nz count primal nodes and
+        both boundary node planes are stored. Tangential E-field DOFs on
+        the low- and high-side PEC walls must therefore both be masked.
         """
 
         grid = GridFIT3D(
@@ -77,10 +71,6 @@ class TestBoundaryConditions:
                 low_mask = solver.BC[1:-1, 1:-1, 0, component]
                 high_mask = solver.BC[1:-1, 1:-1, -1, component]
 
-            # The explicit low-side tangential DOFs belong to the PEC
-            # boundary and therefore have to be removed.
+            # Tangential DOFs on both PEC walls are removed.
             assert np.all(low_mask == 0)
-
-            # The high-side boundary DOFs are not stored explicitly.
-            # The final stored layer is an interior layer and must remain.
-            assert np.all(high_mask == 1)
+            assert np.all(high_mask == 0)

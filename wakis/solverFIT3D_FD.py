@@ -179,13 +179,20 @@ class SolverFIT3D_FD(
 
         The geometric PEC/SIBC exclusion is shared. The impedance of SIBC
         boundaries is *not* included in this mask and must enter the FD
-        operator through D_Zs later.
+        operator through D_Zs later. Electric Dirichlet boundaries (PEC
+        walls, periodic high-side copies) and the zero-length ghost edges
+        of the symmetric FIT stencil are inactive as well.
         """
         active_material = self.iDeps.diagonal() != 0.0
         active_boundary = self.bc_mask_E.toarray().astype(bool)
         self.active_conductor_E = self._build_conductor_e_dof_mask()
 
-        self.active_E = active_material & active_boundary & self.active_conductor_E
+        # The last primal edge along each axis has zero length (L = 0).
+        active_edge = self.Ds.diagonal() != 0.0
+
+        self.active_E = (
+            active_material & active_boundary & active_edge & self.active_conductor_E
+        )
         self.free_E_idx = np.flatnonzero(self.active_E)
 
     def _assemble_fd_operators(self):
@@ -305,8 +312,9 @@ class SolverFIT3D_FD(
 
         Stored magnetic unknown Hx(i,j,k) is the flux through primal face
         (i,j,k), as defined by the curl matrix C (see
-        _primal_face_array_to_dual_edge_component). High-side boundary
-        faces have no stored magnetic DOF.
+        _primal_face_array_to_dual_edge_component). With the symmetric FIT
+        stencil every physical primal face, including the domain-boundary
+        faces on both sides, has a stored magnetic DOF.
 
         First-order approximation: H is taken tangential to the wall, with
         its face-normal component as the FIT unknown. Geometry coefficient
@@ -361,15 +369,7 @@ class SolverFIT3D_FD(
                 # i.e. the area that converts b -> H in the regular FIT
                 # term. With conformal_stabilization="area_floor" this is the
                 # floored area; the SIBC term must use the same H.
-                if index[axis] < (self.Nx, self.Ny, self.Nz)[axis]:
-                    area = 1.0 / float(self.iA.to_matrix(direction)[index])
-                else:
-                    # High-side face without stored H DOF (dropped below).
-                    area = max(
-                        float(geom["region_areas"][index][field_ids[0]]),
-                        getattr(self, "conformal_area_floor", 0.0)
-                        * float(geom["face_area"][index]),
-                    )
+                area = 1.0 / float(self.iA.to_matrix(direction)[index])
                 normal = np.asarray(segment["normal"], dtype=float)
                 length = float(segment["length"])
                 if normal.shape != (3,) or not np.all(np.isfinite(normal)):
@@ -394,43 +394,21 @@ class SolverFIT3D_FD(
                 mu_wall[index] = wall_material[1]
                 mu_field[index] = field_material[1]
 
-            # High-side primal faces are not represented in the
-            # stored magnetic DOF space.
-            high = [slice(None)] * 3
-            high[axis] = -1
-
-            if np.any(g[tuple(high)] > 0):
-                bc = self.bc_high[axis].lower()
-
-                if bc not in ("pec", "electric"):
-                    raise NotImplementedError(
-                        f"SIBC on high-side {direction} faces "
-                        "requires explicit boundary treatment"
-                    )
-
-                # Outer PEC boundary: tangential E is zero.
-                # No additional SIBC correction is required.
-
-            # Map primal faces to stored magnetic H DOFs.
+            # Map primal faces to stored magnetic H DOFs. Zero-area ghost
+            # faces carry no SIBC (g = 0, mu_field = 1).
             # WAKIS uses x-fastest indexing, corresponding to order="F".
             offset = axis * self.N
             target = slice(offset, offset + self.N)
 
-            self.sibc_g[target] = self._primal_face_array_to_dual_edge_component(
-                g, direction
-            ).ravel(order="F")
-
-            self.sibc_sigma[target] = self._primal_face_array_to_dual_edge_component(
-                sig, direction
-            ).ravel(order="F")
-
-            self.sibc_mu_wall[target] = self._primal_face_array_to_dual_edge_component(
-                mu_wall, direction
-            ).ravel(order="F")
-
-            self.sibc_mu_field[target] = self._primal_face_array_to_dual_edge_component(
-                mu_field, direction
-            ).ravel(order="F")
+            for stored, values, fill in (
+                (self.sibc_g, g, 0.0),
+                (self.sibc_sigma, sig, 0.0),
+                (self.sibc_mu_wall, mu_wall, 0.0),
+                (self.sibc_mu_field, mu_field, 1.0),
+            ):
+                stored[target] = self._primal_face_array_to_dual_edge_component(
+                    values, direction, fill
+                ).ravel(order="F")
 
         self.has_sibc = bool(np.any(self.sibc_g > 0))
 

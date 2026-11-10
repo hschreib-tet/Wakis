@@ -62,6 +62,14 @@ Note that the number of cells will heavily affect the simulation time (in partic
 ```
 
 ### `STL` geometry importing
+
+The `stl_method="voxelize_rectilinear"` option requires a uniform grid and
+samples the centres of its physical cells. Optional `subpixel_smoothing=True`
+uses aligned subcell samples. Stored masks retain the full grid dimensions;
+terminal boundary labels inherit the nearest physical-cell values, including
+smoothing when enabled. This assumes no material change within the final
+half-cell. For nonuniform meshes, use `stl_method="interior_points"`.
+
 In beam-coupling impedance simulations one is usually interested in the geometric impedance, together with the impedance coming from material properties. In `wakis`, the geometry to simulate (sometimes referred as Embedded boundaries) can be imported from a `.stl` file containing a CAD model, and the units should be meters [m].
 
 ```python
@@ -131,6 +139,13 @@ grid = GridFIT3D(xmin, xmax, ymin, ymax, zmin, zmax,
                 )
 ```
 
+`Nx`, `Ny`, and `Nz` count stored primal nodes, including the high boundary
+node. There are `Nx - 1`, `Ny - 1`, and `Nz - 1` physical intervals.
+The same convention applies to refined grids and grids restored with
+`GridFIT3D(load_from_h5=...)`.
+
+`grid.save_to_h5("grid.h5")` saves the primal nodes and any STL cell masks in the current stencil layout. Loading rebuilds the dual coordinates and FIT metrics from those nodes; the file does not store separate metric arrays.
+
 Optionally, the `grid` of the simulation can be inspected interactively in 3D (thanks to PyVista):
 
 ```python
@@ -190,6 +205,10 @@ bc_low = ['pec', 'pec', 'cpml']
 bc_high = ['pec', 'pec', 'cpml']
 # Pass these lists when constructing SolverFIT3D.
 ```
+For CPML, `n_pml` counts physical cells. Electric and magnetic absorption
+profiles follow their staggered node and edge-midpoint positions, including
+on nonuniform grids; terminal storage is excluded from magnetic corrections.
+
 ### Accessing `solver`'s fields, matrices and simulation parameters
 Similarly to `grid`, the solver exposes its fields and parameters as attributes. Inspect the calculated timestep with:
 
@@ -285,10 +304,12 @@ Sources in `wakis` can be:
 
 The sources can modify components of the $E$ and $H$ fields or the current $J$. Each source updates the solver once per timestep.
 
+All waveform sources use hard injection by default, assigning their evaluated values to the selected components. Pass `injection="soft"` to add the values to the existing fields instead. The `Beam` source uses its own moving-current and TF/SF injection path.
+
 To add a time-dependent source, one can simply setup a time-loop and run the routine `solver.one_step()` after the source has been applied (see [Running a simulation](#running-a-simulation) section). However, a more optimized way is to pass a `source` to the EM solver. The `source` objects available inside `sources.py` are:
 * `Beam`: a line source for $J_z$ that adds a Gaussian current traversing the domain from z- to z+. Its longitudinal size $\sigma_z$, total charge $q$, and transverse position are constructor arguments.
-* `PlaneWave`: a port source that excites a sinusoidal plane wave in the +$z$ direction by modifying $E_x$ and $H_y$ in an $xy$ plane.
-* `WavePacket`: a port source for a Gaussian wave packet travelling in +$z$, with configurable frequency or wavelength, longitudinal size, transverse size, and speed.
+* `PlaneWave`: a port source that excites a sinusoidal TM plane wave at angle `theta` from +$z$ towards +$x$ by modifying $E_x$, $E_z$, and $H_y$ in an $xy$ plane. The default `theta=0` gives propagation along +$z$.
+* `WavePacket`: a port source for a TM Gaussian wave packet travelling in the $x$-$z$ plane, with configurable angle from +$z$, frequency or wavelength, longitudinal size, transverse size, and speed.
 * `Dipole`: Updates the user-defined field and component every timestep to introduce a dipole-like sinusoidal excitation
 * `Pulse`: Injects an electromagnetic pulse at the given source point (xs, ys, zs), with the selected shape {"Harris", "Gaussian", "Rectangular"}, length, and amplitude
 
@@ -341,6 +362,19 @@ As can be deduced from the instantiation, the `wake` object contains the informa
 ```{tip}
 The `skip_cells` parameter excludes the specified number of cells at each end of the wake integration path. For example, `skip_cells=10` can avoid perturbations near the beam injection or reflections from the domain boundaries. The older `add_space` argument to `wakesolve` remains available for compatibility.
 ```
+
+The beam and test positions snap to the nearest primal x/y nodes. Longitudinal
+`Jz` and `Ez` samples lie at the midpoints of the physical z-edges. In the saved
+HDF5 file, `z` holds these midpoints and `dz` their integration lengths.
+The domain boundaries are recovered from the end midpoints and half-lengths.
+When reading this file, `WakeSolver.zf` holds the saved field positions;
+`WakeSolver.z` optionally supplies full-domain coordinates to define the beam's
+flight-time reference. Supply `z` explicitly for a field monitor covering only
+part of the longitudinal domain. `skip_cells` trims the integration path without
+changing that reference.
+`Ez` snapshots use
+`t=n*dt`; optional `Jz` snapshots use `t=(n+1/2)*dt`. Transverse wakes require
+neighboring x/y nodes around the selected test position.
 
 ### Running a wakefield simulation
 A wakefield simulation can be run using `solver.wakesolve()`. It advances the electromagnetic fields until the requested `wakelength` is reached, saves the longitudinal electric field to the wake solver's `Ez_file`, and computes wake potentials and impedances. Reset the fields if reusing the solver from the preceding examples:
