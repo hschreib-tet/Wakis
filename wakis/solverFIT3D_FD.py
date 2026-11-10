@@ -55,15 +55,19 @@ class SolverFIT3D_FD(
         """
         Build the active electric degree-of-freedom set.
 
-        Electric DOFs are inactive if they belong either to
-        a PEC material or to an electric Dirichlet boundary.
+        Electric DOFs are inactive if they belong to a PEC material, to an
+        electric Dirichlet boundary (PEC wall or periodic high-side copy),
+        or to a zero-length ghost edge of the symmetric FIT stencil.
         """
 
         active_material = self.iDeps.diagonal() != 0.0
 
         active_boundary = self.bc_mask_E.toarray().astype(bool)
 
-        self.active_E = active_material & active_boundary
+        # The last primal edge along each axis has zero length (L = 0).
+        active_edge = self.Ds.diagonal() != 0.0
+
+        self.active_E = active_material & active_boundary & active_edge
 
         self.free_E_idx = np.flatnonzero(self.active_E)
 

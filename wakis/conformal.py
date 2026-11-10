@@ -109,32 +109,33 @@ class ConformalGridMixin:
         """
         Derive a cell mask from a boolean mask on primal grid points.
 
-        The cell centers correspond to the interior dual grid points.
         The cell classification is obtained from the eight primal
-        corner-point classifications using a majority rule.
+        corner-point classifications using a majority rule. With
+        threshold=0.5, at least five of the eight corners must lie inside
+        the solid.
 
-        With threshold=0.5, at least five of the eight primal corner
-        points must lie inside the solid.
+        The zero-extent high-side ghost cells of the symmetric stencil are
+        treated like PyVista does on the computational grid: their missing
+        corners repeat the boundary nodes. This matches the cell masks of
+        the legacy ``interior_points`` method.
 
         In conformal mode, this mask is stored in ``self.grid[key]``.
-        It is also used as a backward-compatibility fallback to reconstruct
-        dual point masks from older HDF5 files.
 
         Parameters
         ----------
         point_mask : ndarray of bool
-            Boolean mask with shape (Nx+1, Ny+1, Nz+1).
+            Boolean mask with shape (Nx, Ny, Nz).
         threshold : float, optional
             Occupancy threshold used for the cell classification.
 
         Returns
         -------
         cell_mask : ndarray of bool
-            Boolean mask with shape (Nx, Ny, Nz).
+            Boolean mask with shape (Nx, Ny, Nz), including ghost cells.
         """
         point_mask = np.asarray(point_mask, dtype=bool)
 
-        expected_shape = (self.Nx + 1, self.Ny + 1, self.Nz + 1)
+        expected_shape = (self.Nx, self.Ny, self.Nz)
         if point_mask.shape != expected_shape:
             raise ValueError(
                 f"Expected primal point mask shape {expected_shape}, "
@@ -144,56 +145,20 @@ class ConformalGridMixin:
         if not 0.0 <= threshold <= 1.0:
             raise ValueError("threshold must be between 0 and 1.")
 
-        # Count how many of the eight corner points lie inside the STL.
-        # uint8 is sufficient (maximum value is 8) and avoids a large
-        # temporary floating-point array.
-        count = point_mask[:-1, :-1, :-1].astype(np.uint8)
+        # Repeat the high-side boundary nodes for the ghost cells.
+        p = np.pad(point_mask, ((0, 1), (0, 1), (0, 1)), mode="edge")
 
-        count += point_mask[1:, :-1, :-1]
-        count += point_mask[:-1, 1:, :-1]
-        count += point_mask[:-1, :-1, 1:]
-        count += point_mask[1:, 1:, :-1]
-        count += point_mask[1:, :-1, 1:]
-        count += point_mask[:-1, 1:, 1:]
-        count += point_mask[1:, 1:, 1:]
+        # uint8 is sufficient (maximum value is 8).
+        count = p[:-1, :-1, :-1].astype(np.uint8)
+        count += p[1:, :-1, :-1]
+        count += p[:-1, 1:, :-1]
+        count += p[:-1, :-1, 1:]
+        count += p[1:, 1:, :-1]
+        count += p[1:, :-1, 1:]
+        count += p[:-1, 1:, 1:]
+        count += p[1:, 1:, 1:]
 
         return count > 8.0 * threshold
-
-    def _cell_mask_to_dual_point_mask(self, cell_mask):
-        """
-        Reconstruct a dual-point mask from a primal cell mask.
-
-        This is a backward-compatibility helper for HDF5 files written before
-        direct dual-grid point classification was introduced. The current
-        conformal geometry pipeline classifies dual grid points directly.
-
-        Interior dual grid points coincide with primal cell centers. Values on
-        the additional high-side boundary planes are extended from the adjacent
-        cell-center values.
-
-        Parameters
-        ----------
-        cell_mask : ndarray of bool
-            Boolean cell mask with shape (Nx, Ny, Nz).
-
-        Returns
-        -------
-        dual_point_mask : ndarray of bool
-            Boolean mask with shape (Nx+1, Ny+1, Nz+1).
-        """
-        cell_mask = np.asarray(cell_mask, dtype=bool)
-
-        expected_shape = (self.Nx, self.Ny, self.Nz)
-        if cell_mask.shape != expected_shape:
-            raise ValueError(
-                f"Expected cell mask shape {expected_shape}, got {cell_mask.shape}."
-            )
-
-        return np.pad(
-            cell_mask,
-            ((0, 1), (0, 1), (0, 1)),
-            mode="edge",
-        )
 
     def _classify_coordinate_block_in_stl(
         self,
@@ -414,9 +379,10 @@ class ConformalGridMixin:
         For the primal grid, all points are classified using the selected
         STL method.
 
-        For the dual grid, the regular inner dual grid is classified using
-        the selected STL method. Points on the high-side boundary planes are
-        classified separately using interior_points.
+        For the dual grid, the interior dual points (primal cell centres)
+        are classified using the selected STL method. Points on the six
+        domain-boundary planes are classified separately using
+        interior_points.
         """
         x, y, z = self._get_grid_coordinates(grid_type)
 
@@ -435,87 +401,48 @@ class ConformalGridMixin:
             raise ValueError(f"Unknown grid type: {grid_type}")
 
         # ----------------------------------------------------------
-        # Regular inner dual grid
+        # Interior dual grid (primal cell centres)
+        #
+        # The dual coordinates are [x0, midpoints, x_end]. The interior
+        # block is regular on a uniform grid, so every STL method applies.
         # ----------------------------------------------------------
-        point_mask = np.zeros(
-            (
-                len(x),
-                len(y),
-                len(z),
-            ),
-            dtype=bool,
-        )
+        point_mask = np.zeros((len(x), len(y), len(z)), dtype=bool)
 
-        point_mask[
-            :-1,
-            :-1,
-            :-1,
-        ] = self._classify_coordinate_block_in_stl(
+        point_mask[1:-1, 1:-1, 1:-1] = self._classify_coordinate_block_in_stl(
             surf,
-            x[:-1],
-            y[:-1],
-            z[:-1],
+            x[1:-1],
+            y[1:-1],
+            z[1:-1],
             method,
             stl_tolerance,
             progress_bar=progress_bar,
         )
 
         # ----------------------------------------------------------
-        # High-side x plane
+        # Boundary planes (half-cell spacing to the domain boundary)
         #
-        # Includes the y/z high-side edges and the high-side corner.
+        # Classified with interior_points. x planes include all y/z
+        # points, y planes the remaining x, z planes the remaining x/y,
+        # so every boundary point is classified exactly once.
         # ----------------------------------------------------------
-        point_mask[
-            -1,
-            :,
-            :,
-        ] = self._classify_coordinate_block_in_stl(
-            surf,
-            x[-1:],
-            y,
-            z,
-            "interior_points",
-            stl_tolerance,
-            progress_bar=False,
-        )[0, :, :]
+        inner = slice(1, -1)
+        planes = []
+        for end in (0, -1):
+            planes.append(((end, slice(None), slice(None)), (x[[end]], y, z)))
+            planes.append(((inner, end, slice(None)), (x[inner], y[[end]], z)))
+            planes.append(((inner, inner, end), (x[inner], y[inner], z[[end]])))
 
-        # ----------------------------------------------------------
-        # High-side y plane
-        #
-        # x-high points have already been classified above.
-        # ----------------------------------------------------------
-        point_mask[
-            :-1,
-            -1,
-            :,
-        ] = self._classify_coordinate_block_in_stl(
-            surf,
-            x[:-1],
-            y[-1:],
-            z,
-            "interior_points",
-            stl_tolerance,
-            progress_bar=False,
-        )[:, 0, :]
-
-        # ----------------------------------------------------------
-        # High-side z plane
-        #
-        # x-high and y-high points have already been classified.
-        # ----------------------------------------------------------
-        point_mask[
-            :-1,
-            :-1,
-            -1,
-        ] = self._classify_coordinate_block_in_stl(
-            surf,
-            x[:-1],
-            y[:-1],
-            z[-1:],
-            "interior_points",
-            stl_tolerance,
-            progress_bar=False,
-        )[:, :, 0]
+        for index, (px, py, pz) in planes:
+            block = self._classify_coordinate_block_in_stl(
+                surf,
+                px,
+                py,
+                pz,
+                "interior_points",
+                stl_tolerance,
+                progress_bar=False,
+            )
+            point_mask[index] = block.reshape(point_mask[index].shape)
 
         return point_mask
 
@@ -539,8 +466,7 @@ class ConformalGridMixin:
         key : str
             STL solid key.
         primal_point_mask : ndarray of bool
-            Boolean mask on primal grid points with shape
-            (Nx+1, Ny+1, Nz+1).
+            Boolean mask on primal grid points with shape (Nx, Ny, Nz).
         dual_point_mask : ndarray of bool
             Boolean mask on dual grid points with shape
             (Nx+1, Ny+1, Nz+1).
@@ -1997,7 +1923,7 @@ class ConformalGridMixin:
             #   two z-directed edges at y_j and y_{j+1}
             #
             # Shape:
-            #   (Nx + 1, Ny, Nz)
+            #   (nx, ny - 1, nz - 1) for nx, ny, nz grid points
             # ------------------------------------------------------
             x_faces = (
                 y_edges[:, :, :-1]
@@ -2014,7 +1940,7 @@ class ConformalGridMixin:
             #   two z-directed edges at x_i and x_{i+1}
             #
             # Shape:
-            #   (Nx, Ny + 1, Nz)
+            #   (nx - 1, ny, nz - 1)
             # ------------------------------------------------------
             y_faces = (
                 x_edges[:, :, :-1]
@@ -2031,7 +1957,7 @@ class ConformalGridMixin:
             #   two y-directed edges at x_i and x_{i+1}
             #
             # Shape:
-            #   (Nx, Ny, Nz + 1)
+            #   (nx - 1, ny - 1, nz)
             # ------------------------------------------------------
             z_faces = (
                 x_edges[:, :-1, :]
@@ -3014,8 +2940,8 @@ class ConformalGridMixin:
 
         Both primal and dual grid-point masks are generated using the same
         selected STL classification method. For the dual grid, the selected
-        method is applied to the regular inner dual points, while high-side
-        boundary points are classified separately using ``interior_points``.
+        method is applied to the interior dual points, while points on the
+        domain-boundary planes are classified using ``interior_points``.
 
         The cell mask stored in ``self.grid[key]`` is derived from the primal
         point mask using the existing corner-point threshold rule.
@@ -3900,350 +3826,184 @@ class ConformalSolverMixin:
                         "mu_r": mu_r_eff,
                     }
 
-    def _edge_array_to_field_component(
-        self,
-        edge_values,
-        direction,
-    ):
-        """
-        Map a full primal/dual edge array to the edge DOFs stored by Field.
+    # ------------------------------------------------------------------
+    # Geometry array -> stored DOF mapping (symmetric FIT stencil)
+    #
+    # Nx, Ny, Nz count primal nodes. Every field component stores
+    # Nx * Ny * Nz values; entries without a geometric counterpart are
+    # zero-size ghost DOFs on the high side (L = 0 or iA = 0).
+    #
+    # Full geometry array shapes and the stored DOF they belong to:
+    #
+    #   primal x-edge (Nx-1, Ny,   Nz  )  (i,j,k)     -> Ex(i,j,k)
+    #   primal x-face (Nx,   Ny-1, Nz-1)  (i,j,k)     -> Hx(i,j,k)
+    #   dual   x-edge (Nx,   Ny+1, Nz+1)  (i,j+1,k+1) -> Hx(i,j,k)
+    #   dual   x-face (Nx+1, Ny,   Nz  )  (i+1,j,k)   -> Ex(i,j,k)
+    #
+    # and cyclically for y and z. The dual offsets follow from the dual
+    # coordinates tx = [x0, primal midpoints, x_end]: the dual line through
+    # the primal face centre y_{j+1/2} is ty[j+1], and the dual face
+    # around the primal edge midpoint x_{i+1/2} lies at tx[i+1].
+    # ------------------------------------------------------------------
 
-        The full edge arrays include high-side boundary edges, whereas the
-        solver stores Nx * Ny * Nz DOFs per component. Low-side boundary
-        DOFs are included; high-side boundary DOFs are not.
-        """
-        edge_values = np.asarray(edge_values)
+    _AXIS = {"x": 0, "y": 1, "z": 2}
 
-        expected_shapes = {
-            "x": (
-                self.Nx,
-                self.Ny + 1,
-                self.Nz + 1,
-            ),
-            "y": (
-                self.Nx + 1,
-                self.Ny,
-                self.Nz + 1,
-            ),
-            "z": (
-                self.Nx + 1,
-                self.Ny + 1,
-                self.Nz,
-            ),
-        }
+    def _geometry_array_shape(self, kind, direction):
+        """Full geometry-array shape of one primal/dual edge/face family."""
+        if direction not in self._AXIS:
+            raise ValueError(f"Unknown direction '{direction}'.")
 
-        if direction not in expected_shapes:
-            raise ValueError(f"Unknown edge direction '{direction}'.")
+        axis = self._AXIS[direction]
+        shape = [self.Nx, self.Ny, self.Nz]
 
-        if edge_values.shape != expected_shapes[direction]:
-            raise ValueError(
-                f"Expected {direction}-edge array shape "
-                f"{expected_shapes[direction]}, "
-                f"got {edge_values.shape}."
-            )
-
-        if direction == "x":
-            return edge_values[
-                :,
-                : self.Ny,
-                : self.Nz,
-            ]
-
-        if direction == "y":
-            return edge_values[
-                : self.Nx,
-                :,
-                : self.Nz,
-            ]
-
-        return edge_values[
-            : self.Nx,
-            : self.Ny,
-            :,
-        ]
-
-    def _face_array_to_field_component(
-        self,
-        face_values,
-        direction,
-    ):
-        """
-        Map a full grid-face array to the face DOFs stored in Field.
-
-        Full face-array shapes are:
-            x: (Nx + 1, Ny, Nz)
-            y: (Nx, Ny + 1, Nz)
-            z: (Nx, Ny, Nz + 1)
-
-        Field stores Nx * Ny * Nz values for every component and
-        therefore contains the low-side faces.
-        """
-        face_values = np.asarray(face_values)
-
-        expected_shapes = {
-            "x": (
-                self.Nx + 1,
-                self.Ny,
-                self.Nz,
-            ),
-            "y": (
-                self.Nx,
-                self.Ny + 1,
-                self.Nz,
-            ),
-            "z": (
-                self.Nx,
-                self.Ny,
-                self.Nz + 1,
-            ),
-        }
-
-        if direction not in expected_shapes:
-            raise ValueError(f"Unknown face direction '{direction}'.")
-
-        expected_shape = expected_shapes[direction]
-
-        if face_values.shape != expected_shape:
-            raise ValueError(
-                f"Expected {direction}-face array "
-                f"shape {expected_shape}, "
-                f"got {face_values.shape}."
-            )
-
-        if direction == "x":
-            return face_values[
-                : self.Nx,
-                :,
-                :,
-            ]
-
-        if direction == "y":
-            return face_values[
-                :,
-                : self.Ny,
-                :,
-            ]
-
-        return face_values[
-            :,
-            :,
-            : self.Nz,
-        ]
-
-    def _dual_face_array_to_primal_edge_component(
-        self,
-        face_values,
-        direction,
-        fill_value=np.nan,
-    ):
-        """
-        Map dual-face data to the associated stored primal-edge DOFs.
-
-        For interior primal edges the associated dual face is shifted by one
-        index in the two directions transverse to the edge:
-
-            Ex(i,j,k) <-> dual x-face (i,   j-1, k-1)
-            Ey(i,j,k) <-> dual y-face (i-1, j,   k-1)
-            Ez(i,j,k) <-> dual z-face (i-1, j-1, k)
-
-        Low-side boundary edges do not have a complete dual face inside the
-        physical domain. They are therefore left at ``fill_value`` here.
-        """
-        face_values = np.asarray(face_values)
-
-        expected_shapes = {
-            "x": (
-                self.Nx + 1,
-                self.Ny,
-                self.Nz,
-            ),
-            "y": (
-                self.Nx,
-                self.Ny + 1,
-                self.Nz,
-            ),
-            "z": (
-                self.Nx,
-                self.Ny,
-                self.Nz + 1,
-            ),
-        }
-
-        if direction not in expected_shapes:
-            raise ValueError(f"Unknown face direction '{direction}'.")
-
-        if face_values.shape != expected_shapes[direction]:
-            raise ValueError(
-                f"Expected dual {direction}-face array shape "
-                f"{expected_shapes[direction]}, "
-                f"got {face_values.shape}."
-            )
-
-        dtype = np.result_type(
-            face_values.dtype,
-            np.asarray(fill_value).dtype,
-        )
-
-        result = np.full(
-            (
-                self.Nx,
-                self.Ny,
-                self.Nz,
-            ),
-            fill_value,
-            dtype=dtype,
-        )
-
-        if direction == "x":
-            result[:, 1:, 1:] = face_values[
-                : self.Nx,
-                : self.Ny - 1,
-                : self.Nz - 1,
-            ]
-
-        elif direction == "y":
-            result[1:, :, 1:] = face_values[
-                : self.Nx - 1,
-                : self.Ny,
-                : self.Nz - 1,
-            ]
-
+        if kind == "primal_edge":
+            shape[axis] -= 1
+        elif kind == "primal_face":
+            shape = [n - 1 for n in shape]
+            shape[axis] += 1
+        elif kind == "dual_edge":
+            shape = [n + 1 for n in shape]
+            shape[axis] -= 1
+        elif kind == "dual_face":
+            shape[axis] += 1
         else:
-            result[1:, 1:, :] = face_values[
-                : self.Nx - 1,
-                : self.Ny - 1,
-                : self.Nz,
-            ]
+            raise ValueError(f"Unknown geometry array kind '{kind}'.")
+
+        return tuple(shape)
+
+    def _geometry_array_offset(self, kind, direction):
+        """Index offset from stored DOF (i,j,k) to the geometry array."""
+        axis = self._AXIS[direction]
+
+        if kind in ("primal_edge", "primal_face"):
+            return (0, 0, 0)
+        if kind == "dual_edge":
+            offset = [1, 1, 1]
+            offset[axis] = 0
+            return tuple(offset)
+        if kind == "dual_face":
+            offset = [0, 0, 0]
+            offset[axis] = 1
+            return tuple(offset)
+
+        raise ValueError(f"Unknown geometry array kind '{kind}'.")
+
+    def _geometry_array_to_field_component(
+        self,
+        values,
+        kind,
+        direction,
+        fill_value=None,
+    ):
+        """
+        Map a full primal/dual edge or face array to stored DOFs.
+
+        Stored DOF (i, j, k) takes ``values[(i, j, k) + offset]`` (see the
+        table above). Ghost DOFs without a geometric counterpart get
+        ``fill_value``:
+
+        - None (default): False for boolean arrays, NaN for floating-point
+          arrays (NaN means "no conformal value" to the material code).
+        - "nearest": copy the nearest stored value (used for region IDs).
+        - any scalar: that constant.
+        """
+        values = np.asarray(values)
+        expected_shape = self._geometry_array_shape(kind, direction)
+
+        if values.shape != expected_shape:
+            raise ValueError(
+                f"Expected {kind.replace('_', ' ')} {direction}-array shape "
+                f"{expected_shape}, got {values.shape}."
+            )
+
+        shape = (self.Nx, self.Ny, self.Nz)
+        oi, oj, ok = self._geometry_array_offset(kind, direction)
+        source = values[
+            oi : oi + shape[0],
+            oj : oj + shape[1],
+            ok : ok + shape[2],
+        ]
+
+        if source.shape == shape:
+            return source.copy()
+
+        if isinstance(fill_value, str) and fill_value == "nearest":
+            padding = [(0, n - m) for n, m in zip(shape, source.shape)]
+            return np.pad(source, padding, mode="edge")
+
+        if fill_value is None:
+            if values.dtype == bool:
+                fill_value = False
+            elif np.issubdtype(values.dtype, np.floating):
+                fill_value = np.nan
+            else:
+                raise ValueError(
+                    f"Ghost DOFs of a {values.dtype} array need an explicit "
+                    "fill_value (a constant or 'nearest')."
+                )
+
+        dtype = np.result_type(values.dtype, np.asarray(fill_value).dtype)
+        result = np.full(shape, fill_value, dtype=dtype)
+        result[: source.shape[0], : source.shape[1], : source.shape[2]] = source
 
         return result
 
+    def _edge_array_to_field_component(self, edge_values, direction, fill_value=None):
+        """Map a full primal-edge array to the stored electric DOFs."""
+        return self._geometry_array_to_field_component(
+            edge_values, "primal_edge", direction, fill_value
+        )
+
+    def _face_array_to_field_component(self, face_values, direction, fill_value=None):
+        """
+        Map a full primal-face array to the stored magnetic DOFs.
+
+        The curl matrix C defines Hx(i,j,k) as the flux through the primal
+        x-face (i, j, k) at x[i]; likewise for Hy and Hz.
+        """
+        return self._geometry_array_to_field_component(
+            face_values, "primal_face", direction, fill_value
+        )
+
     def _primal_face_array_to_dual_edge_component(
-        self,
-        face_values,
-        direction,
+        self, face_values, direction, fill_value=None
+    ):
+        """Map primal-face data to the stored dual-edge (magnetic) DOFs."""
+        return self._face_array_to_field_component(face_values, direction, fill_value)
+
+    def _dual_face_array_to_primal_edge_component(
+        self, face_values, direction, fill_value=None
     ):
         """
-        Map primal-face data to the associated stored dual-edge DOFs.
+        Map dual-face data to the stored primal-edge (electric) DOFs.
 
-        The curl matrix C defines the magnetic DOF Hx(i,j,k) as the flux
-        through the primal x-face at x[i]:
+            Ex(i,j,k) <-> dual x-face (i+1, j, k)
+            Ey(i,j,k) <-> dual y-face (i, j+1, k)
+            Ez(i,j,k) <-> dual z-face (i, j, k+1)
 
-            Hx(i,j,k) <-> primal x-face (i, j, k)
-            Hy(i,j,k) <-> primal y-face (i, j, k)
-            Hz(i,j,k) <-> primal z-face (i, j, k)
-
-        The high-side boundary faces (x[Nx], y[Ny], z[Nz]) have no stored
-        magnetic DOF.
+        Every electric DOF, including the boundary edges, has a dual face.
         """
-        face_values = np.asarray(face_values)
-
-        expected_shapes = {
-            "x": (
-                self.Nx + 1,
-                self.Ny,
-                self.Nz,
-            ),
-            "y": (
-                self.Nx,
-                self.Ny + 1,
-                self.Nz,
-            ),
-            "z": (
-                self.Nx,
-                self.Ny,
-                self.Nz + 1,
-            ),
-        }
-
-        if direction not in expected_shapes:
-            raise ValueError(f"Unknown face direction '{direction}'.")
-
-        if face_values.shape != expected_shapes[direction]:
-            raise ValueError(
-                f"Expected primal {direction}-face array shape "
-                f"{expected_shapes[direction]}, "
-                f"got {face_values.shape}."
-            )
-
-        return self._face_array_to_field_component(
-            face_values,
-            direction,
+        return self._geometry_array_to_field_component(
+            face_values, "dual_face", direction, fill_value
         )
 
     def _dual_edge_array_to_field_component(
-        self,
-        edge_values,
-        direction,
-        fill_value=np.nan,
+        self, edge_values, direction, fill_value=None
     ):
         """
         Map a full dual-edge array to the stored magnetic DOFs.
 
-        Dual x-edge (i, j, k) connects the dual points tx[i] and tx[i+1]
-        and therefore pierces the primal x-face at x[i+1]. Since Hx(i,j,k)
-        belongs to the primal x-face at x[i] (see
-        ``_primal_face_array_to_dual_edge_component``):
+            Hx(i,j,k) <-> dual x-edge (i, j+1, k+1)
+            Hy(i,j,k) <-> dual y-edge (i+1, j, k+1)
+            Hz(i,j,k) <-> dual z-edge (i+1, j+1, k)
 
-            Hx(i,j,k) <-> dual x-edge (i-1, j,   k)
-            Hy(i,j,k) <-> dual y-edge (i,   j-1, k)
-            Hz(i,j,k) <-> dual z-edge (i,   j,   k-1)
-
-        The low-side DOFs (i=0, j=0 or k=0 along the edge direction) belong
-        to half dual edges between the domain boundary and the first dual
-        point. These are not part of the dual-edge arrays and are set to
-        ``fill_value``.
+        Dual x-edge (i, ., .) spans tx[i]..tx[i+1] around x[i], including
+        the half edges at both domain boundaries, so every magnetic DOF has
+        a dual edge.
         """
-        edge_values = np.asarray(edge_values)
-
-        expected_shapes = {
-            "x": (self.Nx, self.Ny + 1, self.Nz + 1),
-            "y": (self.Nx + 1, self.Ny, self.Nz + 1),
-            "z": (self.Nx + 1, self.Ny + 1, self.Nz),
-        }
-
-        if direction not in expected_shapes:
-            raise ValueError(f"Unknown edge direction '{direction}'.")
-
-        if edge_values.shape != expected_shapes[direction]:
-            raise ValueError(
-                f"Expected dual {direction}-edge array shape "
-                f"{expected_shapes[direction]}, "
-                f"got {edge_values.shape}."
-            )
-
-        dtype = np.result_type(
-            edge_values.dtype,
-            np.asarray(fill_value).dtype,
+        return self._geometry_array_to_field_component(
+            edge_values, "dual_edge", direction, fill_value
         )
-
-        result = np.full(
-            (self.Nx, self.Ny, self.Nz),
-            fill_value,
-            dtype=dtype,
-        )
-
-        if direction == "x":
-            result[1:, :, :] = edge_values[
-                : self.Nx - 1,
-                : self.Ny,
-                : self.Nz,
-            ]
-
-        elif direction == "y":
-            result[:, 1:, :] = edge_values[
-                : self.Nx,
-                : self.Ny - 1,
-                : self.Nz,
-            ]
-
-        else:
-            result[:, :, 1:] = edge_values[
-                : self.Nx,
-                : self.Ny,
-                : self.Nz - 1,
-            ]
-
-        return result
 
     @staticmethod
     def _combine_conformal_diagonal_component(
@@ -4709,6 +4469,7 @@ class ConformalSolverMixin:
             field_fraction = self._edge_array_to_field_component(
                 full_fraction,
                 direction,
+                fill_value=1.0,
             )
 
             setattr(
@@ -4760,7 +4521,9 @@ class ConformalSolverMixin:
             setattr(
                 self.A_fraction_geometric,
                 f"field_{direction}",
-                self._face_array_to_field_component(full_fraction, direction).copy(),
+                self._face_array_to_field_component(
+                    full_fraction, direction, fill_value=1.0
+                ),
             )
 
             if area_floor > 0.0:
@@ -4776,10 +4539,13 @@ class ConformalSolverMixin:
             field_fraction = self._face_array_to_field_component(
                 full_fraction,
                 direction,
+                fill_value=1.0,
             )
 
-            # Grid stores inverse face areas.
-            base_area = np.divide(1.0, self.iA.to_matrix(direction))
+            # Grid stores inverse face areas; ghost faces (iA = 0) have
+            # zero area.
+            iA = self.iA.to_matrix(direction)
+            base_area = np.divide(1.0, iA, out=np.zeros_like(iA), where=iA != 0)
 
             setattr(
                 self.A_fraction,
@@ -4841,68 +4607,25 @@ class ConformalSolverMixin:
 
         Notes
         -----
-        At low-side boundaries, the dual face is truncated by the physical
-        domain boundary. Missing dual-face vertices are represented by
-        constant extrapolation of the nearest available dual-point value.
+        Ex(i,j,k) belongs to the dual x-face (i+1, j, k), whose corners are
+        the dual points (i+1, j..j+1, k..k+1). The dual grid includes the
+        domain boundaries, so boundary dual faces are complete half faces.
         """
-        point_values = np.asarray(point_values)
+        p = np.asarray(point_values)
 
-        Nx = point_values.shape[0] - 1
-        Ny = point_values.shape[1] - 1
-        Nz = point_values.shape[2] - 1
-
-        # ----------------------------------------------------------
-        # x-directed primal edges -> dual yz faces
-        # ----------------------------------------------------------
-        values = point_values[:Nx, :, :]
-
-        padded = np.pad(
-            values,
-            ((0, 0), (1, 0), (1, 0)),
-            mode="edge",
-        )
-
+        # Ex(i,j,k) -> dual yz face at tx[i+1]
         values_x = 0.25 * (
-            padded[:, 1 : Ny + 1, 1 : Nz + 1]
-            + padded[:, :Ny, 1 : Nz + 1]
-            + padded[:, :Ny, :Nz]
-            + padded[:, 1 : Ny + 1, :Nz]
+            p[1:, :-1, :-1] + p[1:, 1:, :-1] + p[1:, 1:, 1:] + p[1:, :-1, 1:]
         )
 
-        # ----------------------------------------------------------
-        # y-directed primal edges -> dual xz faces
-        # ----------------------------------------------------------
-        values = point_values[:, :Ny, :]
-
-        padded = np.pad(
-            values,
-            ((1, 0), (0, 0), (1, 0)),
-            mode="edge",
-        )
-
+        # Ey(i,j,k) -> dual xz face at ty[j+1]
         values_y = 0.25 * (
-            padded[1 : Nx + 1, :, 1 : Nz + 1]
-            + padded[:Nx, :, 1 : Nz + 1]
-            + padded[:Nx, :, :Nz]
-            + padded[1 : Nx + 1, :, :Nz]
+            p[:-1, 1:, :-1] + p[1:, 1:, :-1] + p[1:, 1:, 1:] + p[:-1, 1:, 1:]
         )
 
-        # ----------------------------------------------------------
-        # z-directed primal edges -> dual xy faces
-        # ----------------------------------------------------------
-        values = point_values[:, :, :Nz]
-
-        padded = np.pad(
-            values,
-            ((1, 0), (1, 0), (0, 0)),
-            mode="edge",
-        )
-
+        # Ez(i,j,k) -> dual xy face at tz[k+1]
         values_z = 0.25 * (
-            padded[1 : Nx + 1, 1 : Ny + 1, :]
-            + padded[:Nx, 1 : Ny + 1, :]
-            + padded[:Nx, :Ny, :]
-            + padded[1 : Nx + 1, :Ny, :]
+            p[:-1, :-1, 1:] + p[1:, :-1, 1:] + p[1:, 1:, 1:] + p[:-1, 1:, 1:]
         )
 
         return values_x, values_y, values_z
@@ -4917,41 +4640,37 @@ class ConformalSolverMixin:
         ----------
         point_values : ndarray
             Material values on the primal grid points with shape
-            (Nx+1, Ny+1, Nz+1).
+            (Nx, Ny, Nz).
 
         Returns
         -------
         values_x, values_y, values_z : ndarray
             Face-averaged material values associated with the x-, y-, and
             z-directed dual edges. Each array has shape (Nx, Ny, Nz).
+            Ghost DOFs (zero-area high-side faces) copy the nearest face.
         """
-        point_values = np.asarray(point_values)
+        p = np.asarray(point_values)
 
         # Hx(i,j,k) -> primal yz face at x[i] (see curl matrix C)
         values_x = 0.25 * (
-            point_values[:-1, :-1, :-1]
-            + point_values[:-1, 1:, :-1]
-            + point_values[:-1, 1:, 1:]
-            + point_values[:-1, :-1, 1:]
+            p[:, :-1, :-1] + p[:, 1:, :-1] + p[:, 1:, 1:] + p[:, :-1, 1:]
         )
 
         # Hy(i,j,k) -> primal xz face at y[j]
         values_y = 0.25 * (
-            point_values[:-1, :-1, :-1]
-            + point_values[1:, :-1, :-1]
-            + point_values[1:, :-1, 1:]
-            + point_values[:-1, :-1, 1:]
+            p[:-1, :, :-1] + p[1:, :, :-1] + p[1:, :, 1:] + p[:-1, :, 1:]
         )
 
         # Hz(i,j,k) -> primal xy face at z[k]
         values_z = 0.25 * (
-            point_values[:-1, :-1, :-1]
-            + point_values[1:, :-1, :-1]
-            + point_values[1:, 1:, :-1]
-            + point_values[:-1, 1:, :-1]
+            p[:-1, :-1, :] + p[1:, :-1, :] + p[1:, 1:, :] + p[:-1, 1:, :]
         )
 
-        return values_x, values_y, values_z
+        def pad(values):
+            padding = [(0, n - m) for n, m in zip(p.shape, values.shape)]
+            return np.pad(values, padding, mode="edge")
+
+        return pad(values_x), pad(values_y), pad(values_z)
 
     def _apply_stl_materials_conformal(self):
         """
@@ -4976,30 +4695,14 @@ class ConformalSolverMixin:
                 "with geometry_mode='conformal'."
             )
 
-        shape = (
-            self.Nx + 1,
-            self.Ny + 1,
-            self.Nz + 1,
-        )
+        # Point shapes: primal (Nx, Ny, Nz), dual (Nx+1, Ny+1, Nz+1).
+        primal_shape = (self.Nx, self.Ny, self.Nz)
+        dual_shape = (self.Nx + 1, self.Ny + 1, self.Nz + 1)
 
         # Initialize point-wise material values with the background material.
-        eps_dual = np.full(
-            shape,
-            self.eps_bg,
-            dtype=self.dtype,
-        )
-
-        sigma_dual = np.full(
-            shape,
-            self.sigma_bg,
-            dtype=self.dtype,
-        )
-
-        mu_primal = np.full(
-            shape,
-            self.mu_bg,
-            dtype=self.dtype,
-        )
+        eps_dual = np.full(dual_shape, self.eps_bg, dtype=self.dtype)
+        sigma_dual = np.full(dual_shape, self.sigma_bg, dtype=self.dtype)
+        mu_primal = np.full(primal_shape, self.mu_bg, dtype=self.dtype)
 
         # Assign STL material values to primal and dual grid points.
         for key in self.stl_solids.keys():
@@ -5088,8 +4791,8 @@ class ConformalSolverMixin:
         for direction in ("x", "y", "z"):
             # Electric DOFs correspond to primal edges.
             start, end = self.grid._get_edge_region_ids("primal", direction)
-            start = self._edge_array_to_field_component(start, direction)
-            end = self._edge_array_to_field_component(end, direction)
+            start = self._edge_array_to_field_component(start, direction, "nearest")
+            end = self._edge_array_to_field_component(end, direction, "nearest")
 
             same_normal = (start == end) & region_is_normal[start]
             fully_conductor = region_is_conductor[start] & region_is_conductor[end]
@@ -5134,18 +4837,9 @@ class ConformalSolverMixin:
 
             # Magnetic DOFs correspond to dual edges and primal faces.
             dual_start, dual_end = self.grid._get_edge_region_ids("dual", direction)
-            # Low-side half dual edges (fill -1) keep the averaged value.
-            dual_start = self._dual_edge_array_to_field_component(
-                dual_start, direction, fill_value=-1
-            )
-            dual_end = self._dual_edge_array_to_field_component(
-                dual_end, direction, fill_value=-1
-            )
-            has_dual_edge = dual_start >= 0
-            dual_same_normal = has_dual_edge & (dual_start == dual_end)
-            dual_same_normal[has_dual_edge] &= region_is_normal[
-                dual_start[has_dual_edge]
-            ]
+            dual_start = self._dual_edge_array_to_field_component(dual_start, direction)
+            dual_end = self._dual_edge_array_to_field_component(dual_end, direction)
+            dual_same_normal = (dual_start == dual_end) & region_is_normal[dual_start]
             mu_components[direction][dual_same_normal] = (
                 mu_regions[dual_start[dual_same_normal]] * mu_0
             )

@@ -10,7 +10,8 @@ from wakis.solverFIT3D_FD import SolverFIT3D_FD
 
 
 def test_impedance_sweep_beam_on_requested_ez_line():
-    grid = GridFIT3D(-1.0, 1.0, -1.0, 1.0, 0.0, 1.0, 8, 8, 6, verbose=0)
+    # Nx, Ny, Nz count primal nodes: 8 x 8 x 6 cells.
+    grid = GridFIT3D(-1.0, 1.0, -1.0, 1.0, 0.0, 1.0, 9, 9, 7, verbose=0)
     solver = SolverFIT3D_FD(
         grid,
         bc_low=["pec"] * 3,
@@ -42,3 +43,8 @@ def test_impedance_sweep_beam_on_requested_ez_line():
         # Ez(i, j, :) lies on the primal grid line (grid.x[i], grid.y[j]).
         assert grid.x[i] == xs
         assert grid.y[j] == ys
+
+        # The beam drives every physical Ez edge and not the zero-length
+        # ghost edge at the high z boundary.
+        assert np.all(np.abs(ez[i, j, :-1]) > 0)
+        assert ez[i, j, -1] == 0
