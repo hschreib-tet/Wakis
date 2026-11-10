@@ -30,3 +30,6 @@ notebooks/_009_generated/
 notebooks/_010_generated/
 notebooks/_011_generated/
 notebooks/_pillbox_mesh_convergence/
+notes/*
+tmp/*
+*.stl
