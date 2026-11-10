@@ -363,7 +363,11 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
 
             A_values = self.A_eff.toarray()
 
-            if np.any(A_values <= 0.0):
+            # Ghost faces of the symmetric stencil have zero area (iA = 0);
+            # all physical faces must keep a positive effective area.
+            physical = self.grid.iA.toarray() != 0
+
+            if np.any(A_values[physical] <= 0.0):
                 raise RuntimeError(
                     "Conformal primal effective face area must be positive."
                 )
@@ -374,7 +378,14 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
                 self.Nz,
             )
 
-            self.iA.fromarray(1.0 / A_values)
+            self.iA.fromarray(
+                np.divide(
+                    1.0,
+                    A_values,
+                    out=np.zeros_like(A_values),
+                    where=physical,
+                )
+            )
 
         self.update_logger(["grid", "background", "bg_material_type"])
 

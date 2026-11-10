@@ -57,10 +57,11 @@ def test_primal_face_mapping_matches_curl(plain_solver):
     """Hd(i,j,k) is the flux through the primal d-face (i,j,k)."""
     s = plain_solver
     C = s.C.tocsr()
+    # Nx, Ny, Nz count primal nodes (symmetric stencil).
     face_shapes = {
-        "x": (s.Nx + 1, s.Ny, s.Nz),
-        "y": (s.Nx, s.Ny + 1, s.Nz),
-        "z": (s.Nx, s.Ny, s.Nz + 1),
+        "x": (s.Nx, s.Ny - 1, s.Nz - 1),
+        "y": (s.Nx - 1, s.Ny, s.Nz - 1),
+        "z": (s.Nx - 1, s.Ny - 1, s.Nz),
     }
 
     for d in AXES:

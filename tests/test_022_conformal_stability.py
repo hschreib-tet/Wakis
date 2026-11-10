@@ -16,7 +16,7 @@ from wakis import GridFIT3D, SolverFIT3D  # noqa: E402
 
 def test_stable_timestep_equals_cfl_on_uncut_grid():
     """On a uniform periodic grid dt_max is exactly the CFL limit."""
-    grid = GridFIT3D(0, 1, 0, 2, 0, 3, 8, 10, 12, verbose=0)
+    grid = GridFIT3D(0, 1, 0, 2, 0, 3, 9, 11, 13, verbose=0)
     solver = SolverFIT3D(grid, use_stl=False, verbose=0)
 
     result = solver.compute_stable_timestep(verbose=False)
@@ -39,9 +39,9 @@ def slanted_cavity_grid(tmp_path_factory):
         0.2,
         -0.2,
         0.2,
-        10,
-        10,
-        10,
+        11,
+        11,
+        11,
         stl_solids={"cav": str(stl_file)},
         stl_materials={"cav": "vacuum"},
         stl_material_types={"cav": "normal"},
@@ -118,9 +118,9 @@ def test_dielectric_interface_keeps_dual_geometry(tmp_path):
         0.2,
         -0.2,
         0.2,
-        12,
-        12,
-        12,
+        13,
+        13,
+        13,
         stl_solids={"block": str(stl_file)},
         stl_materials={"block": [4.0, 2.0, 0.0]},
         stl_material_types={"block": "normal"},
@@ -151,7 +151,7 @@ def test_dielectric_interface_keeps_dual_geometry(tmp_path):
 
 
 def _unit_grid(**kwargs):
-    return GridFIT3D(0, 1, 0, 1, 0, 1, 2, 2, 2, verbose=0, **kwargs)
+    return GridFIT3D(0, 1, 0, 1, 0, 1, 3, 3, 3, verbose=0, **kwargs)
 
 
 def test_stabilization_selector_validation():
@@ -187,9 +187,9 @@ def _slanted_grid(stl_file, **kwargs):
         0.2,
         -0.2,
         0.2,
-        12,
-        12,
-        12,
+        13,
+        13,
+        13,
         stl_solids={"cav": str(stl_file)},
         stl_materials={"cav": "vacuum"},
         stl_material_types={"cav": "normal"},

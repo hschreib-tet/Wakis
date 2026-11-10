@@ -12,6 +12,7 @@ from scipy.constants import mu_0 as mu_0
 from wakis import GridFIT3D, SolverFIT3D
 
 
+@pytest.mark.slow
 class TestConformalGeometry:
     def test_conformal_geometry_masks(self):
         """
@@ -42,10 +43,10 @@ class TestConformalGeometry:
         solids = pv.read(solid_1) + pv.read(solid_2)
         xmin, xmax, ymin, ymax, zmin, zmax = solids.bounds
 
-        # Number of mesh cells
-        Nx = 60
-        Ny = 60
-        Nz = 140
+        # Number of primal nodes (60 x 60 x 140 physical cells)
+        Nx = 61
+        Ny = 61
+        Nz = 141
 
         grid = GridFIT3D(
             xmin,
@@ -73,11 +74,7 @@ class TestConformalGeometry:
         # ----------------------------------------------------------
         primal = grid.primal_point_masks["shell"]
 
-        assert primal.shape == (
-            Nx + 1,
-            Ny + 1,
-            Nz + 1,
-        )
+        assert primal.shape == (Nx, Ny, Nz)
 
         assert primal.dtype == bool
 
@@ -98,13 +95,10 @@ class TestConformalGeometry:
 
         expected_cell_mask = corner_count > 4
 
-        assert expected_cell_mask.shape == (
-            Nx,
-            Ny,
-            Nz,
-        )
+        assert expected_cell_mask.shape == (Nx - 1, Ny - 1, Nz - 1)
 
-        # Cell mask actually stored in the PyVista grid
+        # Cell mask stored in the PyVista grid, including the zero-extent
+        # high-side ghost cells of the symmetric stencil.
         cell_mask = np.reshape(
             np.asarray(grid.grid["shell"], dtype=bool),
             (Nx, Ny, Nz),
@@ -112,7 +106,7 @@ class TestConformalGeometry:
         )
 
         np.testing.assert_array_equal(
-            cell_mask,
+            cell_mask[:-1, :-1, :-1],
             expected_cell_mask,
         )
 
@@ -132,16 +126,14 @@ class TestConformalGeometry:
         assert np.any(dual)
         assert np.any(~dual)
 
-        legacy_dual_mask = grid._cell_mask_to_dual_point_mask(expected_cell_mask)
-
-        assert not np.array_equal(
-            dual,
-            legacy_dual_mask,
-        )
+        # Dual points: both domain boundaries and the primal cell centres.
+        assert dual.shape == (Nx + 1, Ny + 1, Nz + 1)
+        assert grid.tx[0] == grid.x[0] and grid.tx[-1] == grid.x[-1]
 
     def test_average_dual_points_to_primal_edges(self):
-        """Test dual-point averaging onto the faces of primal edges."""
+        """Test dual-point averaging onto the dual faces of primal edges."""
 
+        # Nx, Ny, Nz count primal nodes; dual points are (Nx+1, Ny+1, Nz+1).
         Nx = 3
         Ny = 4
         Nz = 5
@@ -160,65 +152,65 @@ class TestConformalGeometry:
         assert values_y.shape == (Nx, Ny, Nz)
         assert values_z.shape == (Nx, Ny, Nz)
 
-        # ----------------------------------------------------------
-        # Interior faces
-        # ----------------------------------------------------------
-
-        # x-directed primal edge -> dual yz face
+        # Ex(i,j,k) -> dual x-face (i+1, j, k): dual points (i+1, j..j+1, k..k+1)
         i, j, k = 1, 2, 3
         expected = 0.25 * (
-            values[i, j, k]
-            + values[i, j - 1, k]
-            + values[i, j - 1, k - 1]
-            + values[i, j, k - 1]
+            values[i + 1, j, k]
+            + values[i + 1, j + 1, k]
+            + values[i + 1, j + 1, k + 1]
+            + values[i + 1, j, k + 1]
         )
         assert values_x[i, j, k] == pytest.approx(expected)
 
-        # y-directed primal edge -> dual xz face
+        # Ey(i,j,k) -> dual y-face (i, j+1, k)
         i, j, k = 2, 1, 3
         expected = 0.25 * (
-            values[i, j, k]
-            + values[i - 1, j, k]
-            + values[i - 1, j, k - 1]
-            + values[i, j, k - 1]
+            values[i, j + 1, k]
+            + values[i + 1, j + 1, k]
+            + values[i + 1, j + 1, k + 1]
+            + values[i, j + 1, k + 1]
         )
         assert values_y[i, j, k] == pytest.approx(expected)
 
-        # z-directed primal edge -> dual xy face
+        # Ez(i,j,k) -> dual z-face (i, j, k+1)
         i, j, k = 2, 2, 1
         expected = 0.25 * (
-            values[i, j, k]
-            + values[i - 1, j, k]
-            + values[i - 1, j - 1, k]
-            + values[i, j - 1, k]
+            values[i, j, k + 1]
+            + values[i + 1, j, k + 1]
+            + values[i + 1, j + 1, k + 1]
+            + values[i, j + 1, k + 1]
         )
         assert values_z[i, j, k] == pytest.approx(expected)
 
-        # ----------------------------------------------------------
-        # Low-side boundary treatment
-        # ----------------------------------------------------------
-
-        # x edge on ymin: only two distinct dual points contribute
-        i, j, k = 1, 0, 3
-        expected = 0.5 * (values[i, 0, k] + values[i, 0, k - 1])
+        # Boundary edges have complete (half-size) dual faces: the dual
+        # grid includes the domain boundary, so no extrapolation is used.
+        i, j, k = 1, 0, 0
+        expected = 0.25 * (
+            values[i + 1, 0, 0]
+            + values[i + 1, 1, 0]
+            + values[i + 1, 1, 1]
+            + values[i + 1, 0, 1]
+        )
         assert values_x[i, j, k] == pytest.approx(expected)
 
-        # x edge on ymin and zmin: only one dual point contributes
-        i, j, k = 1, 0, 0
-        expected = values[i, 0, 0]
+        i, j, k = 1, Ny - 1, Nz - 1
+        expected = 0.25 * (
+            values[i + 1, Ny - 1, Nz - 1]
+            + values[i + 1, Ny, Nz - 1]
+            + values[i + 1, Ny, Nz]
+            + values[i + 1, Ny - 1, Nz]
+        )
         assert values_x[i, j, k] == pytest.approx(expected)
 
     def test_average_primal_points_to_dual_edges(self):
-        """Test primal-point averaging onto the faces of dual edges."""
+        """Test primal-point averaging onto the primal faces of dual edges."""
 
+        # Nx, Ny, Nz count primal nodes.
         Nx = 3
         Ny = 4
         Nz = 5
 
-        values = np.arange(
-            (Nx + 1) * (Ny + 1) * (Nz + 1),
-            dtype=float,
-        ).reshape(Nx + 1, Ny + 1, Nz + 1)
+        values = np.arange(Nx * Ny * Nz, dtype=float).reshape(Nx, Ny, Nz)
 
         values_x, values_y, values_z = SolverFIT3D._average_primal_points_to_dual_edges(
             values
@@ -227,10 +219,6 @@ class TestConformalGeometry:
         assert values_x.shape == (Nx, Ny, Nz)
         assert values_y.shape == (Nx, Ny, Nz)
         assert values_z.shape == (Nx, Ny, Nz)
-
-        # ----------------------------------------------------------
-        # Interior faces
-        # ----------------------------------------------------------
 
         # Hx(i,j,k) -> primal yz face at x[i] (curl matrix C)
         i, j, k = 1, 2, 3
@@ -262,46 +250,44 @@ class TestConformalGeometry:
         )
         assert values_z[i, j, k] == pytest.approx(expected)
 
-        # ----------------------------------------------------------
-        # Low-side boundary
-        # ----------------------------------------------------------
-
         # Hx(0,j,k) belongs to the boundary face at x[0].
-        i = 0
-        j = Ny - 1
-        k = Nz - 1
-
+        i, j, k = 0, Ny - 2, Nz - 2
         expected = 0.25 * (
-            values[0, Ny - 1, Nz - 1]
-            + values[0, Ny, Nz - 1]
-            + values[0, Ny, Nz]
-            + values[0, Ny - 1, Nz]
+            values[0, Ny - 2, Nz - 2]
+            + values[0, Ny - 1, Nz - 2]
+            + values[0, Ny - 1, Nz - 1]
+            + values[0, Ny - 2, Nz - 1]
         )
         assert values_x[i, j, k] == pytest.approx(expected)
+
+        # Ghost DOFs (zero-area high-side faces) copy the nearest face.
+        assert values_x[0, Ny - 1, Nz - 1] == pytest.approx(expected)
 
     def test_conformal_material_assignment(self):
         """Test point-based material assignment onto FIT material tensors."""
 
-        Nx = 2
-        Ny = 2
-        Nz = 2
+        # Primal nodes (2 x 2 x 2 physical cells); fields have this shape.
+        Nx = 3
+        Ny = 3
+        Nz = 3
 
-        shape_points = (Nx + 1, Ny + 1, Nz + 1)
         shape_cells = (Nx, Ny, Nz)
+        shape_primal = (Nx, Ny, Nz)
+        shape_dual = (Nx + 1, Ny + 1, Nz + 1)
 
         # ----------------------------------------------------------
         # Synthetic primal and dual point masks
         # ----------------------------------------------------------
-        primal_mask = np.zeros(shape_points, dtype=bool)
-        dual_mask = np.zeros(shape_points, dtype=bool)
+        primal_mask = np.zeros(shape_primal, dtype=bool)
+        dual_mask = np.zeros(shape_dual, dtype=bool)
 
-        # For eps_x[1, 1, 1], the associated dual yz face uses
+        # For eps_x[1, 1, 1], the associated dual x-face (2, 1, 1) uses
         #
-        # (1,1,1), (1,0,1), (1,0,0), (1,1,0).
+        # (2,1,1), (2,2,1), (2,2,2), (2,1,2).
         #
         # Mark two of these four points as material.
-        dual_mask[1, 1, 1] = True
-        dual_mask[1, 0, 1] = True
+        dual_mask[2, 2, 2] = True
+        dual_mask[2, 1, 2] = True
 
         # For mu_x[1, 0, 0], the associated primal yz face at x[1]
         # (curl matrix C) uses
@@ -400,16 +386,16 @@ class TestConformalGeometry:
     def test_conformal_material_assignment_homogeneous(self):
         """Test conformal material assignment for a homogeneous solid."""
 
-        Nx = 2
-        Ny = 3
-        Nz = 4
+        # Primal nodes; fields have this shape.
+        Nx = 3
+        Ny = 4
+        Nz = 5
 
-        shape_points = (Nx + 1, Ny + 1, Nz + 1)
         shape_cells = (Nx, Ny, Nz)
 
         # All primal and dual grid points belong to the material.
-        primal_mask = np.ones(shape_points, dtype=bool)
-        dual_mask = np.ones(shape_points, dtype=bool)
+        primal_mask = np.ones((Nx, Ny, Nz), dtype=bool)
+        dual_mask = np.ones((Nx + 1, Ny + 1, Nz + 1), dtype=bool)
 
         eps_r = 4.0
         mu_r = 2.5
@@ -495,31 +481,15 @@ class TestConformalGeometry:
 
             ieps = 1 / eps = 0.
         """
-        Nx = 2
-        Ny = 2
-        Nz = 2
+        # Primal nodes; fields have this shape.
+        Nx = 3
+        Ny = 3
+        Nz = 3
 
-        shape_points = (
-            Nx + 1,
-            Ny + 1,
-            Nz + 1,
-        )
+        shape_cells = (Nx, Ny, Nz)
 
-        shape_cells = (
-            Nx,
-            Ny,
-            Nz,
-        )
-
-        primal_mask = np.ones(
-            shape_points,
-            dtype=bool,
-        )
-
-        dual_mask = np.ones(
-            shape_points,
-            dtype=bool,
-        )
+        primal_mask = np.ones((Nx, Ny, Nz), dtype=bool)
+        dual_mask = np.ones((Nx + 1, Ny + 1, Nz + 1), dtype=bool)
 
         grid = SimpleNamespace(
             stl_solids={
@@ -675,9 +645,9 @@ class TestConformalGeometry:
             ymax,
             zmin,
             zmax,
-            6,
-            6,
-            14,
+            7,
+            7,
+            15,
             stl_solids=stl_solids,
             stl_materials={
                 "cavity": "vacuum",
@@ -703,9 +673,9 @@ class TestConformalGeometry:
             ymax,
             zmin,
             zmax,
-            6,
-            6,
-            14,
+            7,
+            7,
+            15,
             stl_solids=stl_solids,
             stl_materials={
                 "cavity": "vacuum",
@@ -734,9 +704,9 @@ class TestConformalGeometry:
             1.0,
             0.0,
             1.0,
-            2,
-            2,
-            2,
+            3,
+            3,
+            3,
             verbose=0,
         )
 
@@ -769,9 +739,9 @@ class TestConformalGeometry:
             1.0,
             0.0,
             1.0,
-            2,
-            2,
-            2,
+            3,
+            3,
+            3,
             bg_material_type="sibc",
             verbose=0,
         )
@@ -794,9 +764,9 @@ class TestConformalGeometry:
             1.0,
             0.0,
             1.0,
-            2,
-            2,
-            2,
+            3,
+            3,
+            3,
             bg_material_type="normal",
             verbose=0,
         )
@@ -818,9 +788,9 @@ class TestConformalGeometry:
             1.0,
             0.0,
             1.0,
-            2,
-            2,
-            2,
+            3,
+            3,
+            3,
             bg_material_type="pec",
             verbose=0,
         )
@@ -843,9 +813,9 @@ class TestConformalGeometry:
             1.0,
             0.0,
             1.0,
-            3,
-            1,
-            1,
+            4,
+            2,
+            2,
             verbose=0,
         )
 
@@ -854,7 +824,10 @@ class TestConformalGeometry:
             "material_2": "unused",
         }
 
+        # Primal points (4, 2, 2); dual points (5, 3, 3) with
+        # tx = [0, 0.5, 1.5, 2.5, 3].
         shape = (4, 2, 2)
+        dual_shape = (5, 3, 3)
 
         # --------------------------------------------------
         # Primal point masks
@@ -887,21 +860,21 @@ class TestConformalGeometry:
         #
         # resulting x sequence:
         #
-        # 0  0  1  2
+        # 0  0  0  1  2
         # --------------------------------------------------
 
         dual_mask_1 = np.zeros(
-            shape,
+            dual_shape,
             dtype=bool,
         )
 
         dual_mask_2 = np.zeros(
-            shape,
+            dual_shape,
             dtype=bool,
         )
 
-        dual_mask_1[2:, :, :] = True
-        dual_mask_2[3:, :, :] = True
+        dual_mask_1[3:, :, :] = True
+        dual_mask_2[4:, :, :] = True
 
         grid.dual_point_masks = {
             "material_1": dual_mask_1,
@@ -928,7 +901,7 @@ class TestConformalGeometry:
 
         assert np.array_equal(
             grid.region_ids["dual"][:, 0, 0],
-            np.array([0, 0, 1, 2]),
+            np.array([0, 0, 0, 1, 2]),
         )
 
         assert np.array_equal(
@@ -938,7 +911,7 @@ class TestConformalGeometry:
 
         assert np.array_equal(
             grid.interface_edge_masks["dual"]["x"][:, 0, 0],
-            np.array([False, True, True]),
+            np.array([False, False, True, True]),
         )
 
         for grid_type in ("primal", "dual"):
@@ -956,9 +929,9 @@ class TestConformalGeometry:
             1.0,
             0.0,
             1.0,
-            4,
-            1,
-            1,
+            5,
+            2,
+            2,
             geometry_mode="conformal",
             bg_material_type="normal",
             verbose=0,
@@ -1198,9 +1171,9 @@ class TestConformalGeometry:
             1.0,
             0.0,
             1.0,
-            4,
-            1,
-            1,
+            5,
+            2,
+            2,
             geometry_mode="conformal",
             bg_material_type="normal",
             verbose=0,
@@ -1392,12 +1365,14 @@ class TestConformalGeometry:
             ),
         )
 
+        # The last stored Ex DOF is the zero-length ghost edge (uncut).
         expected_fraction = np.array(
             [
                 1.0,
                 0.25,
                 0.60,
                 0.75,
+                1.0,
             ]
         )
 
@@ -1424,9 +1399,16 @@ class TestConformalGeometry:
             * expected_fraction,
         )
 
-        # Conductor cuts never modify the dual edge lengths.
+        # Conductor cuts never modify the dual edge lengths. The solver's
+        # tL may differ from grid.tL only through the (default periodic)
+        # boundary conditions, so compare with an uncut solver.
         assert not hasattr(solver, "tL_eff")
-        np.testing.assert_array_equal(solver.tL.toarray(), grid.tL.toarray())
+        reference = SolverFIT3D(
+            GridFIT3D(0.0, 4.0, 0.0, 1.0, 0.0, 1.0, 5, 2, 2, verbose=0),
+            use_stl=False,
+            verbose=0,
+        )
+        np.testing.assert_array_equal(solver.tL.toarray(), reference.tL.toarray())
 
     def test_edge_array_to_field_component(self):
         grid = GridFIT3D(
@@ -1436,9 +1418,9 @@ class TestConformalGeometry:
             3.0,
             0.0,
             4.0,
-            2,
             3,
             4,
+            5,
             verbose=0,
         )
 
@@ -1448,35 +1430,39 @@ class TestConformalGeometry:
             verbose=0,
         )
 
+        # Primal edges (Nx-1, Ny, Nz) etc.; the stored DOFs append one
+        # zero-length ghost layer along the edge direction.
         x_edges = np.arange(2 * 4 * 5).reshape(2, 4, 5)
-
         y_edges = np.arange(3 * 3 * 5).reshape(3, 3, 5)
-
         z_edges = np.arange(3 * 4 * 4).reshape(3, 4, 4)
 
-        np.testing.assert_array_equal(
-            solver._edge_array_to_field_component(
-                x_edges,
-                "x",
-            ),
-            x_edges[:, :-1, :-1],
-        )
+        for direction, edges, axis in (
+            ("x", x_edges, 0),
+            ("y", y_edges, 1),
+            ("z", z_edges, 2),
+        ):
+            field = solver._edge_array_to_field_component(edges, direction, -1)
+            assert field.shape == (3, 4, 5)
 
-        np.testing.assert_array_equal(
-            solver._edge_array_to_field_component(
-                y_edges,
-                "y",
-            ),
-            y_edges[:-1, :, :-1],
-        )
+            ghost = [slice(None)] * 3
+            ghost[axis] = -1
+            physical = [slice(None)] * 3
+            physical[axis] = slice(0, -1)
 
-        np.testing.assert_array_equal(
-            solver._edge_array_to_field_component(
-                z_edges,
-                "z",
-            ),
-            z_edges[:-1, :-1, :],
-        )
+            np.testing.assert_array_equal(field[tuple(physical)], edges)
+            assert np.all(field[tuple(ghost)] == -1)
+
+            # Region IDs copy the nearest edge into the ghost layer.
+            nearest = solver._edge_array_to_field_component(edges, direction, "nearest")
+            np.testing.assert_array_equal(
+                np.take(nearest, -1, axis=axis), np.take(edges, -1, axis=axis)
+            )
+
+        # Boolean arrays default to False, floats to NaN on ghosts.
+        field = solver._edge_array_to_field_component(np.ones((2, 4, 5), bool), "x")
+        assert field.dtype == bool and not np.any(field[-1])
+        field = solver._edge_array_to_field_component(np.ones((2, 4, 5)), "x")
+        assert np.all(np.isnan(field[-1])) and np.all(field[:-1] == 1.0)
 
     def test_face_candidate_masks(self):
         grid = GridFIT3D(
@@ -1486,9 +1472,9 @@ class TestConformalGeometry:
             2.0,
             0.0,
             2.0,
-            2,
-            2,
-            2,
+            3,
+            3,
+            3,
             geometry_mode="conformal",
             verbose=0,
         )
@@ -1623,9 +1609,9 @@ class TestConformalGeometry:
             2.0,
             0.0,
             2.0,
-            2,
-            2,
-            2,
+            3,
+            3,
+            3,
             geometry_mode="conformal",
             verbose=0,
         )
@@ -1859,9 +1845,9 @@ class TestConformalGeometry:
             1.0,
             0.0,
             1.0,
-            1,
-            1,
-            1,
+            2,
+            2,
+            2,
             geometry_mode="conformal",
             verbose=0,
         )
@@ -2059,9 +2045,9 @@ class TestConformalGeometry:
             1.0,
             0.0,
             1.0,
-            1,
-            1,
-            1,
+            2,
+            2,
+            2,
             geometry_mode="conformal",
             verbose=0,
         )
@@ -2287,9 +2273,9 @@ class TestConformalGeometry:
             3.0,
             0.0,
             4.0,
-            2,
             3,
             4,
+            5,
             verbose=0,
         )
 
@@ -2299,47 +2285,29 @@ class TestConformalGeometry:
             verbose=0,
         )
 
-        x_faces = np.arange(3 * 3 * 4).reshape(
-            3,
-            3,
-            4,
-        )
+        # Primal faces (Nx, Ny-1, Nz-1) etc.; Hd(i,j,k) <-> d-face (i,j,k).
+        # The stored DOFs append zero-area ghost layers transverse to d.
+        x_faces = np.arange(3 * 3 * 4).reshape(3, 3, 4)
+        y_faces = np.arange(2 * 4 * 4).reshape(2, 4, 4)
+        z_faces = np.arange(2 * 3 * 5).reshape(2, 3, 5)
 
-        y_faces = np.arange(2 * 4 * 4).reshape(
-            2,
-            4,
-            4,
-        )
+        for direction, faces in (
+            ("x", x_faces),
+            ("y", y_faces),
+            ("z", z_faces),
+        ):
+            field = solver._face_array_to_field_component(faces, direction, -1)
+            assert field.shape == (3, 4, 5)
 
-        z_faces = np.arange(2 * 3 * 5).reshape(
-            2,
-            3,
-            5,
-        )
+            n0, n1, n2 = faces.shape
+            np.testing.assert_array_equal(field[:n0, :n1, :n2], faces)
 
-        np.testing.assert_array_equal(
-            solver._face_array_to_field_component(
-                x_faces,
-                "x",
-            ),
-            x_faces[:-1, :, :],
-        )
+            ghost = np.ones(field.shape, dtype=bool)
+            ghost[:n0, :n1, :n2] = False
+            assert np.all(field[ghost] == -1)
 
-        np.testing.assert_array_equal(
-            solver._face_array_to_field_component(
-                y_faces,
-                "y",
-            ),
-            y_faces[:, :-1, :],
-        )
-
-        np.testing.assert_array_equal(
-            solver._face_array_to_field_component(
-                z_faces,
-                "z",
-            ),
-            z_faces[:, :, :-1],
-        )
+            # Ghost faces are exactly the faces with zero area (iA = 0).
+            np.testing.assert_array_equal(ghost, solver.iA.to_matrix(direction) == 0)
 
     def test_conformal_face_fractions(self):
         grid = GridFIT3D(
@@ -2349,9 +2317,9 @@ class TestConformalGeometry:
             1.0,
             0.0,
             1.0,
-            3,
-            1,
-            1,
+            4,
+            2,
+            2,
             geometry_mode="conformal",
             bg_material_type="normal",
             verbose=0,
@@ -2566,8 +2534,8 @@ class TestConformalGeometry:
         # --------------------------------------------------
         # Check mapped Field fractions
         #
-        # z-face Field stores the low-side z faces, therefore
-        # these three entries are directly represented.
+        # Hz(i,j,k) <-> primal z-face (i,j,k). The last x entry is the
+        # zero-area ghost face, which is reported as uncut.
         # --------------------------------------------------
         np.testing.assert_allclose(
             solver.A_fraction.to_matrix("z")[:, 0, 0],
@@ -2575,19 +2543,28 @@ class TestConformalGeometry:
                 1.0,
                 0.25,
                 0.25,
+                1.0,
             ],
         )
 
-        # Conductor cuts never modify the dual face areas.
+        # Conductor cuts never modify the dual face areas. The solver's
+        # itA may differ from grid.itA only through the (default periodic)
+        # boundary conditions, so compare with an uncut solver.
         assert not hasattr(solver, "tA_eff")
-        np.testing.assert_array_equal(solver.itA.toarray(), grid.itA.toarray())
+        reference = SolverFIT3D(
+            GridFIT3D(0.0, 3.0, 0.0, 1.0, 0.0, 1.0, 4, 2, 2, verbose=0),
+            use_stl=False,
+            verbose=0,
+        )
+        np.testing.assert_array_equal(solver.itA.toarray(), reference.itA.toarray())
 
         # --------------------------------------------------
         # Effective primal areas must be base area * fraction.
         # --------------------------------------------------
+        # Ghost faces (iA = 0) have zero area.
+        iA_z = solver.iA.to_matrix("z")[:, 0, 0]
         primal_base_area = np.divide(
-            1.0,
-            solver.iA.to_matrix("z")[:, 0, 0],
+            1.0, iA_z, out=np.zeros_like(iA_z), where=iA_z != 0
         )
 
         expected_fraction = np.array(
@@ -2595,6 +2572,7 @@ class TestConformalGeometry:
                 1.0,
                 0.25,
                 0.25,
+                1.0,
             ]
         )
 
@@ -2656,9 +2634,9 @@ class TestConformalGeometry:
             1.0,
             0.0,
             1.0,
-            4,
-            2,
-            2,
+            5,
+            3,
+            3,
             geometry_mode="conformal",
             verbose=0,
         )
@@ -2859,9 +2837,9 @@ class TestConformalGeometry:
             1.0,
             0.0,
             1.0,
-            2,
-            2,
-            2,
+            3,
+            3,
+            3,
             stl_solids={
                 "layer": str(stl_file),
             },
@@ -2973,9 +2951,9 @@ class TestConformalGeometry:
             1.0,
             0.0,
             1.0,
-            2,
-            2,
-            2,
+            3,
+            3,
+            3,
             stl_solids={
                 "middle": str(middle_file),
                 "right": str(right_file),
@@ -3317,9 +3295,9 @@ class TestConformalGeometry:
             1.0,
             0.0,
             1.0,
-            6,
-            6,
-            6,
+            7,
+            7,
+            7,
             stl_solids=stl_solids,
             stl_materials=stl_materials,
             stl_material_types=stl_material_types,
@@ -3522,9 +3500,9 @@ class TestConformalGeometry:
             5.0,
             0.0,
             5.0,
-            5,
-            5,
-            5,
+            6,
+            6,
+            6,
             stl_solids={
                 "insert": str(stl_file),
             },
@@ -3643,7 +3621,9 @@ class TestConformalGeometry:
         # geometrically active.
         # ============================================================
 
-        dual_face_index = (1, 1, 1)
+        # Dual coordinates are [0, 0.5, 1.5, ..., 4.5, 5]: y = 1.5 is dual
+        # node 2 and the x/z range [1.5, 2.5] is dual cell 2.
+        dual_face_index = (2, 2, 2)
 
         dual_face_geometry = grid.interface_face_data["dual"]["y"]
 
@@ -3672,7 +3652,7 @@ class TestConformalGeometry:
         #     (2, 1, 2)
         #
         # associated dual y-face:
-        #     (1, 1, 1)
+        #     (2, 2, 2)  (Ey(i,j,k) <-> dual y-face (i, j+1, k))
         # ------------------------------------------------------------
 
         eps_parallel = solver._dual_face_array_to_primal_edge_component(
@@ -3953,9 +3933,9 @@ class TestConformalGeometry:
             5.0,
             0.0,
             5.0,
-            5,
-            5,
-            5,
+            6,
+            6,
+            6,
             stl_solids={
                 "insert": str(stl_file),
             },
@@ -4034,9 +4014,16 @@ class TestConformalGeometry:
 
         assert not hasattr(solver_pec, "tA_eff")
 
+        # The solver's itA differs from grid.itA only through the (default
+        # periodic) boundary conditions, so compare with an uncut solver.
+        reference = SolverFIT3D(
+            GridFIT3D(0.0, 5.0, 0.0, 5.0, 0.0, 5.0, 6, 6, 6, verbose=0),
+            use_stl=False,
+            verbose=0,
+        )
         np.testing.assert_array_equal(
             solver_pec.itA.toarray(),
-            grid_pec.itA.toarray(),
+            reference.itA.toarray(),
         )
 
         # ============================================================
@@ -4145,9 +4132,9 @@ class TestConformalGeometry:
             3.0,
             0.0,
             4.0,
-            2,
             3,
             4,
+            5,
             geometry_mode="legacy",
             verbose=0,
         )
