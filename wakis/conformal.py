@@ -169,6 +169,7 @@ class ConformalGridMixin:
         method,
         stl_tolerance,
         progress_bar=False,
+        check_surface=True,
     ):
         """
         Classify a Cartesian block of points with respect to an STL surface.
@@ -185,6 +186,10 @@ class ConformalGridMixin:
             Tolerance used by the point-in-surface classifier.
         progress_bar : bool, optional
             Show PyVista progress information.
+        check_surface : bool, optional
+            Let PyVista verify that ``surf`` is closed before classifying
+            interior points. Set to False only for surfaces already known to
+            be open, for which a warning has been issued.
 
         Returns
         -------
@@ -227,20 +232,12 @@ class ConformalGridMixin:
 
             point_cloud = pv.PolyData(points)
 
-            try:
-                selected = point_cloud.select_interior_points(
-                    surf,
-                    method="cell_locator",
-                    locator_tolerance=stl_tolerance,
-                )
-
-            except Exception:
-                selected = point_cloud.select_interior_points(
-                    surf,
-                    method="cell_locator",
-                    locator_tolerance=stl_tolerance,
-                    check_surface=False,
-                )
+            selected = point_cloud.select_interior_points(
+                surf,
+                method="cell_locator",
+                locator_tolerance=stl_tolerance,
+                check_surface=check_surface,
+            )
 
             return np.reshape(
                 np.asarray(
@@ -372,12 +369,14 @@ class ConformalGridMixin:
         method,
         stl_tolerance,
         progress_bar=False,
+        check_surface=True,
     ):
         """
         Classify primal or dual FIT grid points with respect to an STL.
 
         For the primal grid, all points are classified using the selected
-        STL method.
+        STL method. ``check_surface`` is passed on to the interior-point
+        classification (see ``_classify_coordinate_block_in_stl``).
 
         For the dual grid, the interior dual points (primal cell centres)
         are classified using the selected STL method. Points on the six
@@ -395,6 +394,7 @@ class ConformalGridMixin:
                 method,
                 stl_tolerance,
                 progress_bar=progress_bar,
+                check_surface=check_surface,
             )
 
         if grid_type != "dual":
@@ -416,6 +416,7 @@ class ConformalGridMixin:
             method,
             stl_tolerance,
             progress_bar=progress_bar,
+            check_surface=check_surface,
         )
 
         # ----------------------------------------------------------
@@ -441,6 +442,7 @@ class ConformalGridMixin:
                 "interior_points",
                 stl_tolerance,
                 progress_bar=False,
+                check_surface=check_surface,
             )
             point_mask[index] = block.reshape(point_mask[index].shape)
 
@@ -2991,6 +2993,19 @@ class ConformalGridMixin:
             if self.verbose:
                 print(f" * Marking grid points inside STL solid '{key}'...")
 
+            # Inside/outside is only well defined for a closed surface. Test it
+            # once per solid (same VTK check PyVista uses) and warn, instead of
+            # silently retrying without the check on any exception.
+            check_surface = bool(vtk.vtkSelectEnclosedPoints.IsSurfaceClosed(surf))
+            if not check_surface:
+                warnings.warn(
+                    f"STL solid '{key}' is not a closed surface; grid points are "
+                    "classified without the closed-surface check. Repair the STL "
+                    "if the material masks look wrong.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+
             # ----------------------------------------------------------
             # Primal grid-point classification
             # ----------------------------------------------------------
@@ -3000,6 +3015,7 @@ class ConformalGridMixin:
                 method=method,
                 stl_tolerance=stl_tolerance,
                 progress_bar=progress_bar,
+                check_surface=check_surface,
             )
 
             # ----------------------------------------------------------
@@ -3011,6 +3027,7 @@ class ConformalGridMixin:
                 method=method,
                 stl_tolerance=stl_tolerance,
                 progress_bar=progress_bar,
+                check_surface=check_surface,
             )
 
             # ----------------------------------------------------------
@@ -3045,10 +3062,20 @@ class ConformalGridMixin:
                     "dual points marked inside the solid."
                 )
 
-        # Build material-region topology
+        # Build material-region topology and the cut-cell geometry.
         #
         # Must be done only after all STL point masks are available.
         # --------------------------------------------------------------
+        self._build_conformal_interfaces()
+
+    def _build_conformal_interfaces(self):
+        """
+        Build the conformal interface geometry from the STL point masks.
+
+        Used both after classifying the grid points and after loading the
+        point masks from HDF5, so that both paths give identical cut-cell
+        geometry. The STL surfaces are traced again and must be readable.
+        """
         self._build_interface_topology()
 
         # --------------------------------------------------------------
