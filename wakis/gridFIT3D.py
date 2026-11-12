@@ -1412,6 +1412,14 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
             if hasattr(self, "stl_tol"):
                 hf.attrs["stl_tol"] = self.stl_tol
 
+            # The small-cut-cell treatment changes the solver metrics, so a
+            # reloaded grid must reproduce it.
+            hf.attrs["conformal_stabilization"] = self.conformal_stabilization
+            hf.attrs["conformal_area_floor"] = self.conformal_area_floor
+            hf.attrs["conformal_min_edge_fraction"] = self.conformal_min_edge_fraction
+            if self.bg_material_type is not None:
+                hf.attrs["bg_material_type"] = self.bg_material_type
+
             # Preserve STL ordering explicitly because it defines region
             # priority in overlapping solids.
             hf.create_dataset(
@@ -1465,7 +1473,8 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
         """
         Load grid axis arrays and STL metadata from an HDF5 file.
 
-        Restore primal node arrays and current-format STL masks. Dual
+        Restore primal node arrays, current-format STL masks, the background
+        material type and the conformal small-cut-cell treatment. Dual
         coordinates and all FIT metrics are recomputed from the node arrays.
 
         Parameters
@@ -1522,6 +1531,16 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
 
             if "stl_tol" in hf.attrs:
                 self.stl_tol = float(hf.attrs["stl_tol"])
+
+            if "conformal_stabilization" in hf.attrs:
+                self._set_conformal_stabilization(
+                    str(hf.attrs["conformal_stabilization"]),
+                    float(hf.attrs["conformal_area_floor"]),
+                    float(hf.attrs["conformal_min_edge_fraction"]),
+                )
+
+            if "bg_material_type" in hf.attrs:
+                self.bg_material_type = str(hf.attrs["bg_material_type"])
 
             # ----------------------------------------------------------
             # Preserve STL ordering
@@ -1648,7 +1667,7 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
             if all(key in self.primal_point_masks for key in self.stl_solids) and all(
                 key in self.dual_point_masks for key in self.stl_solids
             ):
-                self._build_interface_topology()
+                self._build_conformal_interfaces()
 
         # add verbosity
         if self.verbose > 1:

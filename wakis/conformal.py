@@ -3062,10 +3062,20 @@ class ConformalGridMixin:
                     "dual points marked inside the solid."
                 )
 
-        # Build material-region topology
+        # Build material-region topology and the cut-cell geometry.
         #
         # Must be done only after all STL point masks are available.
         # --------------------------------------------------------------
+        self._build_conformal_interfaces()
+
+    def _build_conformal_interfaces(self):
+        """
+        Build the conformal interface geometry from the STL point masks.
+
+        Used both after classifying the grid points and after loading the
+        point masks from HDF5, so that both paths give identical cut-cell
+        geometry. The STL surfaces are traced again and must be readable.
+        """
         self._build_interface_topology()
 
         # --------------------------------------------------------------
