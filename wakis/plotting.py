@@ -6,6 +6,8 @@
 import matplotlib.pyplot as plt
 import numpy as np
 import pyvista as pv
+from scipy.constants import epsilon_0 as eps_0
+from scipy.constants import mu_0
 
 
 class PlotMixinSolver:
@@ -1582,6 +1584,498 @@ class PlotMixinSolver:
             except Exception:
                 if self.verbose > 1:
                     print(f"[!] Could not add logo widget: {e}")
+
+    def plot_conformal_mesh(
+        self,
+        grid_type="primal",
+        normal="z",
+        index=None,
+        quantity="eps",
+        interactive=False,
+        show_stl=True,
+        show_stabilization=True,
+        cmap="viridis",
+        ax=None,
+    ):
+        """
+        2D view of the FIT mesh and its effective materials in one grid plane.
+
+        Shows how the STL geometry is represented on the mesh, for conformal
+        and staircase grids alike. The material of a FIT DOF belongs to the
+        face its edge pierces, so the view depends on the grid:
+
+        - ``"primal"``: primal faces in the plane, coloured by the
+          permeability ``mu_r`` of the magnetic DOF through the face. In
+          conformal mode, faces cut by a PEC/SIBC wall are coloured only in
+          their part in the normal material (the conductor part is grey),
+          and the primal edges are drawn only up to the wall. Faces without
+          any active edge are grey (inside PEC).
+        - ``"dual"``: dual faces in the plane, coloured by ``eps_r`` or
+          ``sigma`` of the electric DOF piercing the face. Dual metrics are
+          never cut, so all faces are drawn in full; faces whose electric
+          edge lies in PEC or was eliminated are grey.
+
+        The plane normal selects the material component: in an x-normal
+        plane the faces carry the x-components. Faces at dielectric or
+        magnetic interfaces show the effective (mixed) value used by the
+        solver.
+
+        Parameters
+        ----------
+        grid_type : {'primal', 'dual'}, optional
+            Grid whose faces and edges are shown. Default 'primal'.
+        normal : {'x', 'y', 'z'}, optional
+            Normal direction of the plane. Default 'z'.
+        index : int or None, optional
+            Plane index along ``normal``: primal nodes ``0 ... N-1`` or dual
+            nodes ``1 ... N-1`` (the dual planes through the primal edge
+            midpoints). None selects the middle plane.
+        quantity : {'eps', 'sigma'}, optional
+            Material shown on the dual grid. Ignored on the primal grid,
+            which only carries ``mu``. Default 'eps'.
+        interactive : bool, optional
+            Add matplotlib widgets to choose the normal (and the quantity on
+            the dual grid) and a slider for the plane index. Requires an
+            interactive backend, e.g. ``%matplotlib widget`` in Jupyter.
+            Default False.
+        show_stl : bool, optional
+            Draw the intersection of the STL surfaces with the plane as black
+            lines (the exact geometry). Default True.
+        show_stabilization : bool, optional
+            Mark the conformal stabilization in red: faces raised by the
+            area floor (outline) and edges eliminated as too short (dashed
+            edge on the primal grid, outlined grey face on the dual grid).
+            Default True.
+        cmap : str, optional
+            Matplotlib colormap for the material values. Default 'viridis'.
+        ax : matplotlib.axes.Axes or None, optional
+            Axes to draw on. None creates a new figure.
+
+        Returns
+        -------
+        fig : matplotlib.figure.Figure
+        ax : matplotlib.axes.Axes
+
+        Notes
+        -----
+        Hatched faces are cut by a PEC/SIBC wall but have no resolved cut
+        polygon (e.g. two cuts in one face); the solver keeps their full
+        area. Conductivity is shown on a logarithmic scale, with sigma = 0
+        in white.
+        """
+        if grid_type not in ("primal", "dual"):
+            raise ValueError("grid_type must be 'primal' or 'dual'.")
+        if normal not in ("x", "y", "z"):
+            raise ValueError("normal must be 'x', 'y' or 'z'.")
+        if grid_type == "dual" and quantity not in ("eps", "sigma"):
+            raise ValueError("quantity must be 'eps' or 'sigma'.")
+
+        from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(8, 6.5))
+        else:
+            fig = ax.figure
+
+        state = {
+            "normal": normal,
+            "index": index,
+            "quantity": quantity,
+            "colorbar": None,
+        }
+
+        def draw():
+            ax.clear()
+            data = self._conformal_slice_data(
+                grid_type, state["normal"], state["index"], state["quantity"]
+            )
+            state["index"] = data["index"]
+            mappable = self._draw_conformal_slice(
+                ax, data, cmap, show_stl, show_stabilization
+            )
+            if state["colorbar"] is None:
+                colorbar_ax = make_axes_locatable(ax).append_axes(
+                    "right", size="4%", pad=0.1
+                )
+                state["colorbar"] = fig.colorbar(mappable, cax=colorbar_ax)
+            else:
+                state["colorbar"].update_normal(mappable)
+            state["colorbar"].set_label(data["label"])
+            fig.canvas.draw_idle()
+
+        draw()
+
+        if interactive:
+            self._add_conformal_mesh_widgets(fig, state, draw, grid_type)
+
+        return fig, ax
+
+    def _conformal_slice_range(self, grid_type, normal):
+        """First and last plane index along ``normal`` for plot_conformal_mesh."""
+        n_nodes = (self.Nx, self.Ny, self.Nz)["xyz".index(normal)]
+        # Dual planes 0 and N lie on the domain boundary and carry no DOFs.
+        return (0, n_nodes - 1) if grid_type == "primal" else (1, n_nodes - 1)
+
+    def _conformal_slice_data(self, grid_type, normal, index, quantity):
+        """
+        Collect the faces, edges and STL lines of one grid plane.
+
+        Returns plain 2D geometry (in the in-plane coordinates) with the
+        material value and flags of every face, so that drawing is separate
+        from the FIT data access.
+        """
+        low, high = self._conformal_slice_range(grid_type, normal)
+        if index is None:
+            index = (low + high) // 2
+        index = int(index)
+        if not low <= index <= high:
+            raise ValueError(
+                f"{grid_type} plane index along {normal} must be in "
+                f"[{low}, {high}], got {index}."
+            )
+
+        axis = "xyz".index(normal)
+        a, b = (d for d in "xyz" if d != normal)
+        ia, ib = "xyz".index(a), "xyz".index(b)
+        grid = self.grid
+        coords = (
+            (grid.x, grid.y, grid.z)
+            if grid_type == "primal"
+            else (grid.tx, grid.ty, grid.tz)
+        )
+        ca, cb = coords[ia], coords[ib]
+
+        def at(i_normal, j_a, j_b):
+            idx = [0, 0, 0]
+            idx[axis], idx[ia], idx[ib] = i_normal, j_a, j_b
+            return tuple(idx)
+
+        def rectangle(j_a, j_b):
+            return np.array(
+                [
+                    (ca[j_a], cb[j_b]),
+                    (ca[j_a + 1], cb[j_b]),
+                    (ca[j_a + 1], cb[j_b + 1]),
+                    (ca[j_a], cb[j_b + 1]),
+                ]
+            )
+
+        ieps = {d: np.asarray(self.ieps.to_matrix(d)) for d in "xyz"}
+        conformal = grid.geometry_mode == "conformal" and bool(
+            self.conformal_line_data["primal"]
+        )
+        if conformal:
+            region_types = self.region_material_types
+            is_conductor = np.zeros(max(region_types) + 1, dtype=bool)
+            for region_id, kind in region_types.items():
+                is_conductor[region_id] = kind in ("pec", "sibc")
+            line_data = self.conformal_line_data["primal"]
+
+        faces = []
+        edges = []
+
+        if grid_type == "primal":
+            mu_r = 1.0 / (np.asarray(self.imu.to_matrix(normal)) * mu_0)
+            if conformal:
+                region_ids = grid.region_ids["primal"]
+                polygons = grid.interface_face_data["primal"][normal]["polygons"]
+                floored = np.asarray(self.A_fraction.to_matrix(normal)) > (
+                    np.asarray(self.A_fraction_geometric.to_matrix(normal)) + 1e-12
+                )
+
+            for j_a in range(len(ca) - 1):
+                for j_b in range(len(cb) - 1):
+                    face = at(index, j_a, j_b)
+                    record = {
+                        "vertices": rectangle(j_a, j_b),
+                        "cell": rectangle(j_a, j_b),
+                        "value": mu_r[face],
+                        # No active edge around the face: no circulation of
+                        # E drives this H DOF, the face is inside PEC.
+                        "pec": all(
+                            ieps[d][at(index, j_a + da, j_b + db)] == 0.0
+                            for d, da, db in (
+                                (a, 0, 0),
+                                (a, 0, 1),
+                                (b, 0, 0),
+                                (b, 1, 0),
+                            )
+                        ),
+                        "floored": conformal and bool(floored[face]),
+                        "unresolved": False,
+                    }
+                    if conformal:
+                        conductor_corners = is_conductor[
+                            [
+                                region_ids[at(index, j_a + da, j_b + db)]
+                                for da, db in ((0, 0), (1, 0), (1, 1), (0, 1))
+                            ]
+                        ]
+                        if conductor_corners.any() and not conductor_corners.all():
+                            parts = {
+                                bool(is_conductor[p["region_id"]]): np.asarray(
+                                    p["vertices"]
+                                )[:, [ia, ib]]
+                                for p in polygons.get(face, [])
+                            }
+                            if False in parts:
+                                record["vertices"] = parts[False]
+                                record["pec_part"] = parts.get(True)
+                            else:
+                                record["unresolved"] = True
+                    faces.append(record)
+
+            # In-plane primal edges: E DOFs, drawn only in the normal material.
+            for d in (a, b):
+                c_d, c_other = (ca, cb) if d == a else (cb, ca)
+                for j_d in range(len(c_d) - 1):
+                    for j_o in range(len(c_other)):
+                        edge = at(index, j_d, j_o) if d == a else at(index, j_o, j_d)
+                        t0, t1, style = 0.0, 1.0, "mesh"
+                        live = ieps[d][edge] != 0.0
+                        if conformal:
+                            data = line_data[d]
+                            start = is_conductor[data["start_region"][edge]]
+                            end = is_conductor[data["end_region"][edge]]
+                            alpha = data["alpha"][edge]
+                            if start and end:
+                                continue
+                            if not live:
+                                style = "eliminated"  # removed entirely
+                            elif start != end and np.isfinite(alpha):
+                                t0, t1 = (alpha, 1.0) if start else (0.0, alpha)
+                        elif not live:
+                            continue
+                        p0 = c_d[j_d] + t0 * (c_d[j_d + 1] - c_d[j_d])
+                        p1 = c_d[j_d] + t1 * (c_d[j_d + 1] - c_d[j_d])
+                        q = c_other[j_o]
+                        segment = [(p0, q), (p1, q)] if d == a else [(q, p0), (q, p1)]
+                        edges.append({"segment": segment, "style": style})
+
+            label = rf"$\mu_{{r,{normal}}}$"
+            log_scale = False
+
+        else:
+            e_index = index - 1  # dual plane t[i] holds the E DOFs of edge i-1
+            if quantity == "eps":
+                values = 1.0 / (ieps[normal] * eps_0)
+                label = rf"$\varepsilon_{{r,{normal}}}$"
+            else:
+                values = np.asarray(self.sigma.to_matrix(normal))
+                label = rf"$\sigma_{{{normal}}}$ [S/m]"
+            eliminated = np.zeros(ieps[normal].shape, dtype=bool)
+            if conformal:
+                cut = (
+                    line_data[normal]["normal_to_conductor"]
+                    | line_data[normal]["conductor_to_normal"]
+                )
+                eliminated = self._edge_array_to_field_component(cut, normal).astype(
+                    bool
+                ) & (ieps[normal] == 0.0)
+
+            for j_a in range(len(ca) - 1):
+                for j_b in range(len(cb) - 1):
+                    dof = at(e_index, j_a, j_b)
+                    pec = ieps[normal][dof] == 0.0
+                    faces.append(
+                        {
+                            "vertices": rectangle(j_a, j_b),
+                            "cell": rectangle(j_a, j_b),
+                            "value": np.nan if pec else values[dof],
+                            "pec": pec,
+                            "floored": bool(eliminated[dof]),
+                            "unresolved": False,
+                        }
+                    )
+            # Dual edges are never cut: draw them as full grid lines.
+            edges += [
+                {"segment": [(ca[0], q), (ca[-1], q)], "style": "mesh"} for q in cb
+            ]
+            edges += [
+                {"segment": [(p, cb[0]), (p, cb[-1])], "style": "mesh"} for p in ca
+            ]
+            log_scale = quantity == "sigma"
+
+        stl_lines = []
+        position = coords[axis][index]
+        if grid.stl_solids:
+            origin = np.zeros(3)
+            origin[axis] = position
+            for key in grid.stl_solids:
+                section = grid.read_stl(key).slice(
+                    normal=np.eye(3)[axis], origin=origin
+                )
+                for cell in range(section.n_cells):
+                    stl_lines.append(section.get_cell(cell).points[:, [ia, ib]])
+
+        return {
+            "index": index,
+            "faces": faces,
+            "edges": edges,
+            "stl_lines": stl_lines,
+            "label": label,
+            "log_scale": log_scale,
+            "xlabel": f"{a} [m]",
+            "ylabel": f"{b} [m]",
+            "limits": ((ca[0], ca[-1]), (cb[0], cb[-1])),
+            "title": (f"{grid_type} mesh, {normal} = {position:.4g} m (index {index})"),
+        }
+
+    @staticmethod
+    def _draw_conformal_slice(ax, data, cmap, show_stl, show_stabilization):
+        """Draw the output of _conformal_slice_data; return the face mappable."""
+        from matplotlib.collections import LineCollection, PolyCollection
+        from matplotlib.colors import LogNorm, Normalize
+        from matplotlib.lines import Line2D
+        from matplotlib.patches import Patch
+
+        faces = data["faces"]
+        material = [f for f in faces if not f["pec"]]
+        values = np.array([f["value"] for f in material], dtype=float)
+
+        colormap = plt.get_cmap(cmap).copy()
+        colormap.set_bad("white")
+        positive = values[values > 0]
+        if not np.isfinite(values).any():
+            norm = Normalize(0.0, 1.0)  # plane entirely inside PEC
+        elif data["log_scale"] and positive.size:
+            norm = LogNorm(positive.min(), positive.max())
+            values = np.where(values > 0, values, np.nan)
+        else:
+            low, high = np.nanmin(values), np.nanmax(values)
+            if high - low < 1e-9 * max(abs(high), 1.0):
+                low, high = low - 0.5, high + 0.5
+            norm = Normalize(low, high)
+
+        mappable = PolyCollection(
+            [f["vertices"] for f in material],
+            array=values,
+            cmap=colormap,
+            norm=norm,
+            edgecolors="none",
+        )
+        ax.add_collection(mappable)
+        ax.add_collection(
+            PolyCollection(
+                [f["vertices"] for f in faces if f["pec"]]
+                + [f["pec_part"] for f in faces if f.get("pec_part") is not None],
+                facecolors="0.6",
+                edgecolors="none",
+            )
+        )
+        ax.add_collection(
+            PolyCollection(
+                [f["vertices"] for f in faces if f["unresolved"]],
+                facecolors="none",
+                edgecolors="0.3",
+                hatch="//",
+                linewidths=0.0,
+            )
+        )
+        ax.add_collection(
+            LineCollection(
+                [e["segment"] for e in data["edges"] if e["style"] == "mesh"],
+                colors="0.25",
+                linewidths=0.6,
+            )
+        )
+
+        handles = [Patch(facecolor="0.6", label="PEC")]
+        if show_stabilization:
+            ax.add_collection(
+                PolyCollection(
+                    [f["cell"] for f in faces if f["floored"]],
+                    facecolors="none",
+                    edgecolors="red",
+                    linewidths=1.2,
+                )
+            )
+            ax.add_collection(
+                LineCollection(
+                    [e["segment"] for e in data["edges"] if e["style"] == "eliminated"],
+                    colors="red",
+                    linewidths=1.2,
+                    linestyles="--",
+                )
+            )
+            handles.append(Patch(facecolor="none", edgecolor="red", label="stabilized"))
+        if any(f["unresolved"] for f in faces):
+            handles.append(
+                Patch(facecolor="none", edgecolor="0.3", hatch="//", label="unresolved")
+            )
+        if show_stl and data["stl_lines"]:
+            ax.add_collection(
+                LineCollection(data["stl_lines"], colors="black", linewidths=1.8)
+            )
+            handles.append(Line2D([], [], color="black", linewidth=1.8, label="STL"))
+
+        (x0, x1), (y0, y1) = data["limits"]
+        ax.set_xlim(x0, x1)
+        ax.set_ylim(y0, y1)
+        ax.set_aspect("equal")
+        ax.set_xlabel(data["xlabel"])
+        ax.set_ylabel(data["ylabel"])
+        ax.set_title(data["title"])
+        ax.legend(
+            handles=handles, loc="upper left", bbox_to_anchor=(1.15, 1.0), fontsize=8
+        )
+        return mappable
+
+    def _add_conformal_mesh_widgets(self, fig, state, draw, grid_type):
+        """Normal/quantity buttons and an index slider for plot_conformal_mesh."""
+        from matplotlib.widgets import RadioButtons, Slider
+
+        fig.subplots_adjust(left=0.22, bottom=0.16)
+        low, high = self._conformal_slice_range(grid_type, state["normal"])
+        slider = Slider(
+            fig.add_axes([0.22, 0.04, 0.5, 0.03]),
+            "index",
+            low,
+            high,
+            valinit=state["index"],
+            valstep=1,
+        )
+
+        def on_index(value):
+            state["index"] = int(value)
+            draw()
+
+        def on_normal(label):
+            state["normal"] = label
+            state["index"] = None
+            draw()
+            low, high = self._conformal_slice_range(grid_type, label)
+            slider.valmin, slider.valmax = low, high
+            slider.ax.set_xlim(low, high)
+            slider.eventson = False
+            slider.set_val(state["index"])
+            slider.eventson = True
+
+        slider.on_changed(on_index)
+        normal_buttons = RadioButtons(
+            fig.add_axes([0.02, 0.62, 0.1, 0.18]),
+            ("x", "y", "z"),
+            active="xyz".index(state["normal"]),
+        )
+        normal_buttons.on_clicked(on_normal)
+        widgets = [slider, normal_buttons]
+
+        if grid_type == "dual":
+
+            def on_quantity(label):
+                state["quantity"] = label
+                draw()
+
+            quantity_buttons = RadioButtons(
+                fig.add_axes([0.02, 0.38, 0.1, 0.14]),
+                ("eps", "sigma"),
+                active=("eps", "sigma").index(state["quantity"]),
+            )
+            quantity_buttons.on_clicked(on_quantity)
+            widgets.append(quantity_buttons)
+
+        # Widgets stop responding once garbage collected; keep a reference.
+        fig._wakis_conformal_widgets = widgets
 
 
 class PlotMixinGrid:

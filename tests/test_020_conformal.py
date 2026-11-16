@@ -303,3 +303,35 @@ def test_conformal_grid_h5_roundtrip(pillbox_stls, tmp_path):
         np.testing.assert_array_equal(
             getattr(original, name).toarray(), getattr(reloaded, name).toarray()
         )
+
+
+# ----------------------------------------------------------------------
+# Plotting
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("geometry_mode", ["conformal", "staircase"])
+@pytest.mark.parametrize("grid_type, quantity", [("primal", "eps"), ("dual", "sigma")])
+def test_plot_conformal_mesh(pillbox_stls, geometry_mode, grid_type, quantity):
+    """Smoke test of the mesh/material plane view: every normal direction,
+    and the interactive widgets switching normal and plane index (the last
+    plane lies entirely in PEC)."""
+    from matplotlib.figure import Figure
+
+    grid = _pillbox_grid(pillbox_stls, geometry_mode, rod=True, n_cells=8)
+    solver = _pec_solver(grid)
+    # A bare Figure needs no GUI backend, so nothing is displayed.
+    for normal in "xyz":
+        solver.plot_conformal_mesh(
+            grid_type=grid_type,
+            normal=normal,
+            quantity=quantity,
+            ax=Figure().add_subplot(),
+        )
+
+    fig, _ = solver.plot_conformal_mesh(
+        grid_type=grid_type, interactive=True, ax=Figure().add_subplot()
+    )
+    slider, normal_buttons = fig._wakis_conformal_widgets[:2]
+    normal_buttons.set_active(0)
+    slider.set_val(slider.valmax)
