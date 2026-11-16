@@ -69,7 +69,7 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
         stl_colors=None,
         stl_tol=1e-3,
         stl_method="legacy",
-        geometry_mode="legacy",
+        geometry_mode="staircase",
         bg_material_type=None,
         conformal_stabilization=None,
         conformal_stabilization_fraction=None,
@@ -147,12 +147,13 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
             Voxelization requires a uniform grid and samples physical cell centres;
             terminal storage planes inherit the nearest physical-cell labels.
         geometry_mode : str, optional
-            Geometry-mask representation used after STL classification.
-            ``"legacy"`` preserves the existing cell-based mask pipeline.
-            ``"conformal"`` classifies primal and dual grid points directly,
-            derives the cell mask from the primal point classification, and
-            constructs interface topology and geometric STL intersections.
-            Default is ``"legacy"``.
+            Geometry representation of the STL solids.
+            ``"staircase"`` assigns one material per mesh cell, so curved
+            surfaces are approximated by cell faces.
+            ``"conformal"`` intersects the STL surfaces with the grid edges
+            and faces and uses the cut edge lengths, face areas and
+            effective materials (conformal FIT).
+            Default is ``"staircase"``.
         subpixel_smoothing : bool, optional
             Whether to apply subpixel smoothing to physical STL cells after
             voxelization. Terminal labels inherit the smoothed boundary cells.
@@ -230,8 +231,8 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
 
         self.geometry_mode = geometry_mode.lower()
 
-        if self.geometry_mode not in ("legacy", "conformal"):
-            raise ValueError("[!] geometry_mode must be 'legacy' or 'conformal'.")
+        if self.geometry_mode not in ("staircase", "conformal"):
+            raise ValueError("[!] geometry_mode must be 'staircase' or 'conformal'.")
 
         if bg_material_type is None:
             self.bg_material_type = None
@@ -373,7 +374,18 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
         self.stl_translate = stl_translate
         self.stl_scale = stl_scale
         self.stl_colors = stl_colors
-        self.update_logger(["stl_solids", "stl_materials", "stl_material_types"])
+        self.update_logger(["stl_solids", "stl_materials"])
+        if self.geometry_mode == "conformal":
+            self.update_logger(
+                [
+                    "geometry_mode",
+                    "stl_material_types",
+                    "bg_material_type",
+                    "conformal_stabilization",
+                    "conformal_area_floor",
+                    "conformal_min_edge_fraction",
+                ]
+            )
         if stl_rotate != [0.0, 0.0, 0.0]:
             self.update_logger(["stl_rotate"])
         if stl_translate != [0.0, 0.0, 0.0]:
@@ -765,13 +777,13 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
                 self.stl_materials[key].append(0.0)
 
     def _mark_cells_in_stl(self, method):
-        if self.geometry_mode == "legacy":
-            self._mark_cells_in_stl_legacy(method)
+        if self.geometry_mode == "staircase":
+            self._mark_cells_in_stl_staircase(method)
 
         elif self.geometry_mode == "conformal":
             self._mark_cells_in_stl_conformal(method)
 
-    def _mark_cells_in_stl_legacy(self, method):
+    def _mark_cells_in_stl_staircase(self, method):
         """
         Mark grid cells that are inside each STL solid.
 
@@ -1500,23 +1512,16 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
             # ----------------------------------------------------------
             # Geometry-pipeline metadata
             # ----------------------------------------------------------
-            if "geometry_mode" in hf.attrs:
-                geometry_mode = hf.attrs["geometry_mode"]
+            # Grids saved before conformal support have no geometry_mode
+            # attribute and are staircase grids.
+            geometry_mode = hf.attrs.get("geometry_mode", "staircase")
 
-                if isinstance(geometry_mode, bytes):
-                    geometry_mode = geometry_mode.decode()
+            if isinstance(geometry_mode, bytes):
+                geometry_mode = geometry_mode.decode()
 
-                self.geometry_mode = str(geometry_mode).lower()
+            self.geometry_mode = str(geometry_mode).lower()
 
-            else:
-                # Backward compatibility with older HDF5 files.
-                has_primal_point_masks = any(
-                    name.startswith("grid_primal_points_") for name in hf.keys()
-                )
-
-                self.geometry_mode = "conformal" if has_primal_point_masks else "legacy"
-
-            if self.geometry_mode not in ("legacy", "conformal"):
+            if self.geometry_mode not in ("staircase", "conformal"):
                 raise ValueError(
                     f"Invalid geometry_mode stored in HDF5 file: {self.geometry_mode}"
                 )

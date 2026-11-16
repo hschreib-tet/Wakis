@@ -25,11 +25,6 @@ dist/
 wakis.egg-info/
 .coverage
 .vscode/
-notebooks/pillbox_upper_dielectric.stl
-notebooks/_009_generated/
-notebooks/_010_generated/
-notebooks/_011_generated/
-notebooks/_pillbox_mesh_convergence/
 notes/*
 tmp/*
 *.stl
