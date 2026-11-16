@@ -1858,7 +1858,8 @@ class PlotMixinSolver:
         else:
             e_index = index - 1  # dual plane t[i] holds the E DOFs of edge i-1
             if quantity == "eps":
-                values = 1.0 / (ieps[normal] * eps_0)
+                with np.errstate(divide="ignore"):  # PEC edges: ieps = 0
+                    values = 1.0 / (ieps[normal] * eps_0)
                 label = rf"$\varepsilon_{{r,{normal}}}$"
             else:
                 values = np.asarray(self.sigma.to_matrix(normal))
@@ -1998,7 +1999,12 @@ class PlotMixinSolver:
                     linestyles="--",
                 )
             )
-            handles.append(Patch(facecolor="none", edgecolor="red", label="stabilized"))
+            if any(f["floored"] for f in faces) or any(
+                e["style"] == "eliminated" for e in data["edges"]
+            ):
+                handles.append(
+                    Patch(facecolor="none", edgecolor="red", label="stabilized")
+                )
         if any(f["unresolved"] for f in faces):
             handles.append(
                 Patch(facecolor="none", edgecolor="0.3", hatch="//", label="unresolved")
