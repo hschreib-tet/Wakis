@@ -245,7 +245,7 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
         }
 
         if (
-            getattr(self.grid, "geometry_mode", "legacy") == "conformal"
+            self.grid.geometry_mode == "conformal"
             and getattr(self.grid, "region_ids", {}).get("primal") is not None
             and getattr(self.grid, "region_ids", {}).get("dual") is not None
         ):
@@ -263,12 +263,7 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
         )
 
         if (
-            getattr(
-                self.grid,
-                "geometry_mode",
-                "legacy",
-            )
-            == "conformal"
+            self.grid.geometry_mode == "conformal"
             and resolved_masks
             and intersection_data
             and all(
@@ -337,12 +332,7 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
 
         if (
             use_stl
-            and getattr(
-                self.grid,
-                "geometry_mode",
-                "legacy",
-            )
-            == "conformal"
+            and self.grid.geometry_mode == "conformal"
             and self.L_eff is not None
             and self.A_eff is not None
         ):
@@ -1053,13 +1043,13 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
     def _apply_stl_materials(self):
         """Assign STL materials using the selected geometry representation."""
 
-        if self.grid.geometry_mode == "legacy":
-            self._apply_stl_materials_legacy()
+        if self.grid.geometry_mode == "staircase":
+            self._apply_stl_materials_staircase()
 
         elif self.grid.geometry_mode == "conformal":
             self._apply_stl_materials_conformal()
 
-    def _apply_stl_materials_legacy(self):
+    def _apply_stl_materials_staircase(self):
         """
         Mask STL solids in the grid and assign user-defined materials.
 

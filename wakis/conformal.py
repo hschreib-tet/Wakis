@@ -117,7 +117,7 @@ class ConformalGridMixin:
         The zero-extent high-side ghost cells of the symmetric stencil are
         treated like PyVista does on the computational grid: their missing
         corners repeat the boundary nodes. This matches the cell masks of
-        the legacy ``interior_points`` method.
+        the staircase ``interior_points`` method.
 
         In conformal mode, this mask is stored in ``self.grid[key]``.
 
@@ -1326,12 +1326,9 @@ class ConformalGridMixin:
                     False,
                 )
 
-        # ----------------------------------------------------------
-        # No unambiguous material-aware selection is possible.
-        #
-        # Keep the previous geometric fallback, but retain the fact
-        # that several effective crossing positions remain.
-        # ----------------------------------------------------------
+        # No material-aware choice is possible: use the crossing nearest
+        # the edge midpoint and flag the edge, so that it is reported in
+        # the conformal geometry diagnostics warning.
 
         return (
             self._select_crossing_group(crossing_groups),
@@ -4327,29 +4324,34 @@ class ConformalSolverMixin:
             # Final diagonal electric material components
             # ------------------------------------------------------
 
-            self.conformal_diagonal_materials["eps_r"][direction] = (
-                self._combine_conformal_diagonal_component(
-                    eps_perp,
-                    eps_parallel,
-                    electric_line_mask,
-                    electric_face_mask,
-                    electric_line_n2,
-                    electric_face_n2,
-                    normal_tol=normal_tol,
-                )
-            )
+            electric_mask = electric_line_mask | electric_face_mask
 
-            self.conformal_diagonal_materials["sigma"][direction] = (
-                self._combine_conformal_diagonal_component(
-                    sigma_perp,
-                    sigma_parallel,
+            for name, perp, parallel in (
+                ("eps_r", eps_perp, eps_parallel),
+                ("sigma", sigma_perp, sigma_parallel),
+            ):
+                perp, parallel = self._fill_uncut_diagonal_values(
+                    perp,
+                    parallel,
                     electric_line_mask,
                     electric_face_mask,
-                    electric_line_n2,
-                    electric_face_n2,
-                    normal_tol=normal_tol,
+                    primal_line_data,
+                    self.region_material_properties[name],
+                    lambda values: self._edge_array_to_field_component(
+                        values, direction
+                    ),
                 )
-            )
+                self.conformal_diagonal_materials[name][direction] = (
+                    self._combine_conformal_diagonal_component(
+                        perp,
+                        parallel,
+                        electric_mask,
+                        electric_mask,
+                        electric_line_n2,
+                        electric_face_n2,
+                        normal_tol=normal_tol,
+                    )
+                )
 
             # ======================================================
             # Magnetic material:
@@ -4455,17 +4457,53 @@ class ConformalSolverMixin:
             # Final diagonal magnetic material component
             # ------------------------------------------------------
 
+            mu_perp, mu_parallel = self._fill_uncut_diagonal_values(
+                mu_perp,
+                mu_parallel,
+                magnetic_line_mask,
+                magnetic_face_mask,
+                dual_line_data,
+                self.region_material_properties["mu_r"],
+                lambda values: self._dual_edge_array_to_field_component(
+                    values, direction
+                ),
+            )
+            magnetic_mask = magnetic_line_mask | magnetic_face_mask
             self.conformal_diagonal_materials["mu_r"][direction] = (
                 self._combine_conformal_diagonal_component(
                     mu_perp,
                     mu_parallel,
-                    magnetic_line_mask,
-                    magnetic_face_mask,
+                    magnetic_mask,
+                    magnetic_mask,
                     magnetic_line_n2,
                     magnetic_face_n2,
                     normal_tol=normal_tol,
                 )
             )
+
+    @staticmethod
+    def _fill_uncut_diagonal_values(
+        perp, parallel, line_mask, face_mask, line_data, region_values, to_field
+    ):
+        """Complete the diagonal material inputs where only one of the edge
+        and its dual face is cut by a normal-normal interface.
+
+        An uncut edge lies in one region, so its harmonic (normal) value is
+        that region's material. An uncut dual face lies in the region that
+        contains the edge midpoint, which it passes through, so its
+        arithmetic (tangential) value is that region's material.
+        """
+        start = line_data["start_region"]
+        end = line_data["end_region"]
+        edge_value = to_field(np.where(start == end, region_values[start], np.nan))
+        # Crossing before the midpoint (alpha < 0.5): midpoint in the end region.
+        # NaN alpha (uncut edge) compares False and selects the start region.
+        midpoint_region = np.where(line_data["alpha"] < 0.5, end, start)
+        face_value = to_field(region_values[midpoint_region])
+        return (
+            np.where(line_mask, perp, edge_value),
+            np.where(face_mask, parallel, face_value),
+        )
 
     def _build_conformal_effective_lengths(self):
         """
@@ -4793,13 +4831,14 @@ class ConformalSolverMixin:
         # ----------------------------------------------------------
         # Geometry-based constitutive assignment (conformal FIT).
         #
-        # Point averaging is retained only as a fallback for geometry
-        # configurations not yet represented by resolved interface data.
-        # For uncut edges with one normal region, use that region's
-        # material; for conductor-conductor primal edges, set ieps=0.
-        # For resolved conductor interfaces, use the *normal* part.
-        # Normal-normal material interfaces are handled afterwards by
-        # the existing diagonal-tensor approximation.
+        # Uncut edges with one normal region get that region's
+        # material; conductor-conductor primal edges get ieps=0.
+        # Resolved conductor interfaces use the *normal* part.
+        # Normal-normal interfaces are handled afterwards by the
+        # diagonal-tensor approximation. The point averages above
+        # remain only on edges without resolved crossings, which the
+        # conformal geometry diagnostics already warn about, and on
+        # the zero-length high-side ghost edges.
         # ----------------------------------------------------------
         if not self.region_material_types:
             self._build_region_material_types()
