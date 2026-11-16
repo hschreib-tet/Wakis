@@ -22,6 +22,7 @@ are ``GridFIT3D._mark_cells_in_stl_conformal`` and
 ``_mark_cells_in_stl`` / ``_apply_stl_materials`` dispatchers.
 """
 
+import itertools
 import warnings
 
 import numpy as np
@@ -94,252 +95,113 @@ class ConformalGridMixin:
             return self.x, self.y, self.z
         return self.tx, self.ty, self.tz
 
-    def _point_mask_to_cell_mask(self, point_mask, threshold=0.5):
+    @staticmethod
+    def _classify_points_in_stl(surf, points, method, stl_tolerance, check_surface):
         """
-        Derive a cell mask from a boolean mask on primal grid points.
+        Classify single points (rows of ``points``) with respect to an STL.
 
-        The cell classification is obtained from the eight primal
-        corner-point classifications using a majority rule. With
-        threshold=0.5, at least five of the eight corners must lie inside
-        the solid.
-
-        The zero-extent high-side ghost cells of the symmetric stencil are
-        treated like PyVista does on the computational grid: their missing
-        corners repeat the boundary nodes. This matches the cell masks of
-        the staircase ``interior_points`` method.
-
-        In conformal mode, this mask is stored in ``self.grid[key]``.
-
-        Parameters
-        ----------
-        point_mask : ndarray of bool
-            Boolean mask with shape (Nx, Ny, Nz).
-        threshold : float, optional
-            Occupancy threshold used for the cell classification.
-
-        Returns
-        -------
-        cell_mask : ndarray of bool
-            Boolean mask with shape (Nx, Ny, Nz), including ghost cells.
+        ``check_surface`` lets PyVista verify that ``surf`` is closed; it is
+        False only for surfaces already known to be open (a warning has been
+        issued). Point lists are not on an image grid, so
+        ``voxelize_rectilinear`` falls back to ``interior_points`` here.
         """
-        point_mask = np.asarray(point_mask, dtype=bool)
-
-        # Repeat the high-side boundary nodes for the ghost cells.
-        p = np.pad(point_mask, ((0, 1), (0, 1), (0, 1)), mode="edge")
-
-        # uint8 is sufficient (maximum value is 8).
-        count = p[:-1, :-1, :-1].astype(np.uint8)
-        count += p[1:, :-1, :-1]
-        count += p[:-1, 1:, :-1]
-        count += p[:-1, :-1, 1:]
-        count += p[1:, 1:, :-1]
-        count += p[1:, :-1, 1:]
-        count += p[:-1, 1:, 1:]
-        count += p[1:, 1:, 1:]
-
-        return count > 8.0 * threshold
-
-    def _classify_coordinate_block_in_stl(
-        self,
-        surf,
-        x,
-        y,
-        z,
-        method,
-        stl_tolerance,
-        progress_bar=False,
-        check_surface=True,
-    ):
-        """
-        Classify a Cartesian block of points with respect to an STL surface.
-
-        Parameters
-        ----------
-        surf : pyvista.PolyData
-            Closed STL surface.
-        x, y, z : array_like
-            Coordinates of the Cartesian point block.
-        method : str
-            STL classification method, validated by the caller.
-        stl_tolerance : float
-            Tolerance used by the point-in-surface classifier.
-        progress_bar : bool, optional
-            Show PyVista progress information.
-        check_surface : bool, optional
-            Let PyVista verify that ``surf`` is closed before classifying
-            interior points. Set to False only for surfaces already known to
-            be open, for which a warning has been issued.
-
-        Returns
-        -------
-        ndarray of bool
-            Boolean mask with shape (len(x), len(y), len(z)).
-        """
-        x, y, z = (np.asarray(c, dtype=float) for c in (x, y, z))
-        shape = (len(x), len(y), len(z))
-        method = method.lower()
-
-        if method == "voxelize_rectilinear":
-            # The voxelizer needs a uniform image grid. A single-plane block
-            # has no spacing of its own; use the grid spacing.
-            spacings = []
-            for coords, fallback in zip((x, y, z), (self.dx, self.dy, self.dz)):
-                differences = np.diff(coords)
-                if differences.size and not np.allclose(differences, differences[0]):
-                    raise ValueError(
-                        "voxelize_rectilinear requires uniformly spaced grid "
-                        "coordinates."
-                    )
-                spacings.append(
-                    float(differences[0] if differences.size else np.min(fallback))
-                )
-
-            reference_volume = pv.ImageData(
-                dimensions=shape, origin=(x[0], y[0], z[0]), spacing=tuple(spacings)
-            )
-            vox = surf.voxelize_rectilinear(
-                reference_volume=reference_volume, progress_bar=progress_bar
-            )
-            voxel_mask = np.asarray(vox.cell_data["mask"], dtype=bool)
-            if voxel_mask.size != np.prod(shape):
-                raise RuntimeError(
-                    f"Unexpected voxelize_rectilinear mask size {voxel_mask.size}; "
-                    f"expected {np.prod(shape)}."
-                )
-            return np.reshape(voxel_mask, shape, order="F")
-
-        xx, yy, zz = np.meshgrid(x, y, z, indexing="ij")
-        points = pv.PolyData(np.column_stack((xx.ravel(), yy.ravel(), zz.ravel())))
+        cloud = pv.PolyData(np.asarray(points, dtype=float))
 
         if method == "implicit_distance":
-            inside = points.compute_implicit_distance(surf)["implicit_distance"] <= 0.0
-        else:
-            inside = points.select_interior_points(
-                surf,
-                method="cell_locator",
-                locator_tolerance=stl_tolerance,
-                check_surface=check_surface,
-            )["selected_points"]
+            distance = cloud.compute_implicit_distance(surf)["implicit_distance"]
+            return np.asarray(distance) <= 0.0
 
-        return np.reshape(np.asarray(inside, dtype=bool), shape)
-
-    def _classify_grid_points_in_stl(
-        self,
-        surf,
-        grid_type,
-        method,
-        stl_tolerance,
-        progress_bar=False,
-        check_surface=True,
-    ):
-        """
-        Classify primal or dual FIT grid points with respect to an STL.
-
-        For the primal grid, all points are classified using the selected
-        STL method. ``check_surface`` is passed on to the interior-point
-        classification (see ``_classify_coordinate_block_in_stl``).
-
-        For the dual grid, the interior dual points (primal cell centres)
-        are classified using the selected STL method. Points on the six
-        domain-boundary planes are classified separately using
-        interior_points.
-        """
-        x, y, z = self._get_grid_coordinates(grid_type)
-
-        if grid_type == "primal":
-            return self._classify_coordinate_block_in_stl(
-                surf,
-                x,
-                y,
-                z,
-                method,
-                stl_tolerance,
-                progress_bar=progress_bar,
-                check_surface=check_surface,
-            )
-
-        # Interior dual grid (primal cell centres)
-        #
-        # The dual coordinates are [x0, midpoints, x_end]. The interior
-        # block is regular on a uniform grid, so every STL method applies.
-        point_mask = np.zeros((len(x), len(y), len(z)), dtype=bool)
-
-        point_mask[1:-1, 1:-1, 1:-1] = self._classify_coordinate_block_in_stl(
+        selected = cloud.select_interior_points(
             surf,
-            x[1:-1],
-            y[1:-1],
-            z[1:-1],
-            method,
-            stl_tolerance,
-            progress_bar=progress_bar,
+            method="cell_locator",
+            locator_tolerance=stl_tolerance,
             check_surface=check_surface,
         )
+        return np.asarray(selected["selected_points"], dtype=bool)
 
-        # Boundary planes (half-cell spacing to the domain boundary)
-        #
-        # Classified with interior_points. x planes include all y/z
-        # points, y planes the remaining x, z planes the remaining x/y,
-        # so every boundary point is classified exactly once.
-        inner = slice(1, -1)
-        planes = []
-        for end in (0, -1):
-            planes.append(((end, slice(None), slice(None)), (x[[end]], y, z)))
-            planes.append(((inner, end, slice(None)), (x[inner], y[[end]], z)))
-            planes.append(((inner, inner, end), (x[inner], y[inner], z[[end]])))
-
-        for index, (px, py, pz) in planes:
-            block = self._classify_coordinate_block_in_stl(
-                surf,
-                px,
-                py,
-                pz,
-                "interior_points",
-                stl_tolerance,
-                progress_bar=False,
-                check_surface=check_surface,
-            )
-            point_mask[index] = block.reshape(point_mask[index].shape)
-
-        return point_mask
-
-    def _store_stl_masks(
-        self, key, primal_point_mask, dual_point_mask, cell_threshold=0.5
+    def _classify_primal_points_in_stl(
+        self, surf, method, stl_tolerance, progress_bar, check_surface
     ):
         """
-        Store primal-point, dual-point, and cell masks for one STL solid.
+        Classify all primal grid points with respect to an STL surface.
 
-        The primal and dual point masks are obtained independently from
-        geometric STL classification. The cell mask stored in
-        ``self.grid[key]`` is derived from the eight primal corner-point
-        classifications.
-
-        Parameters
-        ----------
-        key : str
-            STL solid key.
-        primal_point_mask : ndarray of bool
-            Boolean mask on primal grid points with shape (Nx, Ny, Nz).
-        dual_point_mask : ndarray of bool
-            Boolean mask on dual grid points with shape
-            (Nx+1, Ny+1, Nz+1).
-        cell_threshold : float, optional
-            Threshold used to classify the cell center from the eight
-            primal corner-point values. With the default value 0.5,
-            at least five of eight corner points must lie inside the solid.
+        Returns a boolean mask with shape (Nx, Ny, Nz).
         """
-        primal_point_mask = np.asarray(primal_point_mask, dtype=bool)
-        dual_point_mask = np.asarray(dual_point_mask, dtype=bool)
+        x, y, z = self.x, self.y, self.z
+        shape = (len(x), len(y), len(z))
 
-        cell_center_mask = self._point_mask_to_cell_mask(
-            primal_point_mask, threshold=cell_threshold
+        if method != "voxelize_rectilinear":
+            xx, yy, zz = np.meshgrid(x, y, z, indexing="ij")
+            points = np.column_stack((xx.ravel(), yy.ravel(), zz.ravel()))
+            return self._classify_points_in_stl(
+                surf, points, method, stl_tolerance, check_surface
+            ).reshape(shape)
+
+        spacings = []
+        for coords in (x, y, z):
+            differences = np.diff(coords)
+            if not np.allclose(differences, differences[0]):
+                raise ValueError(
+                    "voxelize_rectilinear requires uniformly spaced grid coordinates."
+                )
+            spacings.append(float(differences[0]))
+
+        reference_volume = pv.ImageData(
+            dimensions=shape, origin=(x[0], y[0], z[0]), spacing=tuple(spacings)
         )
-
-        self.primal_point_masks[key] = primal_point_mask
-        self.dual_point_masks[key] = dual_point_mask
-
-        self.grid[key] = np.reshape(
-            cell_center_mask, self.Nx * self.Ny * self.Nz, order="C"
+        vox = surf.voxelize_rectilinear(
+            reference_volume=reference_volume, progress_bar=progress_bar
         )
+        voxel_mask = np.asarray(vox.cell_data["mask"], dtype=bool)
+        if voxel_mask.size != np.prod(shape):
+            raise RuntimeError(
+                f"Unexpected voxelize_rectilinear mask size {voxel_mask.size}; "
+                f"expected {np.prod(shape)}."
+            )
+        return np.reshape(voxel_mask, shape, order="F")
+
+    def _classify_dual_points_in_stl(
+        self, surf, primal_mask, method, stl_tolerance, check_surface
+    ):
+        """
+        Classify the dual grid points, reusing the primal classification.
+
+        Each dual point lies between up to 8 primal points: the 8 corners of
+        its cell, or 4, 2 or 1 on the domain boundary. Where these all agree,
+        the dual point takes their value; only dual points next to the
+        surface (corners disagree) are classified with the STL method. This
+        keeps the classification exact up to features thinner than a cell,
+        which the conformal treatment cannot resolve anyway.
+
+        Returns
+        -------
+        dual_mask : ndarray of bool
+            Mask on the dual points, shape (Nx+1, Ny+1, Nz+1).
+        inside_corners : ndarray of uint8
+            Number of inside primal corners of every dual point; for the
+            interior dual points this is the corner count of their cell.
+        """
+        shape = (self.Nx + 1, self.Ny + 1, self.Nz + 1)
+
+        # Edge padding repeats the boundary nodes, so boundary dual points
+        # count their 4, 2 or 1 real primal neighbours repeatedly.
+        padded = np.pad(np.asarray(primal_mask, dtype=np.uint8), 1, mode="edge")
+        inside_corners = np.zeros(shape, dtype=np.uint8)
+        for a, b, c in itertools.product((0, 1), repeat=3):
+            inside_corners += padded[
+                a : a + shape[0], b : b + shape[1], c : c + shape[2]
+            ]
+
+        dual_mask = inside_corners == 8
+        near_surface = (inside_corners > 0) & (inside_corners < 8)
+        if near_surface.any():
+            i, j, k = np.nonzero(near_surface)
+            points = np.column_stack((self.tx[i], self.ty[j], self.tz[k]))
+            dual_mask[near_surface] = self._classify_points_in_stl(
+                surf, points, method, stl_tolerance, check_surface
+            )
+
+        return dual_mask, inside_corners
 
     def _build_region_maps(self):
         """
@@ -1703,13 +1565,12 @@ class ConformalGridMixin:
         """
         Generate conformal STL masks on the primal and dual FIT grids.
 
-        Both primal and dual grid-point masks are generated using the same
-        selected STL classification method. For the dual grid, the selected
-        method is applied to the interior dual points, while points on the
-        domain-boundary planes are classified using ``interior_points``.
-
-        The cell mask stored in ``self.grid[key]`` is derived from the primal
-        point mask using the existing corner-point threshold rule.
+        The primal grid points are classified with the selected STL method.
+        Dual points take the value of their primal neighbours where these
+        agree and are classified exactly only next to the surface (see
+        ``_classify_dual_points_in_stl``). The cell mask stored in
+        ``self.grid[key]`` follows from the same corner count (at least 5 of
+        8 corners inside).
 
         Parameters
         ----------
@@ -1762,29 +1623,20 @@ class ConformalGridMixin:
                     stacklevel=2,
                 )
 
-            # Primal grid-point classification
-            primal_point_mask = self._classify_grid_points_in_stl(
-                surf=surf,
-                grid_type="primal",
-                method=method,
-                stl_tolerance=stl_tolerance,
-                progress_bar=progress_bar,
-                check_surface=check_surface,
+            primal_mask = self._classify_primal_points_in_stl(
+                surf, method, stl_tolerance, progress_bar, check_surface
             )
-
-            # Dual grid-point classification
-            dual_point_mask = self._classify_grid_points_in_stl(
-                surf=surf,
-                grid_type="dual",
-                method=method,
-                stl_tolerance=stl_tolerance,
-                progress_bar=progress_bar,
-                check_surface=check_surface,
+            dual_mask, inside_corners = self._classify_dual_points_in_stl(
+                surf, primal_mask, method, stl_tolerance, check_surface
             )
+            self.primal_point_masks[key] = primal_mask
+            self.dual_point_masks[key] = dual_mask
 
-            # Store primal/dual point masks and derive the cell mask
-            self._store_stl_masks(
-                key, primal_point_mask, dual_point_mask, cell_threshold=0.5
+            # Cell mask for plots, overlap checks and HDF5: at least 5 of the
+            # 8 corners inside. Dual point (i+1, j+1, k+1) is the centre of
+            # cell (i, j, k); the high-side ghost cells repeat the boundary.
+            self.grid[key] = np.reshape(
+                inside_corners[1:, 1:, 1:] >= 5, self.Nx * self.Ny * self.Nz
             )
 
             # Diagnostics
