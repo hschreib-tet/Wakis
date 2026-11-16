@@ -273,7 +273,8 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
             "dual": {},
         }
 
-        self.interior_interface_edge_masks = {
+        # Interface edges with an endpoint transition and an STL crossing
+        self.resolved_interface_edge_masks = {
             "primal": {},
             "dual": {},
         }
@@ -291,11 +292,6 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
 
         self.region_id_to_key = {0: None}
         self.region_key_to_id = {}
-
-        self.face_candidate_masks = {
-            "primal": {},
-            "dual": {},
-        }
 
         self.interface_face_data = {
             "primal": {},
