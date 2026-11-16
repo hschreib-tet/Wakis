@@ -938,22 +938,14 @@ class ConformalGridMixin:
                     grid_type, direction
                 )
 
+                # One representative crossing per edge; pure tangential
+                # contacts keep the NaN / -1 defaults.
                 intersections = {
                     "alpha": np.full(shape, np.nan, dtype=float),
                     "surface_id": np.full(shape, -1, dtype=np.int32),
-                    "cell_id": np.full(shape, -1, dtype=np.int64),
                     "normal": np.full(shape + (3,), np.nan, dtype=float),
-                    # Raw geometric ray-tracing information.
-                    "has_intersection": np.zeros(shape, dtype=bool),
-                    "multiple_intersections": np.zeros(shape, dtype=bool),
-                    "hit_groups": {},
-                    # Classified interface information.
                     "has_crossing": np.zeros(shape, dtype=bool),
-                    "has_contact": np.zeros(shape, dtype=bool),
                     "multiple_crossing_positions": np.zeros(shape, dtype=bool),
-                    "raw_multiple_crossing_positions": np.zeros(shape, dtype=bool),
-                    "crossing_groups": {},
-                    "contact_groups": {},
                 }
 
                 raw_hits = {}
@@ -988,87 +980,35 @@ class ConformalGridMixin:
                     hit_groups = self._group_intersection_hits(
                         hits, alpha_tolerance=alpha_tolerance
                     )
-
-                    if not hit_groups:
-                        continue
-
-                    # Raw geometric ray-tracing information
-                    intersections["has_intersection"][edge_index] = True
-
-                    intersections["multiple_intersections"][edge_index] = (
-                        len(hit_groups) > 1
-                    )
-
-                    intersections["hit_groups"][edge_index] = hit_groups
-
-                    # Crossing/contact classification
-                    (crossing_groups, contact_groups) = self._split_intersection_groups(
+                    crossing_groups, _ = self._split_intersection_groups(
                         hit_groups, direction
                     )
+                    if not crossing_groups:
+                        continue
 
-                    if crossing_groups:
-                        intersections["has_crossing"][edge_index] = True
-
-                        # Preserve the complete raw geometric information.
-                        intersections["crossing_groups"][edge_index] = crossing_groups
-
-                        intersections["raw_multiple_crossing_positions"][edge_index] = (
-                            len(crossing_groups) > 1
-                        )
-
-                    if contact_groups:
-                        intersections["has_contact"][edge_index] = True
-                        intersections["contact_groups"][edge_index] = contact_groups
-
-                    # Representative physical crossing
-                    #
-                    # Dense alpha/surface/normal arrays describe an actual
-                    # crossing only. Pure tangential contacts therefore keep
-                    # their default NaN / -1 values.
-                    if crossing_groups:
-                        (selected_group, multiple_effective_crossings) = (
-                            self._select_effective_crossing_group(
-                                crossing_groups,
-                                start_region=(start_regions[edge_index]),
-                                end_region=(end_regions[edge_index]),
-                            )
-                        )
-
-                        intersections["multiple_crossing_positions"][edge_index] = (
-                            multiple_effective_crossings
-                        )
-
-                        representative = self._select_representative_hit(selected_group)
-                        intersections["alpha"][edge_index] = representative["alpha"]
-
-                        intersections["surface_id"][edge_index] = representative[
-                            "surface_id"
-                        ]
-
-                        intersections["cell_id"][edge_index] = representative["cell_id"]
-                        intersections["normal"][edge_index] = representative["normal"]
+                    selected_group, multiple = self._select_effective_crossing_group(
+                        crossing_groups,
+                        start_region=start_regions[edge_index],
+                        end_region=end_regions[edge_index],
+                    )
+                    representative = self._select_representative_hit(selected_group)
+                    intersections["has_crossing"][edge_index] = True
+                    intersections["multiple_crossing_positions"][edge_index] = multiple
+                    intersections["alpha"][edge_index] = representative["alpha"]
+                    intersections["surface_id"][edge_index] = representative[
+                        "surface_id"
+                    ]
+                    intersections["normal"][edge_index] = representative["normal"]
 
                 self.interface_intersections[grid_type][direction] = intersections
 
                 if self.verbose:
-                    n_intersections = int(
-                        np.count_nonzero(intersections["has_intersection"])
-                    )
-
-                    n_crossings = int(np.count_nonzero(intersections["has_crossing"]))
-                    n_contacts = int(np.count_nonzero(intersections["has_contact"]))
-
-                    n_multiple_crossings = int(
-                        np.count_nonzero(intersections["multiple_crossing_positions"])
-                    )
-
                     print(
                         f"    * {grid_type} {direction}-edges: "
-                        f"{n_intersections} geometric hits, "
-                        f"{n_crossings} crossings, "
-                        f"{n_contacts} contacts, "
-                        f"{n_multiple_crossings} with multiple "
-                        "crossing positions"
+                        f"{np.count_nonzero(intersections['has_crossing'])} "
+                        "crossings, "
+                        f"{np.count_nonzero(intersections['multiple_crossing_positions'])}"
+                        " with multiple crossing positions"
                     )
         self._build_resolved_interface_edge_masks()
 
@@ -1082,7 +1022,6 @@ class ConformalGridMixin:
             AND
             geometric STL crossing
         """
-        self.interior_interface_edge_masks = {"primal": {}, "dual": {}}
         self.resolved_interface_edge_masks = {"primal": {}, "dual": {}}
 
         for grid_type in ("primal", "dual"):
@@ -1093,11 +1032,8 @@ class ConformalGridMixin:
                     "has_crossing"
                 ]
 
-                interior = endpoint_mask & has_crossing
-                self.interior_interface_edge_masks[grid_type][direction] = interior
-
                 self.resolved_interface_edge_masks[grid_type][direction] = (
-                    interior.copy()
+                    endpoint_mask & has_crossing
                 )
 
     def _get_region_material_type(self, region_id):
@@ -1117,19 +1053,14 @@ class ConformalGridMixin:
 
         return self.stl_material_types[key]
 
-    def _get_interface_diagnostics(self):
+    def _warn_interface_diagnostics(self):
         """
-        Summarize unresolved and approximated conformal-interface cases.
+        Warn about interface edges that the conformal treatment ignores or
+        approximates: material transitions without an STL crossing,
+        crossings hidden from the endpoint regions (features thinner than a
+        cell) and edges with several crossings (one representative is used).
         """
-        diagnostics = {
-            "endpoint_interfaces": 0,
-            "resolved_interfaces": 0,
-            "missing_crossings": 0,
-            "hidden_crossings": 0,
-            "multiple_crossing_edges": 0,
-            "multiple_resolved_edges": 0,
-            "repeated_stl_crossing_edges": [],
-        }
+        missing = hidden = multiple = 0
 
         for grid_type in ("primal", "dual"):
             for direction in ("x", "y", "z"):
@@ -1141,122 +1072,27 @@ class ConformalGridMixin:
                         grid_type, direction
                     )
 
-                resolved_mask = self.resolved_interface_edge_masks[grid_type][direction]
                 data = self.interface_intersections[grid_type][direction]
-                has_crossing = data["has_crossing"]
-                multiple = data["multiple_crossing_positions"]
-                missing = endpoint_mask & ~has_crossing
-                hidden = ~endpoint_mask & has_crossing
+                missing += np.count_nonzero(endpoint_mask & ~data["has_crossing"])
+                hidden += np.count_nonzero(~endpoint_mask & data["has_crossing"])
+                multiple += np.count_nonzero(data["multiple_crossing_positions"])
 
-                diagnostics["endpoint_interfaces"] += int(
-                    np.count_nonzero(endpoint_mask)
-                )
-
-                diagnostics["resolved_interfaces"] += int(
-                    np.count_nonzero(resolved_mask)
-                )
-
-                diagnostics["missing_crossings"] += int(np.count_nonzero(missing))
-                diagnostics["hidden_crossings"] += int(np.count_nonzero(hidden))
-
-                diagnostics["multiple_crossing_edges"] += int(
-                    np.count_nonzero(multiple)
-                )
-
-                diagnostics["multiple_resolved_edges"] += int(
-                    np.count_nonzero(multiple & resolved_mask)
-                )
-
-                for index, groups in data["crossing_groups"].items():
-                    if len(groups) <= 1:
-                        continue
-
-                    surface_ids_per_group = [
-                        {hit["surface_id"] for hit in group} for group in groups
-                    ]
-
-                    all_surface_ids = set().union(*surface_ids_per_group)
-
-                    repeated_surface_ids = {
-                        surface_id
-                        for surface_id in all_surface_ids
-                        if sum(
-                            surface_id in group_ids
-                            for group_ids in surface_ids_per_group
-                        )
-                        > 1
-                    }
-
-                    if repeated_surface_ids:
-                        diagnostics["repeated_stl_crossing_edges"].append(
-                            {
-                                "grid_type": grid_type,
-                                "direction": direction,
-                                "index": tuple(int(v) for v in index),
-                                "surface_ids": tuple(sorted(repeated_surface_ids)),
-                            }
-                        )
-        return diagnostics
-
-    def _warn_interface_diagnostics(self):
-        """
-        Warn about conformal-interface cases that are currently ignored or
-        approximated.
-        """
-        diagnostics = self._get_interface_diagnostics()
         messages = []
-
-        if diagnostics["missing_crossings"]:
+        if missing:
             messages.append(
-                f"{diagnostics['missing_crossings']} endpoint "
-                "interface edges have no geometric crossing and "
-                "will not receive a conformal correction."
+                f"{missing} interface edges have no geometric crossing and "
+                "receive no conformal correction."
             )
-
-        if diagnostics["hidden_crossings"]:
+        if hidden:
             messages.append(
-                f"{diagnostics['hidden_crossings']} edges contain "
-                "geometric crossings that are hidden from endpoint "
-                "topology and are ignored by the current conformal "
-                "discretization."
+                f"{hidden} edges contain crossings hidden from the endpoint "
+                "regions (features thinner than a cell); they are ignored."
             )
-
-        if diagnostics["multiple_crossing_edges"]:
+        if multiple:
             messages.append(
-                f"{diagnostics['multiple_crossing_edges']} edges "
-                "contain multiple crossing positions. "
-                f"{diagnostics['multiple_resolved_edges']} of these "
-                "are currently used by the conformal discretization; "
-                "one representative crossing is selected on each edge."
+                f"{multiple} edges cross several surfaces; one representative "
+                "crossing is used on each."
             )
-
-        repeated = diagnostics["repeated_stl_crossing_edges"]
-
-        if repeated:
-            messages.append(
-                f"{len(repeated)} edges cross the same STL at more "
-                "than one distinct position. The geometry on these "
-                "edges is not fully resolved by the current "
-                "single-crossing treatment."
-            )
-
-            for item in repeated[:5]:
-                surface_names = [
-                    self.region_id_to_key[surface_id]
-                    for surface_id in item["surface_ids"]
-                ]
-
-                messages.append(
-                    "  "
-                    f"{item['grid_type']} "
-                    f"{item['direction']}-edge "
-                    f"{item['index']}: "
-                    f"{', '.join(surface_names)}"
-                )
-
-            if len(repeated) > 5:
-                messages.append(f"  ... and {len(repeated) - 5} more.")
-
         if messages:
             warnings.warn(
                 "Conformal geometry diagnostics:\n" + "\n".join(messages),
@@ -1279,7 +1115,7 @@ class ConformalGridMixin:
         self.face_candidate_masks = {"primal": {}, "dual": {}}
 
         for grid_type in ("primal", "dual"):
-            edge_masks = self.interior_interface_edge_masks[grid_type]
+            edge_masks = self.resolved_interface_edge_masks[grid_type]
             x_edges = np.asarray(edge_masks["x"], dtype=bool)
             y_edges = np.asarray(edge_masks["y"], dtype=bool)
             z_edges = np.asarray(edge_masks["z"], dtype=bool)
@@ -1409,8 +1245,8 @@ class ConformalGridMixin:
             edge_index = edge["index"]
             boundary_sign = edge["boundary_sign"]
 
-            (start_point, end_point, start_region, end_region) = (
-                self._get_edge_geometry(grid_type, direction, edge_index)
+            start_point, end_point, _, _ = self._get_edge_geometry(
+                grid_type, direction, edge_index
             )
 
             edge_length = np.linalg.norm(end_point - start_point)
@@ -1436,31 +1272,17 @@ class ConformalGridMixin:
             else:
                 local_boundary_coordinate = 1.0 - alpha
 
-            boundary_parameter = boundary_order + local_boundary_coordinate
-            multiple_crossing_positions = False
-
-            if "multiple_crossing_positions" in intersection_data:
-                multiple_crossing_positions = bool(
-                    intersection_data["multiple_crossing_positions"][edge_index]
-                )
-
             raw_hits.append(
                 {
                     "point": point,
-                    "edge_direction": direction,
-                    "edge_index": edge_index,
-                    "alpha": alpha,
-                    "boundary_order": boundary_order,
-                    "boundary_sign": boundary_sign,
-                    "boundary_parameter": (boundary_parameter),
-                    "start_region": start_region,
-                    "end_region": end_region,
+                    "boundary_parameter": boundary_order + local_boundary_coordinate,
                     "surface_id": int(intersection_data["surface_id"][edge_index]),
-                    "cell_id": int(intersection_data["cell_id"][edge_index]),
                     "normal": np.asarray(
                         intersection_data["normal"][edge_index], dtype=float
-                    ).copy(),
-                    "multiple_crossing_positions": (multiple_crossing_positions),
+                    ),
+                    "multiple_crossing_positions": bool(
+                        intersection_data["multiple_crossing_positions"][edge_index]
+                    ),
                 }
             )
 
@@ -1522,11 +1344,7 @@ class ConformalGridMixin:
         result = {
             "resolved": False,
             "point_groups": point_groups,
-            "p0": None,
-            "p1": None,
-            "vector": None,
             "length": np.nan,
-            "tangent": None,
             "surface_id": -1,
             "normal": None,
         }
@@ -1560,15 +1378,12 @@ class ConformalGridMixin:
             return result
 
         surface_id = next(iter(common_surface_ids))
-        p0 = np.asarray(point_groups[0]["point"], dtype=float)
-        p1 = np.asarray(point_groups[1]["point"], dtype=float)
-        vector = p1 - p0
-        length = float(np.linalg.norm(vector))
+        length = float(
+            np.linalg.norm(point_groups[1]["point"] - point_groups[0]["point"])
+        )
 
         if length <= 0.0:
             return result
-
-        tangent = vector / length
 
         # Collect facet normals belonging to the selected STL surface.
         normals = []
@@ -1592,13 +1407,9 @@ class ConformalGridMixin:
         result.update(
             {
                 "resolved": True,
-                "p0": p0.copy(),
-                "p1": p1.copy(),
-                "vector": vector.copy(),
                 "length": length,
-                "tangent": tangent.copy(),
                 "surface_id": int(surface_id),
-                "normal": (None if normal is None else normal.copy()),
+                "normal": normal,
             }
         )
 
@@ -1611,8 +1422,6 @@ class ConformalGridMixin:
         The ordering is counter-clockwise with respect to the positive
         face normal.
         """
-        # Also validates the face index.
-        self._get_face_boundary_edges(grid_type, face_direction, index)
         x, y, z = self._get_grid_coordinates(grid_type)
         region_ids = self.region_ids[grid_type]
         i, j, k = (int(value) for value in index)
@@ -1631,15 +1440,13 @@ class ConformalGridMixin:
                 (i + 1, j, k + 1),
                 (i + 1, j, k),
             ]
-        elif face_direction == "z":
+        else:
             corner_indices = [
                 (i, j, k),
                 (i + 1, j, k),
                 (i + 1, j + 1, k),
                 (i, j + 1, k),
             ]
-        else:
-            raise ValueError(f"Unknown face direction '{face_direction}'.")
 
         corners = []
 
@@ -1649,7 +1456,6 @@ class ConformalGridMixin:
             corners.append(
                 {
                     "point": np.array([x[ci], y[cj], z[ck]], dtype=float),
-                    "grid_index": corner_index,
                     "region_id": int(region_ids[corner_index]),
                     "boundary_parameter": float(boundary_parameter),
                 }
@@ -1671,10 +1477,8 @@ class ConformalGridMixin:
             points_2d = vertices[:, [1, 2]]
         elif face_direction == "y":
             points_2d = vertices[:, [2, 0]]
-        elif face_direction == "z":
-            points_2d = vertices[:, [0, 1]]
         else:
-            raise ValueError(f"Unknown face direction '{face_direction}'.")
+            points_2d = vertices[:, [0, 1]]
 
         u = points_2d[:, 0]
         v = points_2d[:, 1]
@@ -1757,12 +1561,7 @@ class ConformalGridMixin:
             grid_type, face_direction, index, point_tolerance=point_tolerance
         )
 
-        result = {
-            "resolved": False,
-            "segment": segment,
-            "face_area": np.nan,
-            "polygons": [],
-        }
+        result = {"resolved": False, "segment": segment, "polygons": []}
 
         if not segment["resolved"]:
             return result
@@ -1824,39 +1623,19 @@ class ConformalGridMixin:
         if not np.isclose(area_0 + area_1, face_area, rtol=1e-10, atol=area_tolerance):
             return result
 
-        segment_vector = np.asarray(segment["vector"], dtype=float)
-        segment_length = float(segment["length"])
-
-        # Polygon 0 closes from p1 back to p0.
-        cut_vector_0 = -segment_vector
-
-        # Polygon 1 closes from p0 to p1.
-        cut_vector_1 = segment_vector.copy()
-
         polygons = [
             {
-                "region_id": int(region_id_0),
-                "vertices": path_0.copy(),
-                "area": float(area_0),
-                "area_fraction": float(area_0 / face_area),
-                "cut_vector": (cut_vector_0.copy()),
-                "cut_length": (segment_length),
-                "cut_tangent": (cut_vector_0 / segment_length),
-            },
-            {
-                "region_id": int(region_id_1),
-                "vertices": path_1.copy(),
-                "area": float(area_1),
-                "area_fraction": float(area_1 / face_area),
-                "cut_vector": (cut_vector_1.copy()),
-                "cut_length": (segment_length),
-                "cut_tangent": (cut_vector_1 / segment_length),
-            },
+                "region_id": int(region_id),
+                "vertices": path,
+                "area_fraction": float(area / face_area),
+            }
+            for region_id, path, area in (
+                (region_id_0, path_0, area_0),
+                (region_id_1, path_1, area_1),
+            )
         ]
 
-        result.update(
-            {"resolved": True, "face_area": float(face_area), "polygons": polygons}
-        )
+        result.update({"resolved": True, "polygons": polygons})
 
         return result
 
@@ -1875,96 +1654,49 @@ class ConformalGridMixin:
                     self.face_candidate_masks[grid_type][face_direction], dtype=bool
                 )
 
-                segment_resolved = np.zeros_like(candidate, dtype=bool)
                 resolved = np.zeros_like(candidate, dtype=bool)
-                face_area = np.full(candidate.shape, np.nan, dtype=float)
                 segments = {}
                 polygons = {}
-                region_areas = {}
                 region_area_fractions = {}
 
                 for index_array in np.argwhere(candidate):
                     index = tuple(int(value) for value in index_array)
-
                     split = self._split_face_by_interface(
                         grid_type, face_direction, index
                     )
-
                     segment = split["segment"]
 
-                    # Preserve a successfully reconstructed segment even
-                    # if the later polygon classification is unresolved.
+                    # Keep a reconstructed segment even if the polygon split
+                    # fails, so that the SIBC can detect unresolved faces.
                     if segment["resolved"]:
-                        segment_resolved[index] = True
-
                         segments[index] = {
-                            "surface_id": int(segment["surface_id"]),
-                            "p0": (segment["p0"].copy()),
-                            "p1": (segment["p1"].copy()),
-                            "vector": (segment["vector"].copy()),
-                            "length": float(segment["length"]),
-                            "tangent": (segment["tangent"].copy()),
-                            "normal": (
-                                None
-                                if segment["normal"] is None
-                                else segment["normal"].copy()
-                            ),
+                            key: segment[key]
+                            for key in ("surface_id", "length", "normal")
                         }
 
                     if not split["resolved"]:
                         continue
 
                     resolved[index] = True
-                    face_area[index] = float(split["face_area"])
-                    polygon_records = []
-                    areas = {}
-                    area_fractions = {}
-
-                    for polygon in split["polygons"]:
-                        region_id = int(polygon["region_id"])
-                        area = float(polygon["area"])
-                        area_fraction = float(polygon["area_fraction"])
-                        areas[region_id] = area
-                        area_fractions[region_id] = area_fraction
-
-                        polygon_records.append(
-                            {
-                                "region_id": region_id,
-                                "vertices": polygon["vertices"].copy(),
-                                "area": area,
-                                "area_fraction": area_fraction,
-                                "cut_vector": polygon["cut_vector"].copy(),
-                                "cut_length": float(polygon["cut_length"]),
-                                "cut_tangent": polygon["cut_tangent"].copy(),
-                            }
-                        )
-
-                    polygons[index] = polygon_records
-                    region_areas[index] = areas
-                    region_area_fractions[index] = area_fractions
+                    polygons[index] = split["polygons"]
+                    region_area_fractions[index] = {
+                        polygon["region_id"]: polygon["area_fraction"]
+                        for polygon in split["polygons"]
+                    }
 
                 self.interface_face_data[grid_type][face_direction] = {
-                    "candidate": (candidate.copy()),
-                    "segment_resolved": (segment_resolved),
                     "resolved": resolved,
-                    "face_area": face_area,
                     "segments": segments,
                     "polygons": polygons,
-                    "region_areas": (region_areas),
-                    "region_area_fractions": (region_area_fractions),
+                    "region_area_fractions": region_area_fractions,
                 }
 
                 if self.verbose:
-                    n_candidate = int(np.count_nonzero(candidate))
-                    n_segment = int(np.count_nonzero(segment_resolved))
-                    n_resolved = int(np.count_nonzero(resolved))
-
                     print(
-                        f"    * {grid_type} "
-                        f"{face_direction}-faces: "
-                        f"{n_candidate} candidates, "
-                        f"{n_segment} segments, "
-                        f"{n_resolved} resolved splits"
+                        f"    * {grid_type} {face_direction}-faces: "
+                        f"{np.count_nonzero(candidate)} candidates, "
+                        f"{len(segments)} segments, "
+                        f"{np.count_nonzero(resolved)} resolved splits"
                     )
 
     def _mark_cells_in_stl_conformal(self, method):
@@ -2126,70 +1858,6 @@ class ConformalSolverMixin:
             region_material_types[region_id] = self.grid.stl_material_types[key]
 
         self.region_material_types = region_material_types
-
-    def _build_interface_transition_masks(self):
-        """
-        Classify primal and dual interface edges by the material types
-        on their two endpoint regions.
-
-        Transition orientation is ignored for the classification itself.
-        For example, normal-to-PEC and PEC-to-normal edges both belong
-        to "normal_pec".
-        """
-        self._build_region_material_types()
-        type_codes = {"normal": 0, "pec": 1, "sibc": 2}
-        max_region_id = max(self.region_material_types)
-        region_type_codes = np.empty(max_region_id + 1, dtype=np.int8)
-
-        for region_id, material_type in self.region_material_types.items():
-            region_type_codes[region_id] = type_codes[material_type]
-
-        normal = type_codes["normal"]
-        pec = type_codes["pec"]
-        sibc = type_codes["sibc"]
-        self.interface_transition_masks = {"primal": {}, "dual": {}}
-
-        for grid_type in ("primal", "dual"):
-            for direction in ("x", "y", "z"):
-                (start_regions, end_regions) = self.grid._get_edge_region_ids(
-                    grid_type, direction
-                )
-
-                interface_mask = self.grid.interface_edge_masks[grid_type][direction]
-                start_types = region_type_codes[start_regions]
-                end_types = region_type_codes[end_regions]
-
-                normal_normal = (
-                    interface_mask & (start_types == normal) & (end_types == normal)
-                )
-
-                normal_pec = interface_mask & (
-                    ((start_types == normal) & (end_types == pec))
-                    | ((start_types == pec) & (end_types == normal))
-                )
-
-                normal_sibc = interface_mask & (
-                    ((start_types == normal) & (end_types == sibc))
-                    | ((start_types == sibc) & (end_types == normal))
-                )
-
-                pec_pec = interface_mask & (start_types == pec) & (end_types == pec)
-
-                pec_sibc = interface_mask & (
-                    ((start_types == pec) & (end_types == sibc))
-                    | ((start_types == sibc) & (end_types == pec))
-                )
-
-                sibc_sibc = interface_mask & (start_types == sibc) & (end_types == sibc)
-
-                self.interface_transition_masks[grid_type][direction] = {
-                    "normal_normal": normal_normal,
-                    "normal_pec": normal_pec,
-                    "normal_sibc": normal_sibc,
-                    "pec_pec": pec_pec,
-                    "pec_sibc": pec_sibc,
-                    "sibc_sibc": sibc_sibc,
-                }
 
     def _build_conformal_line_data(self):
         """
@@ -2375,95 +2043,39 @@ class ConformalSolverMixin:
 
     def _build_conformal_face_materials(self):
         """
-        Build effective material properties on resolved conformal faces.
+        Effective materials on resolved interface faces: the area-weighted
+        (arithmetic) average over the normal-material part of the face.
+        The area reduction itself enters through A_eff.
 
-        Material properties are averaged only over the active normal
-        portion of each face. Geometric area reduction is handled
-        separately through A_eff.
-
-        Primal faces:
-            mu_r
-
-        Dual faces:
-            eps_r, sigma
+        Primal faces carry mu_r, dual faces eps_r and sigma.
         """
         self.conformal_face_materials = {"primal": {}, "dual": {}}
+        names = {"primal": ("mu_r",), "dual": ("eps_r", "sigma")}
 
         for grid_type in ("primal", "dual"):
             for direction in ("x", "y", "z"):
                 face_data = self.conformal_face_data[grid_type][direction]
                 geometry = self.grid.interface_face_data[grid_type][direction]
                 supported = face_data["supported"]
-                shape = supported.shape
-
-                if grid_type == "primal":
-                    mu_r_eff = np.full(shape, np.nan, dtype=float)
-                else:
-                    eps_r_eff = np.full(shape, np.nan, dtype=float)
-                    sigma_eff = np.full(shape, np.nan, dtype=float)
+                values = {
+                    name: np.full(supported.shape, np.nan, dtype=float)
+                    for name in names[grid_type]
+                }
 
                 for index_array in np.argwhere(supported):
                     index = tuple(int(value) for value in index_array)
                     fractions = geometry["region_area_fractions"][index]
-                    normal_regions = face_data["normal_region_ids"][index]
+                    regions = face_data["normal_region_ids"][index]
+                    normal_fraction = sum(float(fractions[r]) for r in regions)
 
-                    normal_fraction = sum(
-                        float(fractions[region_id]) for region_id in normal_regions
-                    )
-
-                    if normal_fraction <= 0.0:
-                        raise RuntimeError(
-                            f"Supported {grid_type} "
-                            f"{direction}-face {index} "
-                            "has no positive normal-material area."
+                    for name in names[grid_type]:
+                        table = self.region_material_properties[name]
+                        values[name][index] = sum(
+                            float(fractions[r]) / normal_fraction * table[r]
+                            for r in regions
                         )
 
-                    expected_fraction = float(
-                        face_data["effective_area_fraction"][index]
-                    )
-
-                    if not np.isclose(
-                        normal_fraction, expected_fraction, rtol=1e-10, atol=1e-12
-                    ):
-                        raise RuntimeError(
-                            f"Inconsistent active area fraction on "
-                            f"{grid_type} {direction}-face "
-                            f"{index}: geometry gives "
-                            f"{normal_fraction}, face data gives "
-                            f"{expected_fraction}."
-                        )
-
-                    if grid_type == "primal":
-                        value = 0.0
-
-                        for region_id in normal_regions:
-                            weight = float(fractions[region_id]) / normal_fraction
-                            material = self._get_region_material_properties(region_id)
-                            value += weight * material[1]
-
-                        mu_r_eff[index] = value
-                    else:
-                        eps_value = 0.0
-                        sigma_value = 0.0
-
-                        for region_id in normal_regions:
-                            weight = float(fractions[region_id]) / normal_fraction
-                            material = self._get_region_material_properties(region_id)
-                            eps_value += weight * material[0]
-                            sigma_value += weight * material[2]
-
-                        eps_r_eff[index] = eps_value
-                        sigma_eff[index] = sigma_value
-
-                if grid_type == "primal":
-                    self.conformal_face_materials[grid_type][direction] = {
-                        "mu_r": mu_r_eff
-                    }
-                else:
-                    self.conformal_face_materials[grid_type][direction] = {
-                        "eps_r": eps_r_eff,
-                        "sigma": sigma_eff,
-                    }
+                self.conformal_face_materials[grid_type][direction] = values
 
     def _get_region_material_properties(self, region_id):
         """
@@ -2515,9 +2127,7 @@ class ConformalSolverMixin:
             - normal-normal: harmonic eps_r and sigma
             - normal-conductor: material properties of the normal segment
 
-        Dual edges:
-            - normal-normal: harmonic mu_r
-            - normal-conductor: mu_r of the normal segment
+        Dual edges (normal-normal only): harmonic mu_r
 
         No FIT operators are modified here.
         """
@@ -2594,12 +2204,7 @@ class ConformalSolverMixin:
                         + (1.0 - alpha[normal_normal]) / end_mu_r[normal_normal]
                     )
 
-                    # Normal -> PEC/SIBC
-                    mu_r_eff[normal_to_conductor] = start_mu_r[normal_to_conductor]
-
-                    # PEC/SIBC -> normal
-                    mu_r_eff[conductor_to_normal] = end_mu_r[conductor_to_normal]
-
+                    # Dual edges are only traced at normal-normal interfaces.
                     self.conformal_line_materials[grid_type][direction] = {
                         "mu_r": mu_r_eff
                     }
@@ -2773,342 +2378,121 @@ class ConformalSolverMixin:
             edge_values, "dual_edge", direction, fill_value
         )
 
-    @staticmethod
-    def _combine_conformal_diagonal_component(
-        perpendicular,
-        parallel,
-        line_mask,
-        face_mask,
-        line_n2,
-        face_n2,
-        normal_tol=1e-12,
-    ):
-        """
-        Combine normal and tangential effective material values into one
-        diagonal Cartesian material component.
-
-        The diagonal approximation is
-
-            m_ii = n_i^2 * m_perp
-                + (1 - n_i^2) * m_parallel
-
-        where
-
-            m_perp     : harmonic line value,
-            m_parallel : arithmetic face value.
-
-        Purely normal and purely tangential cases are treated explicitly so
-        that missing values in the unused contribution do not produce NaNs.
-        """
-        perpendicular = np.asarray(perpendicular, dtype=float)
-        parallel = np.asarray(parallel, dtype=float)
-        line_mask = np.asarray(line_mask, dtype=bool)
-        face_mask = np.asarray(face_mask, dtype=bool)
-        line_n2 = np.asarray(line_n2, dtype=float)
-        face_n2 = np.asarray(face_n2, dtype=float)
-        result = np.full(perpendicular.shape, np.nan, dtype=float)
-
-        # Prefer the normal obtained directly from the edge intersection.
-        # For tangential edges without an edge crossing, use the normal
-        # reconstructed from the associated cut face.
-        n2 = np.where(np.isfinite(line_n2), line_n2, face_n2)
-        finite_n2 = np.isfinite(n2)
-
-        # Numerical noise may produce values slightly outside [0, 1].
-        n2 = np.clip(n2, 0.0, 1.0)
-
-        # General case:
-        # both normal and tangential material values are available.
-        combined = (
-            line_mask
-            & face_mask
-            & finite_n2
-            & np.isfinite(perpendicular)
-            & np.isfinite(parallel)
-        )
-
-        result[combined] = (
-            n2[combined] * perpendicular[combined]
-            + (1.0 - n2[combined]) * parallel[combined]
-        )
-
-        # Pure normal component:
-        #
-        # n_i^2 = 1 -> m_ii = m_perp
-        #
-        # No face contribution is required.
-        pure_normal = (
-            line_mask
-            & finite_n2
-            & np.isfinite(perpendicular)
-            & ((1.0 - n2) <= normal_tol)
-        )
-
-        result[pure_normal] = perpendicular[pure_normal]
-
-        # Pure tangential component:
-        #
-        # n_i^2 = 0 -> m_ii = m_parallel
-        #
-        # No line crossing is required.
-        pure_tangential = (
-            face_mask & finite_n2 & np.isfinite(parallel) & (n2 <= normal_tol)
-        )
-
-        result[pure_tangential] = parallel[pure_tangential]
-
-        return result
-
     def _build_conformal_diagonal_materials(self, normal_tol=1e-12):
         """
-        Build diagonal effective material components for resolved
-        normal-normal interfaces.
+        Diagonal effective materials at normal-normal interfaces.
 
-        Electric material components use
+        For the DOF component along x_i, with n the interface normal,
 
-            primal edge  -> normal/harmonic contribution
-            dual face    -> tangential/arithmetic contribution
+            m_ii = n_i^2 * m_perp + (1 - n_i^2) * m_parallel,
 
-        Magnetic material components use
+        where m_perp is the harmonic (series) value along the DOF edge and
+        m_parallel the arithmetic (parallel) value over its face:
 
-            dual edge    -> normal/harmonic contribution
-            primal face  -> tangential/arithmetic contribution
+            eps, sigma: primal edge (perp) and dual face (parallel)
+            mu:         dual edge (perp) and primal face (parallel)
 
-        The resulting arrays have shape (Nx, Ny, Nz) and contain NaN
-        where no complete conformal normal-normal treatment is available.
+        The arrays have the stored DOF shape (Nx, Ny, Nz) and are NaN where
+        neither the edge nor its face is cut by a normal-normal interface.
         """
         self.conformal_diagonal_materials = {"eps_r": {}, "mu_r": {}, "sigma": {}}
-        axis_index = {"x": 0, "y": 1, "z": 2}
+        electric = (
+            "primal",
+            "dual",
+            self._edge_array_to_field_component,
+            self._dual_face_array_to_primal_edge_component,
+        )
+        magnetic = (
+            "dual",
+            "primal",
+            self._dual_edge_array_to_field_component,
+            self._primal_face_array_to_dual_edge_component,
+        )
 
         for direction in ("x", "y", "z"):
-            axis = axis_index[direction]
-
-            # Electric material:
-            #
-            # primal edge <-> dual face
-
-            primal_line_data = self.conformal_line_data["primal"][direction]
-            primal_line_materials = self.conformal_line_materials["primal"][direction]
-            dual_face_data = self.conformal_face_data["dual"][direction]
-            dual_face_materials = self.conformal_face_materials["dual"][direction]
-
-            # Normal / harmonic contribution
-
-            eps_perp = self._edge_array_to_field_component(
-                primal_line_materials["eps_r"], direction
-            )
-
-            sigma_perp = self._edge_array_to_field_component(
-                primal_line_materials["sigma"], direction
-            )
-
-            electric_line_mask = self._edge_array_to_field_component(
-                primal_line_data["normal_normal"], direction
-            ).astype(bool)
-
-            line_normals = np.asarray(
-                self.grid.interface_intersections["primal"][direction]["normal"],
-                dtype=float,
-            )
-
-            line_norm = np.linalg.norm(line_normals, axis=-1)
-            electric_line_n2_full = np.full(line_norm.shape, np.nan, dtype=float)
-            valid_line_normal = np.isfinite(line_norm) & (line_norm > 0.0)
-
-            electric_line_n2_full[valid_line_normal] = (
-                line_normals[..., axis][valid_line_normal]
-                / line_norm[valid_line_normal]
-            ) ** 2
-
-            electric_line_n2 = self._edge_array_to_field_component(
-                electric_line_n2_full, direction
-            )
-
-            # Tangential / arithmetic contribution
-
-            eps_parallel = self._dual_face_array_to_primal_edge_component(
-                dual_face_materials["eps_r"], direction
-            )
-
-            sigma_parallel = self._dual_face_array_to_primal_edge_component(
-                dual_face_materials["sigma"], direction
-            )
-
-            electric_face_mask = self._dual_face_array_to_primal_edge_component(
-                dual_face_data["normal_normal"], direction, fill_value=False
-            ).astype(bool)
-
-            dual_face_geometry = self.grid.interface_face_data["dual"][direction]
-
-            face_n2_full = np.full(
-                dual_face_data["normal_normal"].shape, np.nan, dtype=float
-            )
-
-            for index, segment in dual_face_geometry["segments"].items():
-                if not dual_face_data["normal_normal"][index]:
-                    continue
-
-                normal = np.asarray(segment["normal"], dtype=float)
-                norm = np.linalg.norm(normal)
-
-                if not np.isfinite(norm) or norm <= 0.0:
-                    continue
-
-                face_n2_full[index] = (normal[axis] / norm) ** 2
-
-            electric_face_n2 = self._dual_face_array_to_primal_edge_component(
-                face_n2_full, direction
-            )
-
-            # Final diagonal electric material components
-
-            electric_mask = electric_line_mask | electric_face_mask
-
-            for name, perp, parallel in (
-                ("eps_r", eps_perp, eps_parallel),
-                ("sigma", sigma_perp, sigma_parallel),
+            for name, (line_grid, face_grid, line_to_dof, face_to_dof) in (
+                ("eps_r", electric),
+                ("sigma", electric),
+                ("mu_r", magnetic),
             ):
-                perp, parallel = self._fill_uncut_diagonal_values(
-                    perp,
-                    parallel,
-                    electric_line_mask,
-                    electric_face_mask,
-                    primal_line_data,
-                    self.region_material_properties[name],
-                    lambda values: self._edge_array_to_field_component(
-                        values, direction
-                    ),
-                )
                 self.conformal_diagonal_materials[name][direction] = (
-                    self._combine_conformal_diagonal_component(
-                        perp,
-                        parallel,
-                        electric_mask,
-                        electric_mask,
-                        electric_line_n2,
-                        electric_face_n2,
-                        normal_tol=normal_tol,
+                    self._diagonal_material_component(
+                        name,
+                        direction,
+                        line_grid,
+                        face_grid,
+                        lambda values, fill=None: line_to_dof(values, direction, fill),
+                        lambda values, fill=None: face_to_dof(values, direction, fill),
+                        normal_tol,
                     )
                 )
 
-            # Magnetic material:
-            #
-            # dual edge <-> primal face
-
-            dual_line_data = self.conformal_line_data["dual"][direction]
-            dual_line_materials = self.conformal_line_materials["dual"][direction]
-            primal_face_data = self.conformal_face_data["primal"][direction]
-            primal_face_materials = self.conformal_face_materials["primal"][direction]
-
-            # Normal / harmonic contribution
-
-            mu_perp = self._dual_edge_array_to_field_component(
-                dual_line_materials["mu_r"], direction
-            )
-
-            magnetic_line_mask = self._dual_edge_array_to_field_component(
-                dual_line_data["normal_normal"], direction, fill_value=False
-            ).astype(bool)
-
-            line_normals = np.asarray(
-                self.grid.interface_intersections["dual"][direction]["normal"],
-                dtype=float,
-            )
-
-            line_norm = np.linalg.norm(line_normals, axis=-1)
-            magnetic_line_n2_full = np.full(line_norm.shape, np.nan, dtype=float)
-            valid_line_normal = np.isfinite(line_norm) & (line_norm > 0.0)
-
-            magnetic_line_n2_full[valid_line_normal] = (
-                line_normals[..., axis][valid_line_normal]
-                / line_norm[valid_line_normal]
-            ) ** 2
-
-            magnetic_line_n2 = self._dual_edge_array_to_field_component(
-                magnetic_line_n2_full, direction
-            )
-
-            # Tangential / arithmetic contribution
-
-            mu_parallel = self._primal_face_array_to_dual_edge_component(
-                primal_face_materials["mu_r"], direction
-            )
-
-            magnetic_face_mask = self._primal_face_array_to_dual_edge_component(
-                primal_face_data["normal_normal"], direction
-            ).astype(bool)
-
-            primal_face_geometry = self.grid.interface_face_data["primal"][direction]
-
-            face_n2_full = np.full(
-                primal_face_data["normal_normal"].shape, np.nan, dtype=float
-            )
-
-            for index, segment in primal_face_geometry["segments"].items():
-                if not primal_face_data["normal_normal"][index]:
-                    continue
-
-                normal = np.asarray(segment["normal"], dtype=float)
-                norm = np.linalg.norm(normal)
-
-                if not np.isfinite(norm) or norm <= 0.0:
-                    continue
-
-                face_n2_full[index] = (normal[axis] / norm) ** 2
-
-            magnetic_face_n2 = self._primal_face_array_to_dual_edge_component(
-                face_n2_full, direction
-            )
-
-            # Final diagonal magnetic material component
-
-            mu_perp, mu_parallel = self._fill_uncut_diagonal_values(
-                mu_perp,
-                mu_parallel,
-                magnetic_line_mask,
-                magnetic_face_mask,
-                dual_line_data,
-                self.region_material_properties["mu_r"],
-                lambda values: self._dual_edge_array_to_field_component(
-                    values, direction
-                ),
-            )
-            magnetic_mask = magnetic_line_mask | magnetic_face_mask
-            self.conformal_diagonal_materials["mu_r"][direction] = (
-                self._combine_conformal_diagonal_component(
-                    mu_perp,
-                    mu_parallel,
-                    magnetic_mask,
-                    magnetic_mask,
-                    magnetic_line_n2,
-                    magnetic_face_n2,
-                    normal_tol=normal_tol,
-                )
-            )
-
-    @staticmethod
-    def _fill_uncut_diagonal_values(
-        perp, parallel, line_mask, face_mask, line_data, region_values, to_field
+    def _diagonal_material_component(
+        self, name, direction, line_grid, face_grid, line_to_dof, face_to_dof, tol
     ):
-        """Complete the diagonal material inputs where only one of the edge
-        and its dual face is cut by a normal-normal interface.
+        """One diagonal material component (see _build_conformal_diagonal_materials)."""
+        axis = "xyz".index(direction)
+        line_data = self.conformal_line_data[line_grid][direction]
+        face_data = self.conformal_face_data[face_grid][direction]
+        region_values = self.region_material_properties[name]
 
-        An uncut edge lies in one region, so its harmonic (normal) value is
-        that region's material. An uncut dual face lies in the region that
-        contains the edge midpoint, which it passes through, so its
-        arithmetic (tangential) value is that region's material.
-        """
-        start = line_data["start_region"]
-        end = line_data["end_region"]
-        edge_value = to_field(np.where(start == end, region_values[start], np.nan))
+        line_cut = line_to_dof(line_data["normal_normal"], False).astype(bool)
+        face_cut = face_to_dof(face_data["normal_normal"], False).astype(bool)
+
+        # Squared normal component: from the edge crossing, or for an uncut
+        # edge from the segment that cuts its face.
+        normals = self.grid.interface_intersections[line_grid][direction]["normal"]
+        norm = np.linalg.norm(normals, axis=-1)
+        line_n2 = np.full(norm.shape, np.nan, dtype=float)
+        valid = np.isfinite(norm) & (norm > 0.0)
+        line_n2[valid] = (normals[..., axis][valid] / norm[valid]) ** 2
+
+        face_n2 = np.full(face_data["normal_normal"].shape, np.nan, dtype=float)
+        segments = self.grid.interface_face_data[face_grid][direction]["segments"]
+        for index, segment in segments.items():
+            if not face_data["normal_normal"][index]:
+                continue
+            normal = np.asarray(segment["normal"], dtype=float)
+            norm = np.linalg.norm(normal)
+            if np.isfinite(norm) and norm > 0.0:
+                face_n2[index] = (normal[axis] / norm) ** 2
+
+        n2 = line_to_dof(line_n2)
+        n2 = np.where(np.isfinite(n2), n2, face_to_dof(face_n2))
+
+        # Where only one of edge and face is cut, the uncut one lies in a
+        # single region: an uncut edge in its endpoint region, an uncut face
+        # in the region of the edge midpoint, which it passes through.
+        start, end = line_data["start_region"], line_data["end_region"]
+        uncut_edge = np.where(start == end, region_values[start], np.nan)
         # Crossing before the midpoint (alpha < 0.5): midpoint in the end region.
         # NaN alpha (uncut edge) compares False and selects the start region.
         midpoint_region = np.where(line_data["alpha"] < 0.5, end, start)
-        face_value = to_field(region_values[midpoint_region])
-        return (
-            np.where(line_mask, perp, edge_value),
-            np.where(face_mask, parallel, face_value),
+
+        perp = np.where(
+            line_cut,
+            line_to_dof(self.conformal_line_materials[line_grid][direction][name]),
+            line_to_dof(uncut_edge),
         )
+        parallel = np.where(
+            face_cut,
+            face_to_dof(self.conformal_face_materials[face_grid][direction][name]),
+            line_to_dof(region_values[midpoint_region]),
+        )
+
+        cut = (line_cut | face_cut) & np.isfinite(n2)
+        n2 = np.clip(n2, 0.0, 1.0)
+        result = np.full(perp.shape, np.nan, dtype=float)
+
+        both = cut & np.isfinite(perp) & np.isfinite(parallel)
+        result[both] = n2[both] * perp[both] + (1.0 - n2[both]) * parallel[both]
+        # Purely normal or tangential interfaces need only one of the values.
+        pure_normal = cut & np.isfinite(perp) & (1.0 - n2 <= tol)
+        result[pure_normal] = perp[pure_normal]
+        pure_tangential = cut & np.isfinite(parallel) & (n2 <= tol)
+        result[pure_tangential] = parallel[pure_tangential]
+
+        return result
 
     def _build_conformal_effective_lengths(self):
         """

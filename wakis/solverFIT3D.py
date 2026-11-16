@@ -212,73 +212,17 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
         self._validate_background_material(bg)
 
         self.region_material_types = {}
+        self.conformal_line_data = {"primal": {}, "dual": {}}
+        self.conformal_line_materials = {"primal": {}, "dual": {}}
+        self.conformal_face_data = {"primal": {}, "dual": {}}
+        self.conformal_face_materials = {"primal": {}, "dual": {}}
+        self.conformal_diagonal_materials = {"eps_r": {}, "mu_r": {}, "sigma": {}}
 
-        self.interface_transition_masks = {
-            "primal": {},
-            "dual": {},
-        }
-        self.conformal_line_data = {
-            "primal": {},
-            "dual": {},
-        }
-        self.conformal_line_materials = {
-            "primal": {},
-            "dual": {},
-        }
-
-        self.conformal_face_data = {
-            "primal": {},
-            "dual": {},
-        }
-
-        self.conformal_face_materials = {
-            "primal": {},
-            "dual": {},
-        }
-
-        self.conformal_diagonal_materials = {
-            "eps_r": {},
-            "mu_r": {},
-            "sigma": {},
-        }
-
-        if (
-            self.grid.geometry_mode == "conformal"
-            and getattr(self.grid, "region_ids", {}).get("primal") is not None
-            and getattr(self.grid, "region_ids", {}).get("dual") is not None
-        ):
-            self._build_interface_transition_masks()
-        resolved_masks = getattr(
-            self.grid,
-            "resolved_interface_edge_masks",
-            None,
+        # The cut-cell data exists once the grid has traced its STL solids.
+        conformal = self.grid.geometry_mode == "conformal" and bool(
+            self.grid.resolved_interface_edge_masks["primal"]
         )
-
-        intersection_data = getattr(
-            self.grid,
-            "interface_intersections",
-            None,
-        )
-
-        if (
-            self.grid.geometry_mode == "conformal"
-            and resolved_masks
-            and intersection_data
-            and all(
-                resolved_masks.get(grid_type)
-                for grid_type in (
-                    "primal",
-                    "dual",
-                )
-            )
-            and all(
-                intersection_data.get(grid_type)
-                for grid_type in (
-                    "primal",
-                    "dual",
-                )
-            )
-        ):
+        if conformal:
             self._build_conformal_line_data()
             self._build_conformal_line_materials()
 
@@ -302,31 +246,12 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
         self.A_fraction = None
         self.A_eff = None
 
-        if use_stl and self.conformal_line_data["primal"]:
+        if use_stl and conformal:
             self._build_conformal_effective_lengths()
-
-        if (
-            use_stl
-            and getattr(
-                self.grid,
-                "interface_face_data",
-                {},
-            ).get("primal")
-            and getattr(
-                self.grid,
-                "interface_face_data",
-                {},
-            ).get("dual")
-        ):
             self._build_conformal_face_data()
             self._build_conformal_face_materials()
             self._build_conformal_effective_areas()
-
-            if (
-                self.conformal_line_materials["primal"]
-                and self.conformal_line_materials["dual"]
-            ):
-                self._build_conformal_diagonal_materials()
+            self._build_conformal_diagonal_materials()
 
         if (
             use_stl
