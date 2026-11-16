@@ -377,7 +377,7 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
                 )
             )
 
-        self.update_logger(["grid", "background", "bg_material_type"])
+        self.update_logger(["grid", "background"])
 
         # Wake computation
         self.wake = wake

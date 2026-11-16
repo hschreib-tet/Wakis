@@ -282,6 +282,14 @@ def test_stabilization_options():
     assert grid.conformal_min_edge_fraction == pytest.approx(0.1)
     assert unit_grid().conformal_stabilization == "none"
 
+    # Conformal settings are logged for reproducibility, staircase logs unchanged.
+    conformal = unit_grid(
+        geometry_mode="conformal", conformal_stabilization="area_floor"
+    )
+    assert conformal.logger.grid["geometry_mode"] == "conformal"
+    assert conformal.logger.grid["conformal_area_floor"] == pytest.approx(0.1)
+    assert "geometry_mode" not in grid.logger.grid
+
     for invalid in (
         dict(conformal_stabilization="snapping"),
         dict(conformal_stabilization="area_floor", conformal_stabilization_fraction=0),

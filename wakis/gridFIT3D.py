@@ -374,7 +374,18 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
         self.stl_translate = stl_translate
         self.stl_scale = stl_scale
         self.stl_colors = stl_colors
-        self.update_logger(["stl_solids", "stl_materials", "stl_material_types"])
+        self.update_logger(["stl_solids", "stl_materials"])
+        if self.geometry_mode == "conformal":
+            self.update_logger(
+                [
+                    "geometry_mode",
+                    "stl_material_types",
+                    "bg_material_type",
+                    "conformal_stabilization",
+                    "conformal_area_floor",
+                    "conformal_min_edge_fraction",
+                ]
+            )
         if stl_rotate != [0.0, 0.0, 0.0]:
             self.update_logger(["stl_rotate"])
         if stl_translate != [0.0, 0.0, 0.0]:
