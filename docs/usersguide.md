@@ -270,6 +270,27 @@ Since `wakis` supports anisotropy, each material tensor stores $x$, $y$, and $z$
 ```{tip}
 Material tensors and electromagnetic fields are `Field` objects. Use their `inspect()` method to check a 2D slice before running the simulation.
 ```
+
+#### Checking the geometry on the mesh
+
+`solver.plot_conformal_mesh()` shows one grid plane with the mesh, the effective material of every face and the exact STL cross-section (black lines), so you can check how the mesh represents the geometry. It works for `geometry_mode="staircase"` and `"conformal"` grids.
+
+The material of a FIT DOF belongs to the face its edge pierces, so the view depends on the grid:
+
+- `grid_type="primal"`: primal faces coloured by $\mu_r$. In conformal mode, faces cut by a PEC wall are coloured only in their part inside the normal material (the PEC part is grey), and cut edges are drawn only up to the wall.
+- `grid_type="dual"`: dual faces coloured by $\varepsilon_r$ or $\sigma$ (`quantity="eps"` or `"sigma"`). Faces whose electric edge lies in PEC are grey.
+
+The plane normal selects the tensor component (an $x$-normal plane shows the $x$-components). Red marks show the conformal stabilization: faces raised by the area floor and eliminated edges.
+
+```python
+# static view of the dual z-plane with index 10
+fig, ax = solver.plot_conformal_mesh(grid_type="dual", normal="z", index=10, quantity="eps")
+
+# interactive: buttons for the normal (and quantity), slider for the plane
+# (in Jupyter, enable an interactive backend first: %matplotlib widget)
+fig, ax = solver.plot_conformal_mesh(grid_type="primal", interactive=True)
+```
+
 ### Running a simulation
 
 With an initial field or a source, advance the simulation one timestep at a time with `solver.one_step()`:
