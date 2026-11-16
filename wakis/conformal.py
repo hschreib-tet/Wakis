@@ -160,48 +160,22 @@ class ConformalGridMixin:
             )
         return np.reshape(voxel_mask, shape, order="F")
 
-    def _classify_dual_points_in_stl(
-        self, surf, primal_mask, method, stl_tolerance, check_surface
-    ):
+    def _count_inside_corners(self, primal_mask):
         """
-        Classify the dual grid points, reusing the primal classification.
+        Number of inside primal neighbours of every dual point.
 
         Each dual point lies between up to 8 primal points: the 8 corners of
-        its cell, or 4, 2 or 1 on the domain boundary. Where these all agree,
-        the dual point takes their value; only dual points next to the
-        surface (corners disagree) are classified with the STL method. This
-        keeps the classification exact up to features thinner than a cell,
-        which the conformal treatment cannot resolve anyway.
-
-        Returns
-        -------
-        dual_mask : ndarray of bool
-            Mask on the dual points, shape (Nx+1, Ny+1, Nz+1).
-        inside_corners : ndarray of uint8
-            Number of inside primal corners of every dual point; for the
-            interior dual points this is the corner count of their cell.
+        its cell, or 4, 2 or 1 on the domain boundary. Edge padding repeats
+        the boundary nodes, so boundary dual points count their real
+        neighbours repeatedly and reach 0 or 8 when these agree. For the
+        interior dual points this is the corner count of their cell.
         """
         shape = (self.Nx + 1, self.Ny + 1, self.Nz + 1)
-
-        # Edge padding repeats the boundary nodes, so boundary dual points
-        # count their 4, 2 or 1 real primal neighbours repeatedly.
         padded = np.pad(np.asarray(primal_mask, dtype=np.uint8), 1, mode="edge")
-        inside_corners = np.zeros(shape, dtype=np.uint8)
+        count = np.zeros(shape, dtype=np.uint8)
         for a, b, c in itertools.product((0, 1), repeat=3):
-            inside_corners += padded[
-                a : a + shape[0], b : b + shape[1], c : c + shape[2]
-            ]
-
-        dual_mask = inside_corners == 8
-        near_surface = (inside_corners > 0) & (inside_corners < 8)
-        if near_surface.any():
-            i, j, k = np.nonzero(near_surface)
-            points = np.column_stack((self.tx[i], self.ty[j], self.tz[k]))
-            dual_mask[near_surface] = self._classify_points_in_stl(
-                surf, points, method, stl_tolerance, check_surface
-            )
-
-        return dual_mask, inside_corners
+            count += padded[a : a + shape[0], b : b + shape[1], c : c + shape[2]]
+        return count
 
     def _build_region_maps(self):
         """
@@ -627,102 +601,117 @@ class ConformalGridMixin:
 
         return crossing_groups, contact_groups
 
-    @staticmethod
-    def _select_crossing_group(crossing_groups):
+    # Interior pieces of an edge shorter than this fraction of the edge are
+    # not treated as material of their own. Coincident surfaces of different
+    # STL solids (the same wall triangulated twice) leave such slivers, as
+    # do gaps and overlaps far below the cell size; neither can be resolved
+    # on the grid. Measured spreads of coincident surfaces are a few percent
+    # of an edge, real thin layers are much wider.
+    _SLIVER_FRACTION = 0.1
+
+    def _resolve_edge_interfaces(self, crossing_groups, start_inside):
         """
-        Select one representative crossing position on an edge.
+        Reconstruct the material along one edge and return its interfaces.
 
-        If several distinct crossing positions exist, the position closest
-        to the edge midpoint is selected. If two positions are equally close
-        to the midpoint, the group containing the highest surface ID is
-        preferred.
+        Every crossing of a solid's surface toggles whether the edge is
+        inside that solid; the material at a point is the last-listed solid
+        containing it (later solids overwrite earlier ones), or the
+        background. Interior pieces shorter than ``_SLIVER_FRACTION`` of the
+        edge are removed, so that their two bounding crossings form a single
+        interface. Crossings of surfaces covered by a later solid do not
+        change the material and drop out.
 
-        The complete set of crossing groups is preserved separately for
-        the diagnostics warning.
-        """
-        if len(crossing_groups) == 1:
-            return crossing_groups[0]
-
-        def group_key(group):
-            alpha = float(np.mean([hit["alpha"] for hit in group]))
-            highest_surface_id = max(hit["surface_id"] for hit in group)
-
-            return (abs(alpha - 0.5), -highest_surface_id)
-
-        return min(crossing_groups, key=group_key)
-
-    def _select_effective_crossing_group(
-        self, crossing_groups, start_region, end_region
-    ):
-        """
-        Select the effective physical crossing for one endpoint-region
-        transition.
-
-        For normal-conductor interfaces, the geometry of the conductor
-        surface is authoritative:
-
-            normal <-> PEC
-            normal <-> SIBC
-
-        This is important when two separate STL solids describe the same
-        material interface but their triangulated surfaces are not exactly
-        coincident.
-
-        The raw crossing groups are not modified.
+        Parameters
+        ----------
+        crossing_groups : list
+            Crossing groups of the edge, sorted by position.
+        start_inside : dict
+            Region ID -> whether the edge start lies inside that STL solid.
 
         Returns
         -------
-        selected_group : list
-            Crossing group used for the effective conformal interface.
-
-        multiple_effective_crossings : bool
-            True if the physical crossing remains ambiguous after applying
-            the material-aware selection.
+        regions : list of int
+            Material regions along the edge (first = start, last = end).
+        interfaces : list of list
+            For each change between consecutive regions, the crossing groups
+            that form it.
+        thin_layer : bool
+            True if a removed sliver is bounded on both sides by the same
+            surface: a real layer thinner than the sliver limit (a coating,
+            a clipped corner), not the coincident walls of two solids.
         """
-        if len(crossing_groups) == 1:
-            return (crossing_groups[0], False)
+        inside = dict(start_inside)
 
-        start_region = int(start_region)
-        end_region = int(end_region)
+        def region():
+            return max((rid for rid, flag in inside.items() if flag), default=0)
 
-        if start_region == 0:
-            start_type = self.bg_material_type
-        else:
-            start_type = self._get_region_material_type(start_region)
+        regions = [region()]
+        positions = [0.0]
+        interfaces = []
 
-        if end_region == 0:
-            end_type = self.bg_material_type
-        else:
-            end_type = self._get_region_material_type(end_region)
+        for group in crossing_groups:
+            for surface_id in {hit["surface_id"] for hit in group}:
+                inside[surface_id] = not inside[surface_id]
+            positions.append(float(np.mean([hit["alpha"] for hit in group])))
+            regions.append(region())
+            interfaces.append([group])
 
-        conductor_types = {"pec", "sibc"}
-        conductor_region = None
+        positions.append(1.0)
+        widths = list(np.diff(positions))
 
-        if start_type == "normal" and end_type in conductor_types:
-            conductor_region = end_region
-        elif end_type == "normal" and start_type in conductor_types:
-            conductor_region = start_region
+        def merge_equal_neighbours():
+            t = 0
+            while t < len(regions) - 1:
+                if regions[t] == regions[t + 1]:
+                    widths[t] += widths.pop(t + 1)
+                    regions.pop(t + 1)
+                    interfaces.pop(t)
+                else:
+                    t += 1
 
-        # Normal <-> conductor:
-        #
-        # Prefer the crossing generated by the conductor STL itself.
-        # surface_id and STL-region ID use the same region mapping.
+        def surfaces(groups):
+            return {hit["surface_id"] for group in groups for hit in group}
 
-        if conductor_region is not None:
-            conductor_groups = [
-                group
-                for group in crossing_groups
-                if any(int(hit["surface_id"]) == conductor_region for hit in group)
-            ]
+        merge_equal_neighbours()
+        thin_layer = False
 
-            if len(conductor_groups) == 1:
-                return (conductor_groups[0], False)
+        while len(regions) > 2:
+            t = min(range(1, len(regions) - 1), key=lambda t: widths[t])
+            if widths[t] >= self._SLIVER_FRACTION:
+                break
 
-        # No material-aware choice is possible: use the crossing nearest
-        # the edge midpoint and flag the edge, so that it is reported in
-        # the conformal geometry diagnostics warning.
+            thin_layer |= bool(surfaces(interfaces[t - 1]) & surfaces(interfaces[t]))
+            # The sliver's two bounding crossings form one interface.
+            interfaces[t - 1] = interfaces[t - 1] + interfaces.pop(t)
+            widths[t - 1] += 0.5 * widths[t]
+            widths[t + 1] += 0.5 * widths[t]
+            widths.pop(t)
+            regions.pop(t)
+            merge_equal_neighbours()
 
-        return (self._select_crossing_group(crossing_groups), True)
+        return regions, interfaces, thin_layer
+
+    def _select_interface_group(self, groups, left_region, right_region):
+        """
+        Choose the crossing that represents one interface.
+
+        A conductor surface defines the cut wall of a normal-conductor
+        interface; otherwise the surface of the later solid wins, as it does
+        in the point classification. Remaining ties go to the first crossing.
+        """
+
+        def priority(group):
+            sides = {
+                surface_id
+                for surface_id in {hit["surface_id"] for hit in group}
+                if surface_id in (left_region, right_region)
+            }
+            conductor = any(
+                self._is_conductor_region(surface_id) for surface_id in sides
+            )
+            return (not conductor, -max(sides, default=-1))
+
+        return min(groups, key=priority)
 
     def _select_representative_hit(self, hits):
         """
@@ -808,6 +797,10 @@ class ConformalGridMixin:
                     "normal": np.full(shape + (3,), np.nan, dtype=float),
                     "has_crossing": np.zeros(shape, dtype=bool),
                     "multiple_crossing_positions": np.zeros(shape, dtype=bool),
+                    # Diagnostics: material structure thinner than the mesh,
+                    # and crossings contradicting the point classification.
+                    "thin_feature": np.zeros(shape, dtype=bool),
+                    "inconsistent": np.zeros(shape, dtype=bool),
                 }
 
                 raw_hits = {}
@@ -838,6 +831,12 @@ class ConformalGridMixin:
 
                         raw_hits.setdefault(edge_index, []).extend(hits)
 
+                point_masks = (
+                    self.primal_point_masks
+                    if grid_type == "primal"
+                    else self.dual_point_masks
+                )
+
                 for edge_index, hits in raw_hits.items():
                     hit_groups = self._group_intersection_hits(
                         hits, alpha_tolerance=alpha_tolerance
@@ -848,11 +847,62 @@ class ConformalGridMixin:
                     if not crossing_groups:
                         continue
 
-                    selected_group, multiple = self._select_effective_crossing_group(
-                        crossing_groups,
-                        start_region=start_regions[edge_index],
-                        end_region=end_regions[edge_index],
+                    start = int(start_regions[edge_index])
+                    end = int(end_regions[edge_index])
+                    start_inside = {
+                        self.region_key_to_id[key]: bool(point_masks[key][edge_index])
+                        for key in self.stl_solids
+                    }
+                    regions, interfaces, thin_layer = self._resolve_edge_interfaces(
+                        crossing_groups, start_inside
                     )
+
+                    # Crossings that contradict the point classification (an
+                    # open surface, a crossing on a grid point) cannot be
+                    # resolved: keep all of them as one ambiguous interface.
+                    consistent = regions[0] == start and regions[-1] == end
+                    if not consistent:
+                        regions, interfaces = [start, end], [crossing_groups]
+                        intersections["inconsistent"][edge_index] = True
+
+                    # Only covered surfaces or slivers: no material change.
+                    if not interfaces:
+                        intersections["thin_feature"][edge_index] = thin_layer
+                        continue
+
+                    # A layer thinner than the mesh: a thin coating, a feature
+                    # inside one material (same material at both ends), or
+                    # several interfaces of which only one is represented.
+                    intersections["thin_feature"][edge_index] = consistent and (
+                        thin_layer or start == end or len(interfaces) > 1
+                    )
+
+                    # Same material at both ends: no interface to represent.
+                    if start == end:
+                        continue
+
+                    candidates = [
+                        self._select_interface_group(groups, left, right)
+                        for groups, left, right in zip(
+                            interfaces, regions[:-1], regions[1:]
+                        )
+                    ]
+                    # Several interfaces in one edge: only one can be
+                    # represented. A conductor endpoint keeps its own wall
+                    # (a coating on it is dropped, not the wall moved);
+                    # otherwise use the interface nearest the edge midpoint.
+                    if self._is_conductor_region(end):
+                        selected_group = candidates[-1]
+                    elif self._is_conductor_region(start):
+                        selected_group = candidates[0]
+                    else:
+                        selected_group = min(
+                            candidates,
+                            key=lambda group: abs(
+                                np.mean([hit["alpha"] for hit in group]) - 0.5
+                            ),
+                        )
+                    multiple = len(interfaces) > 1 or not consistent
                     representative = self._select_representative_hit(selected_group)
                     intersections["has_crossing"][edge_index] = True
                     intersections["multiple_crossing_positions"][edge_index] = multiple
@@ -915,45 +965,69 @@ class ConformalGridMixin:
 
         return self.stl_material_types[key]
 
+    def _is_conductor_region(self, region_id):
+        # A background without a material type is treated as normal.
+        if region_id == 0 and self.bg_material_type is None:
+            return False
+        return self._get_region_material_type(region_id) in ("pec", "sibc")
+
+    def _get_edge_diagnostic_masks(self, grid_type, direction):
+        """
+        Edges on which the conformal geometry is approximated or unreliable.
+
+        Returns
+        -------
+        thin_feature : ndarray of bool
+            Edges containing material structure thinner than the mesh: a
+            layer inside one material, a thin coating, or several interfaces
+            of which only one is represented.
+        inconsistent : ndarray of bool
+            Edges where STL crossings and point classification disagree: a
+            material transition without a crossing, or crossings that do not
+            reproduce the endpoint materials (e.g. open surfaces, surfaces
+            through grid points). These edges keep the staircase material
+            or an ambiguous cut.
+        """
+        data = self.interface_intersections[grid_type][direction]
+        endpoint_mask = self.interface_edge_masks[grid_type][direction]
+
+        # Dual intersections only exist for normal-normal edges.
+        if grid_type == "dual":
+            endpoint_mask = endpoint_mask & self._get_normal_normal_edge_mask(
+                grid_type, direction
+            )
+
+        missing = endpoint_mask & ~data["has_crossing"]
+        return data["thin_feature"], missing | data["inconsistent"]
+
     def _warn_interface_diagnostics(self):
         """
-        Warn about interface edges that the conformal treatment ignores or
-        approximates: material transitions without an STL crossing,
-        crossings hidden from the endpoint regions (features thinner than a
-        cell) and edges with several crossings (one representative is used).
+        Warn about edges with geometry thinner than the mesh resolution and
+        edges where the STL crossings and point classification disagree.
         """
-        missing = hidden = multiple = 0
+        thin = inconsistent = 0
 
         for grid_type in ("primal", "dual"):
             for direction in ("x", "y", "z"):
-                endpoint_mask = self.interface_edge_masks[grid_type][direction]
-
-                # Dual intersections only exist for normal-normal edges.
-                if grid_type == "dual":
-                    endpoint_mask = endpoint_mask & self._get_normal_normal_edge_mask(
-                        grid_type, direction
-                    )
-
-                data = self.interface_intersections[grid_type][direction]
-                missing += np.count_nonzero(endpoint_mask & ~data["has_crossing"])
-                hidden += np.count_nonzero(~endpoint_mask & data["has_crossing"])
-                multiple += np.count_nonzero(data["multiple_crossing_positions"])
+                thin_mask, inconsistent_mask = self._get_edge_diagnostic_masks(
+                    grid_type, direction
+                )
+                thin += np.count_nonzero(thin_mask)
+                inconsistent += np.count_nonzero(inconsistent_mask)
 
         messages = []
-        if missing:
+        if thin:
             messages.append(
-                f"{missing} interface edges have no geometric crossing and "
-                "receive no conformal correction."
+                f"{thin} edges contain material layers thinner than the mesh "
+                "resolution; at most one interface per edge is represented. "
+                "Refine the mesh there if these layers matter."
             )
-        if hidden:
+        if inconsistent:
             messages.append(
-                f"{hidden} edges contain crossings hidden from the endpoint "
-                "regions (features thinner than a cell); they are ignored."
-            )
-        if multiple:
-            messages.append(
-                f"{multiple} edges cross several surfaces; one representative "
-                "crossing is used on each."
+                f"{inconsistent} edges have STL crossings that disagree with the "
+                "grid point classification and receive no or an ambiguous "
+                "conformal correction. Check that the STL solids are closed "
+                "and not tangent to grid points."
             )
         if messages:
             warnings.warn(
@@ -1567,8 +1641,8 @@ class ConformalGridMixin:
 
         The primal grid points are classified with the selected STL method.
         Dual points take the value of their primal neighbours where these
-        agree and are classified exactly only next to the surface (see
-        ``_classify_dual_points_in_stl``). The cell mask stored in
+        agree for every solid and are classified exactly where they differ for
+        any solid (next to a surface). The cell mask stored in
         ``self.grid[key]`` follows from the same corner count (at least 5 of
         8 corners inside).
 
@@ -1604,6 +1678,8 @@ class ConformalGridMixin:
                 "'voxelize_rectilinear'."
             )
 
+        # Primal points: every solid with the selected STL method.
+        surfaces, closed, corner_counts = {}, {}, {}
         for key in self.stl_solids.keys():
             surf = self.read_stl(key)
 
@@ -1626,19 +1702,36 @@ class ConformalGridMixin:
             primal_mask = self._classify_primal_points_in_stl(
                 surf, method, stl_tolerance, progress_bar, check_surface
             )
-            dual_mask, inside_corners = self._classify_dual_points_in_stl(
-                surf, primal_mask, method, stl_tolerance, check_surface
-            )
             self.primal_point_masks[key] = primal_mask
-            self.dual_point_masks[key] = dual_mask
+            surfaces[key], closed[key] = surf, check_surface
+            corner_counts[key] = self._count_inside_corners(primal_mask)
 
             # Cell mask for plots, overlap checks and HDF5: at least 5 of the
             # 8 corners inside. Dual point (i+1, j+1, k+1) is the centre of
             # cell (i, j, k); the high-side ghost cells repeat the boundary.
             self.grid[key] = np.reshape(
-                inside_corners[1:, 1:, 1:] >= 5, self.Nx * self.Ny * self.Nz
+                corner_counts[key][1:, 1:, 1:] >= 5, self.Nx * self.Ny * self.Nz
             )
 
+        # Dual points take the value of their primal neighbours where these
+        # agree. They are classified exactly wherever the neighbours disagree
+        # for any solid: a layer thinner than a cell can lie between corners
+        # that are all outside it, but its neighbours on both sides differ.
+        near_surface = np.zeros((self.Nx + 1, self.Ny + 1, self.Nz + 1), dtype=bool)
+        for count in corner_counts.values():
+            near_surface |= (count > 0) & (count < 8)
+        i, j, k = np.nonzero(near_surface)
+        points = np.column_stack((self.tx[i], self.ty[j], self.tz[k]))
+
+        for key in self.stl_solids.keys():
+            dual_mask = corner_counts[key] == 8
+            if len(points):
+                dual_mask[near_surface] = self._classify_points_in_stl(
+                    surfaces[key], points, method, stl_tolerance, closed[key]
+                )
+            self.dual_point_masks[key] = dual_mask
+
+        for key in self.stl_solids.keys():
             # Diagnostics
             if self.verbose and np.sum(self.grid[key]) == 0:
                 print(
@@ -1680,7 +1773,7 @@ class ConformalGridMixin:
         # and is independent of the endpoint transition masks.
         self._build_interface_intersections()
 
-        # Produce Warnings for ignored interface cases (hidden crossings, missing crossings)
+        # Warn about thin features and inconsistent STL crossings.
         self._warn_interface_diagnostics()
 
         # Build masks of grid faces adjacent to resolved interface edges
