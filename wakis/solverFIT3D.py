@@ -195,10 +195,8 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
         self.background = bg
 
         # Small-cut-cell treatment chosen in GridFIT3D (area floor case).
-        self.conformal_area_floor = float(getattr(grid, "conformal_area_floor", 0.0))
-        self.conformal_min_edge_fraction = float(
-            getattr(grid, "conformal_min_edge_fraction", 0.0)
-        )
+        self.conformal_area_floor = grid.conformal_area_floor
+        self.conformal_min_edge_fraction = grid.conformal_min_edge_fraction
 
         self.bg_material_type = getattr(
             self.grid,
