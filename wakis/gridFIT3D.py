@@ -181,8 +181,9 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
 
             ``"area_floor"``: the geometry is kept. In the time-stepping
             metric, primal faces cut by a conductor use at least
-            ``conformal_stabilization_fraction`` as area fraction (relaxed
-            Dey-Mittra), and edges with an active fraction below
+            ``conformal_stabilization_fraction`` as area fraction (a
+            simplified form of the area limitation of Benkler et al. 2006,
+            see the physics guide), and edges with an active fraction below
             ``conformal_min_edge_fraction`` are treated as inside the
             conductor. Without the edge elimination, raised areas next to
             nearly covered edges create spurious low-frequency modes.

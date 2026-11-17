@@ -2489,7 +2489,8 @@ class ConformalSolverMixin:
 
         With ``GridFIT3D(conformal_stabilization="area_floor")``, faces cut
         by a PEC/SIBC wall use at least ``conformal_area_floor``
-        as area fraction (relaxed Dey-Mittra), which bounds the reduction of
+        as area fraction (a constant-floor form of the area limitation of
+        Benkler et al. 2006), which bounds the reduction of
         the stable time step. ``A_fraction_geometric`` keeps the exact
         geometric fractions; ``n_area_floored`` counts the raised faces.
 
