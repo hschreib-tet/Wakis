@@ -273,22 +273,22 @@ Material tensors and electromagnetic fields are `Field` objects. Use their `insp
 
 #### Checking the geometry on the mesh
 
-`solver.plot_conformal_mesh()` shows one grid plane with the mesh, the effective material of every face and the exact STL cross-section (black lines), so you can check how the mesh represents the geometry. It works for `geometry_mode="staircase"` and `"conformal"` grids.
+`solver.plot_mesh_materials()` shows one grid plane with the mesh, the effective material of every face and the exact STL cross-section (black lines), so you can check how the mesh represents the geometry. It works for `geometry_mode="staircase"` and `"conformal"` grids.
 
 The material of a FIT DOF belongs to the face its edge pierces, so the view depends on the grid:
 
 - `grid_type="primal"`: primal faces coloured by $\mu_r$. In conformal mode, faces cut by a PEC wall are coloured only in their part inside the normal material (the PEC part is grey), and cut edges are drawn only up to the wall.
 - `grid_type="dual"`: dual faces coloured by $\varepsilon_r$ or $\sigma$ (`quantity="eps"` or `"sigma"`). Faces whose electric edge lies in PEC are grey.
 
-The plane normal selects the tensor component (an $x$-normal plane shows the $x$-components). Red marks show the conformal stabilization: faces raised by the area floor and eliminated edges.
+The plane normal selects the tensor component (an $x$-normal plane shows the $x$-components). Red marks show the conformal stabilization: faces raised by the area floor and eliminated edges. In conformal mode, markers locate the edges counted in the geometry diagnostics warning: orange circles for structure thinner than the mesh (`thin feature`), magenta crosses where the STL crossings disagree with the point classification (`inconsistent`, e.g. an open STL surface). The legend gives their number in the plane; `show_diagnostics=False` hides them.
 
 ```python
 # static view of the dual z-plane with index 10
-fig, ax = solver.plot_conformal_mesh(grid_type="dual", normal="z", index=10, quantity="eps")
+fig, ax = solver.plot_mesh_materials(grid_type="dual", normal="z", index=10, quantity="eps")
 
 # interactive: buttons for the normal (and quantity), slider for the plane
 # (in Jupyter, enable an interactive backend first: %matplotlib widget)
-fig, ax = solver.plot_conformal_mesh(grid_type="primal", interactive=True)
+fig, ax = solver.plot_mesh_materials(grid_type="primal", interactive=True)
 ```
 
 ### Running a simulation

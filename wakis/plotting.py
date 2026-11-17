@@ -1585,7 +1585,7 @@ class PlotMixinSolver:
                 if self.verbose > 1:
                     print(f"[!] Could not add logo widget: {e}")
 
-    def plot_conformal_mesh(
+    def plot_mesh_materials(
         self,
         grid_type="primal",
         normal="z",
@@ -1594,6 +1594,7 @@ class PlotMixinSolver:
         interactive=False,
         show_stl=True,
         show_stabilization=True,
+        show_diagnostics=True,
         cmap="viridis",
         ax=None,
     ):
@@ -1646,6 +1647,15 @@ class PlotMixinSolver:
             area floor (outline) and edges eliminated as too short (dashed
             edge on the primal grid, outlined grey face on the dual grid).
             Default True.
+        show_diagnostics : bool, optional
+            Mark edges flagged by the conformal geometry diagnostics (the
+            ones counted in the grid warning): orange circles for material
+            structure thinner than the mesh (``thin feature``), magenta
+            crosses where STL crossings and point classification disagree
+            (``inconsistent``). Markers sit at the midpoints of the flagged
+            in-plane edges; on the dual grid also where a flagged primal
+            edge pierces a face. Legend entries give the counts in the
+            plane. Conformal grids only. Default True.
         cmap : str, optional
             Matplotlib colormap for the material values. Default 'viridis'.
         ax : matplotlib.axes.Axes or None, optional
@@ -1686,12 +1696,12 @@ class PlotMixinSolver:
 
         def draw():
             ax.clear()
-            data = self._conformal_slice_data(
+            data = self._mesh_slice_data(
                 grid_type, state["normal"], state["index"], state["quantity"]
             )
             state["index"] = data["index"]
-            mappable = self._draw_conformal_slice(
-                ax, data, cmap, show_stl, show_stabilization
+            mappable = self._draw_mesh_slice(
+                ax, data, cmap, show_stl, show_stabilization, show_diagnostics
             )
             if state["colorbar"] is None:
                 colorbar_ax = make_axes_locatable(ax).append_axes(
@@ -1706,17 +1716,17 @@ class PlotMixinSolver:
         draw()
 
         if interactive:
-            self._add_conformal_mesh_widgets(fig, state, draw, grid_type)
+            self._add_mesh_slice_widgets(fig, state, draw, grid_type)
 
         return fig, ax
 
-    def _conformal_slice_range(self, grid_type, normal):
-        """First and last plane index along ``normal`` for plot_conformal_mesh."""
+    def _mesh_slice_range(self, grid_type, normal):
+        """First and last plane index along ``normal`` for plot_mesh_materials."""
         n_nodes = (self.Nx, self.Ny, self.Nz)["xyz".index(normal)]
         # Dual planes 0 and N lie on the domain boundary and carry no DOFs.
         return (0, n_nodes - 1) if grid_type == "primal" else (1, n_nodes - 1)
 
-    def _conformal_slice_data(self, grid_type, normal, index, quantity):
+    def _mesh_slice_data(self, grid_type, normal, index, quantity):
         """
         Collect the faces, edges and STL lines of one grid plane.
 
@@ -1724,7 +1734,7 @@ class PlotMixinSolver:
         material value and flags of every face, so that drawing is separate
         from the FIT data access.
         """
-        low, high = self._conformal_slice_range(grid_type, normal)
+        low, high = self._mesh_slice_range(grid_type, normal)
         if index is None:
             index = (low + high) // 2
         index = int(index)
@@ -1761,8 +1771,12 @@ class PlotMixinSolver:
             )
 
         ieps = {d: np.asarray(self.ieps.to_matrix(d)) for d in "xyz"}
-        conformal = grid.geometry_mode == "conformal" and bool(
-            self.conformal_line_data["primal"]
+        # The cut-cell metrics only exist when the solver applies the STL
+        # materials (use_stl=True); otherwise show the uncut mesh.
+        conformal = (
+            grid.geometry_mode == "conformal"
+            and bool(self.conformal_line_data["primal"])
+            and self.A_fraction is not None
         )
         if conformal:
             region_types = self.region_material_types
@@ -1897,6 +1911,8 @@ class PlotMixinSolver:
             ]
             log_scale = quantity == "sigma"
 
+        diagnostics = self._mesh_slice_diagnostics(grid_type, normal, index, conformal)
+
         stl_lines = []
         position = coords[axis][index]
         if grid.stl_solids:
@@ -1914,6 +1930,7 @@ class PlotMixinSolver:
             "faces": faces,
             "edges": edges,
             "stl_lines": stl_lines,
+            "diagnostics": diagnostics,
             "label": label,
             "log_scale": log_scale,
             "xlabel": f"{a} [m]",
@@ -1922,9 +1939,61 @@ class PlotMixinSolver:
             "title": (f"{grid_type} mesh, {normal} = {position:.4g} m (index {index})"),
         }
 
+    def _mesh_slice_diagnostics(self, grid_type, normal, index, conformal):
+        """
+        Positions of edges flagged by the conformal geometry diagnostics.
+
+        Returns ``{"thin_feature": points, "inconsistent": points}`` with
+        (n, 2) arrays of in-plane coordinates. Marked are the midpoints of
+        the flagged in-plane edges of the shown grid and, on the dual grid,
+        the points where a flagged primal edge pierces the plane (its
+        midpoint). Staircase grids have no diagnostics.
+        """
+        empty = np.empty((0, 2))
+        result = {"thin_feature": [empty], "inconsistent": [empty]}
+        grid = self.grid
+        if not conformal or not grid.interface_intersections[grid_type]:
+            return {key: empty for key in result}
+
+        axis = "xyz".index(normal)
+        a, b = (d for d in "xyz" if d != normal)
+        coords = (
+            (grid.x, grid.y, grid.z)
+            if grid_type == "primal"
+            else (grid.tx, grid.ty, grid.tz)
+        )
+
+        def collect(masks, mask_index, axes_a, axes_b):
+            # 2D slice in plane order (a, b); axes_* are the point coordinates.
+            for key, mask in zip(("thin_feature", "inconsistent"), masks):
+                i, j = np.nonzero(np.take(mask, mask_index, axis=axis))
+                result[key].append(np.column_stack((axes_a[i], axes_b[j])))
+
+        # In-plane edges of the shown grid: marker at the edge midpoint.
+        for d in (a, b):
+            c_a, c_b = coords["xyz".index(a)], coords["xyz".index(b)]
+            mid_a = c_a if d != a else 0.5 * (c_a[:-1] + c_a[1:])
+            mid_b = c_b if d != b else 0.5 * (c_b[:-1] + c_b[1:])
+            collect(grid._get_edge_diagnostic_masks(grid_type, d), index, mid_a, mid_b)
+
+        # Dual plane t[i] cuts the primal edges i-1 along the normal at their
+        # midpoints: these edges pierce the dual faces of the plane.
+        if grid_type == "dual" and grid.interface_intersections["primal"]:
+            primal = (grid.x, grid.y, grid.z)
+            collect(
+                grid._get_edge_diagnostic_masks("primal", normal),
+                index - 1,
+                primal["xyz".index(a)],
+                primal["xyz".index(b)],
+            )
+
+        return {key: np.vstack(points) for key, points in result.items()}
+
     @staticmethod
-    def _draw_conformal_slice(ax, data, cmap, show_stl, show_stabilization):
-        """Draw the output of _conformal_slice_data; return the face mappable."""
+    def _draw_mesh_slice(
+        ax, data, cmap, show_stl, show_stabilization, show_diagnostics=True
+    ):
+        """Draw the output of _mesh_slice_data; return the face mappable."""
         from matplotlib.collections import LineCollection, PolyCollection
         from matplotlib.colors import LogNorm, Normalize
         from matplotlib.lines import Line2D
@@ -2015,6 +2084,22 @@ class PlotMixinSolver:
             )
             handles.append(Line2D([], [], color="black", linewidth=1.8, label="STL"))
 
+        if show_diagnostics:
+            styles = {
+                "thin_feature": dict(
+                    marker="o", markerfacecolor="none", color="darkorange"
+                ),
+                "inconsistent": dict(marker="x", color="magenta"),
+            }
+            for key, points in data["diagnostics"].items():
+                if not len(points):
+                    continue
+                style = dict(linestyle="none", markersize=7, markeredgewidth=1.6)
+                style.update(styles[key])
+                ax.plot(points[:, 0], points[:, 1], zorder=5, **style)
+                label = f"{key.replace('_', ' ')} ({len(points)})"
+                handles.append(Line2D([], [], label=label, **style))
+
         (x0, x1), (y0, y1) = data["limits"]
         ax.set_xlim(x0, x1)
         ax.set_ylim(y0, y1)
@@ -2027,12 +2112,12 @@ class PlotMixinSolver:
         )
         return mappable
 
-    def _add_conformal_mesh_widgets(self, fig, state, draw, grid_type):
-        """Normal/quantity buttons and an index slider for plot_conformal_mesh."""
+    def _add_mesh_slice_widgets(self, fig, state, draw, grid_type):
+        """Normal/quantity buttons and an index slider for plot_mesh_materials."""
         from matplotlib.widgets import RadioButtons, Slider
 
         fig.subplots_adjust(left=0.22, bottom=0.16)
-        low, high = self._conformal_slice_range(grid_type, state["normal"])
+        low, high = self._mesh_slice_range(grid_type, state["normal"])
         slider = Slider(
             fig.add_axes([0.22, 0.04, 0.5, 0.03]),
             "index",
@@ -2050,7 +2135,7 @@ class PlotMixinSolver:
             state["normal"] = label
             state["index"] = None
             draw()
-            low, high = self._conformal_slice_range(grid_type, label)
+            low, high = self._mesh_slice_range(grid_type, label)
             slider.valmin, slider.valmax = low, high
             slider.ax.set_xlim(low, high)
             slider.eventson = False
@@ -2081,7 +2166,7 @@ class PlotMixinSolver:
             widgets.append(quantity_buttons)
 
         # Widgets stop responding once garbage collected; keep a reference.
-        fig._wakis_conformal_widgets = widgets
+        fig._wakis_mesh_widgets = widgets
 
 
 class PlotMixinGrid:
