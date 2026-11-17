@@ -27,9 +27,16 @@ import warnings
 
 import numpy as np
 import pyvista as pv
-import vtk
 from scipy.constants import epsilon_0 as eps_0
 from scipy.constants import mu_0 as mu_0
+
+# Import only the needed VTK modules: the full ``import vtk`` loads modules
+# whose factory overrides change PyVista filters used elsewhere in Wakis
+# (point_data_to_cell_data then returns truncated uint8 averages, which
+# shrinks the staircase STL masks).
+from vtkmodules.vtkCommonCore import vtkIdList, vtkPoints
+from vtkmodules.vtkCommonDataModel import vtkStaticCellLocator
+from vtkmodules.vtkFiltersModeling import vtkSelectEnclosedPoints
 
 from .field import Field
 from .materials import material_lib
@@ -444,7 +451,7 @@ class ConformalGridMixin:
                 self._conformal_stl_locators = {}
 
             if key not in self._conformal_stl_locators:
-                locator = vtk.vtkStaticCellLocator()
+                locator = vtkStaticCellLocator()
                 locator.SetDataSet(surface)
                 locator.BuildLocator()
                 self._conformal_stl_locators[key] = locator
@@ -452,8 +459,8 @@ class ConformalGridMixin:
             locator = self._conformal_stl_locators[key]
 
             # Intersect the complete grid line with the STL.
-            vtk_points = vtk.vtkPoints()
-            vtk_cell_ids = vtk.vtkIdList()
+            vtk_points = vtkPoints()
+            vtk_cell_ids = vtkIdList()
 
             locator.IntersectWithLine(
                 start_point, end_point, 1e-8, vtk_points, vtk_cell_ids
@@ -1689,7 +1696,7 @@ class ConformalGridMixin:
             # Inside/outside is only well defined for a closed surface. Test it
             # once per solid (same VTK check PyVista uses) and warn, instead of
             # silently retrying without the check on any exception.
-            check_surface = bool(vtk.vtkSelectEnclosedPoints.IsSurfaceClosed(surf))
+            check_surface = bool(vtkSelectEnclosedPoints.IsSurfaceClosed(surf))
             if not check_surface:
                 warnings.warn(
                     f"STL solid '{key}' is not a closed surface; grid points are "
