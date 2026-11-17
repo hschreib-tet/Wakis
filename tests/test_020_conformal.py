@@ -320,7 +320,7 @@ def test_conformal_grid_h5_roundtrip(pillbox_stls, tmp_path):
 
 @pytest.mark.parametrize("geometry_mode", ["conformal", "staircase"])
 @pytest.mark.parametrize("grid_type, quantity", [("primal", "eps"), ("dual", "sigma")])
-def test_plot_conformal_mesh(pillbox_stls, geometry_mode, grid_type, quantity):
+def test_plot_mesh_materials(pillbox_stls, geometry_mode, grid_type, quantity):
     """Smoke test of the mesh/material plane view: every normal direction,
     and the interactive widgets switching normal and plane index (the last
     plane lies entirely in PEC)."""
@@ -330,16 +330,89 @@ def test_plot_conformal_mesh(pillbox_stls, geometry_mode, grid_type, quantity):
     solver = _pec_solver(grid)
     # A bare Figure needs no GUI backend, so nothing is displayed.
     for normal in "xyz":
-        solver.plot_conformal_mesh(
+        solver.plot_mesh_materials(
             grid_type=grid_type,
             normal=normal,
             quantity=quantity,
             ax=Figure().add_subplot(),
         )
 
-    fig, _ = solver.plot_conformal_mesh(
+    fig, _ = solver.plot_mesh_materials(
         grid_type=grid_type, interactive=True, ax=Figure().add_subplot()
     )
-    slider, normal_buttons = fig._wakis_conformal_widgets[:2]
+    slider, normal_buttons = fig._wakis_mesh_widgets[:2]
     normal_buttons.set_active(0)
     slider.set_val(slider.valmax)
+
+
+def test_plot_mesh_materials_diagnostics(tmp_path):
+    """Diagnostic markers: a dielectric slab thinner than a cell (thin
+    feature on the z edges through it) and an open box surface (inconsistent
+    x edges at the missing face). The markers appear in the planes holding
+    the flagged edges, on the dual grid also where the flagged primal edges
+    pierce the faces, and the legend counts them."""
+    from matplotlib.figure import Figure
+
+    n = 10
+    d = 1.0 / n
+    pv.Cylinder(
+        center=(0, 0, 0.5), direction=(0, 0, 1), radius=0.42, height=1.2
+    ).triangulate().save(tmp_path / "cav.stl")
+    # Slab between the node plane z = 0.5 and the next edge midpoint.
+    pv.Box(
+        bounds=(-0.25, 0.25, -0.25, 0.25, 0.5 + 0.1 * d, 0.5 + 0.4 * d)
+    ).triangulate().save(tmp_path / "slab.stl")
+    box = pv.Box(bounds=(0.03, 0.27, -0.17, 0.17, 0.13, 0.37)).triangulate()
+    keep = np.nonzero(box.cell_centers().points[:, 0] < 0.26)[0]  # drop +x face
+    box.extract_cells(keep).extract_surface(algorithm="dataset_surface").save(
+        tmp_path / "box.stl"
+    )
+
+    with pytest.warns(UserWarning, match="Conformal geometry diagnostics"):
+        grid = GridFIT3D(
+            -0.5,
+            0.5,
+            -0.5,
+            0.5,
+            0,
+            1,
+            n + 1,
+            n + 1,
+            n + 1,
+            stl_solids={
+                key: str(tmp_path / f"{key}.stl") for key in ("cav", "slab", "box")
+            },
+            stl_materials={"cav": "vacuum", "slab": [3, 1, 0], "box": [2, 1, 0]},
+            bg_material_type="pec",
+            geometry_mode="conformal",
+            verbose=0,
+        )
+    solver = SolverFIT3D(grid, use_stl=True, bg="pec", verbose=0)
+
+    for grid_type, normal, index, expected in (
+        ("primal", "y", 5, {"thin_feature": 5, "inconsistent": 2}),
+        ("dual", "z", 6, {"thin_feature": 25, "inconsistent": 0}),
+        ("primal", "z", 2, {"thin_feature": 0, "inconsistent": 3}),
+    ):
+        data = solver._mesh_slice_data(grid_type, normal, index, "eps")
+        counts = {key: len(points) for key, points in data["diagnostics"].items()}
+        assert counts == expected
+
+        _, ax = solver.plot_mesh_materials(
+            grid_type=grid_type, normal=normal, index=index, ax=Figure().add_subplot()
+        )
+        labels = [text.get_text() for text in ax.get_legend().get_texts()]
+        for key, count in expected.items():
+            entry = f"{key.replace('_', ' ')} ({count})"
+            assert (entry in labels) == (count > 0)
+
+    _, ax = solver.plot_mesh_materials(
+        "dual", normal="z", index=6, show_diagnostics=False, ax=Figure().add_subplot()
+    )
+    assert not any("thin feature" in t.get_text() for t in ax.get_legend().get_texts())
+
+    # Without use_stl the solver has no cut-cell metrics: plain mesh, no markers.
+    plain = SolverFIT3D(grid, bg="pec", verbose=0)
+    data = plain._mesh_slice_data("dual", "z", 6, "eps")
+    assert all(len(points) == 0 for points in data["diagnostics"].values())
+    plain.plot_mesh_materials("primal", normal="z", ax=Figure().add_subplot())
