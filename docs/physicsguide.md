@@ -506,7 +506,39 @@ features confined to that unresolved interval are not separately classified. Non
 | ----- | ---- |
 |  ![](img/STL_solid.png)     |  ![](img/STL_mask.png)    |
 
-Future versions aim to include a more advanced meshing algorithm for improved fidelity near corners and edges.
+This staircase mapping is the default (`geometry_mode="staircase"`). A
+conformal (cut-cell) treatment of curved and slanted surfaces is described in
+the next section.
+
+### 📐 Conformal geometry (cut cells)
+
+With `geometry_mode="conformal"`, the STL surfaces are intersected exactly with the grid edges and faces instead of assigning each cell entirely to one material. This replaces the first-order staircase error at curved and slanted walls by a second-order accurate boundary.
+
+**Conductor walls.** At a PEC wall, only the part of a primal edge or face outside the conductor is kept: edge $e$ keeps the length fraction $\lambda_e$ and face $f$ the area fraction $a_f$. Faraday's law on the cut face becomes
+
+$$
+\mu\, a_f A_f \,\frac{\mathrm{d} h_f}{\mathrm{d}t}
+= -\sum_{e \in \partial f} \pm\, \lambda_e L_e\, e_e ,
+$$
+
+i.e. $\mathbf{D}_s$ and $\mathbf{D}_A$ in Eq. (3a)–(3b) are replaced by their cut values, while the dual metric keeps its grid values [Dey and Mittra, 1997](https://doi.org/10.1109/75.622536). Electric DOFs on edges inside a conductor are removed ($\varepsilon^{-1} = 0$).
+
+**Small cut cells.** A face with a small free area limits the stable time step. Its local limit is approximately $\Delta t_f = \sqrt{a_f / \max_{e \in \partial f} \lambda_e}\;\Delta t_f^\text{Yee}$, which has no lower bound as $a_f \rightarrow 0$ [Benkler et al., 2006](https://doi.org/10.1109/TAP.2006.875909). Benkler et al. fix the time step beforehand and raise $a_f$ on every face that would violate it. Wakis offers a simplified form of this with `conformal_stabilization="area_floor"`:
+
+- **Area floor:** faces cut by a conductor use at least the area fraction $a_\text{min}$ (`conformal_stabilization_fraction`, default 0.1). Unlike in Benkler et al., the floor is a constant and is not derived from the time step.
+- **Short-edge elimination (Wakis addition):** cut edges with $\lambda_e < \lambda_\text{min}$ (`conformal_min_edge_fraction`) are treated as inside the conductor. Without this rule, a raised face bounded by nearly covered edges forms spurious low-frequency modes.
+
+The floor does not guarantee the per-face criterion above for every face at the default `cfln=0.5`. `solver.compute_stable_timestep()` computes the exact stability limit of the assembled operators and reports whether the chosen time step is stable.
+
+**Interfaces between normal materials.** Each DOF receives a diagonal effective material. For the electric DOF along $x_i$ with interface normal $\hat{n}$,
+
+$$
+\varepsilon_{ii} = n_i^2\, \varepsilon_\perp + (1-n_i^2)\, \varepsilon_\parallel ,
+$$
+
+with the harmonic average $\varepsilon_\perp$ along the primal edge and the area-weighted arithmetic average $\varepsilon_\parallel$ over its dual face ($\sigma$ likewise, $\mu$ with primal and dual exchanged). It is the diagonal of the inverse of the smoothing tensor of [Farjadpour et al., 2006](https://doi.org/10.1364/OL.31.002972), $\tilde\varepsilon^{-1} = \mathbf{P}\langle\varepsilon^{-1}\rangle + (\mathbf{1}-\mathbf{P})\langle\varepsilon\rangle^{-1}$, with the averages taken along the edge and over the dual face instead of a voxel. Farjadpour et al. show that neglecting the off-diagonal terms loses the quadratic convergence at interfaces oblique to the grid.
+
+**Limits.** At most one interface per edge is represented; thinner structures are reported as `thin feature` in a warning, and edges where the STL crossings disagree with the point classification (e.g. open surfaces) as `inconsistent`. `solver.plot_mesh_materials()` marks both. Off-diagonal material terms are neglected, and SIBC is not yet supported in conformal mode.
 
 ### Surface impedance boundary condition (SIBC)
 

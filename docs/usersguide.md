@@ -166,6 +166,29 @@ Thanks to a fully exposed python API, all (relevant) class attributes can be che
 When running on `ipython` all attributes and functions() can be viewed by typing the name of the class instance + `.` and then pressing `TAB`. Similarly, when writing code on a IDE (e.g., Visual Studio), a list with all the attributes and functions will be shown when typing e.g., `solver.`.
 ```
 
+#### Conformal geometry
+
+By default, every cell is assigned to one material (`geometry_mode="staircase"`), so curved and slanted walls become steps. With `geometry_mode="conformal"`, the STL surfaces are intersected exactly with the grid, and the solver uses the cut edge lengths, face areas and effective materials (see the [physics guide](physicsguide.md) for the method):
+
+```python
+grid = GridFIT3D(xmin, xmax, ymin, ymax, zmin, zmax,
+                Nx, Ny, Nz,
+                stl_solids=stl_solids,
+                stl_materials=stl_materials,
+                geometry_mode='conformal',
+                stl_material_types={'cavity': 'normal'},  # 'normal' or 'pec'
+                bg_material_type='pec',  # type of the solver background `bg`
+                conformal_stabilization='area_floor',
+                )
+```
+
+- `stl_material_types` tells the grid which solids are PEC walls; solids with the `'pec'` material are detected automatically. `bg_material_type` must match the `bg` passed to `SolverFIT3D`; if it is omitted, the grid treats the background as a normal material, so set it to `'pec'` for a PEC background.
+- Very small cut cells at PEC walls lower the stable timestep. `conformal_stabilization='area_floor'` limits this and is recommended whenever PEC walls cut through the cells.
+- Structures thinner than a cell and inconsistent STL crossings (e.g. open surfaces) are reported in a warning; `solver.plot_mesh_materials()` shows where they are.
+- `subpixel_smoothing` is ignored, and SIBC is not yet supported in conformal mode.
+
+The notebook `004_Conformal-geometry.ipynb` walks through a complete example and compares it with the staircase geometry.
+
 ### Setting up the electromagnetic solver
 
 Once the simulation domain has been defined through the geometry and the grid, the electromagnetic (EM) solver can be created. The solver implemented in `wakis` uses the Finite Integration Technique (FIT) [^1]. The recipe on how to instantiate the `SolverFIT3D` class is given below:
@@ -185,7 +208,7 @@ solver = SolverFIT3D(
 ```
 
 #### Simulation timestep
-The solver calculates `solver.dt` from the smallest cell width in each direction and the CFL number. Conductivity can impose a smaller timestep. To specify a timestep explicitly, pass `dt=...` when constructing `SolverFIT3D`.
+The solver calculates `solver.dt` from the smallest cell width in each direction and the CFL number. Conductivity can impose a smaller timestep. To specify a timestep explicitly, pass `dt=...` when constructing `SolverFIT3D`. With conformal cut cells this estimate is not guaranteed to be stable; `solver.compute_stable_timestep()` computes the exact limit and reports whether `solver.dt` is stable.
 
 ### Boundary conditions
 The required parameters `bc_low` and `bc_high` allow to choose the 6 boundary conditions for our simulation box. For the lower-end boundaries bc_low = [x-, y-, z-] and for the high-end boundaries bc_high = [x+, y+, z+] is used. The supported values to give for -/+ boundaries are:
