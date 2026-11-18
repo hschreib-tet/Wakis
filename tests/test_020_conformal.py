@@ -299,6 +299,14 @@ def test_stabilization_options():
             unit_grid(**invalid)
 
 
+def test_conductor_background_type():
+    """A conformal grid without bg_material_type traces its cuts with a
+    normal background, so a PEC solver background is rejected."""
+    grid = GridFIT3D(0, 1, 0, 1, 0, 1, 3, 3, 3, geometry_mode="conformal", verbose=0)
+    with pytest.raises(ValueError, match="bg_material_type='pec'"):
+        SolverFIT3D(grid, bg="pec", verbose=0)
+
+
 def test_conformal_grid_h5_roundtrip(pillbox_stls, tmp_path):
     """A conformal grid saved to HDF5 and loaded again gives a solver with
     identical cut-cell metrics and materials."""
