@@ -1766,10 +1766,7 @@ class PlotMixinSolver:
             and self.A_fraction is not None
         )
         if conformal:
-            region_types = self.region_material_types
-            is_conductor = np.zeros(max(region_types) + 1, dtype=bool)
-            for region_id, kind in region_types.items():
-                is_conductor[region_id] = kind in ("pec", "sibc")
+            _, is_conductor = grid._region_type_flags()
             line_data = self.conformal_line_data["primal"]
 
         faces = []
@@ -1871,8 +1868,8 @@ class PlotMixinSolver:
                     line_data[normal]["normal_to_conductor"]
                     | line_data[normal]["conductor_to_normal"]
                 )
-                eliminated = self._edge_array_to_field_component(cut, normal).astype(
-                    bool
+                eliminated = self._geometry_array_to_field_component(
+                    cut, "primal_edge", normal
                 ) & (ieps[normal] == 0.0)
 
             for j_a in range(len(ca) - 1):

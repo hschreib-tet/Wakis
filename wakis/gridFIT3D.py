@@ -289,6 +289,7 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
 
         self.region_id_to_key = {0: None}
         self.region_key_to_id = {}
+        self.region_material_types = {}
 
         self.interface_face_data = {
             "primal": {},
@@ -607,8 +608,8 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
                 stl_method=self.stl_method,
                 bg_material_type=self.bg_material_type,
                 conformal_stabilization=self.conformal_stabilization,
-                conformal_stabilization_fraction=self._get_stabilization_fraction(),
-                conformal_min_edge_fraction=self.conformal_min_edge_fraction or None,
+                conformal_stabilization_fraction=self.conformal_area_floor,
+                conformal_min_edge_fraction=self.conformal_min_edge_fraction,
             )
         return _grid
 

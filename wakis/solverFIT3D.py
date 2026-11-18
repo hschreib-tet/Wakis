@@ -221,9 +221,18 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
             # bg_material_type was introduced.
             self.bg_material_type = self._infer_background_material_type(bg)
 
+            # The conformal grid traced its cuts treating the background as
+            # a normal material; a conductor background would contradict it.
+            if grid.geometry_mode == "conformal" and self.bg_material_type != "normal":
+                raise ValueError(
+                    f"The background {bg!r} is a conductor, but the conformal "
+                    "grid has no bg_material_type. Pass "
+                    f"bg_material_type={self.bg_material_type!r} to GridFIT3D."
+                )
+
         self._validate_background_material(bg)
 
-        self.region_material_types = {}
+        self.region_material_types = self.grid.region_material_types
         self.conformal_line_data = {"primal": {}, "dual": {}}
         self.conformal_line_materials = {"primal": {}, "dual": {}}
         self.conformal_face_data = {"primal": {}, "dual": {}}
@@ -265,12 +274,6 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
             self._build_conformal_effective_areas()
             self._build_conformal_diagonal_materials()
 
-        if (
-            use_stl
-            and self.grid.geometry_mode == "conformal"
-            and self.L_eff is not None
-            and self.A_eff is not None
-        ):
             # ----------------------------------------------------------
             # Activate conformal primal metrics.
             #
@@ -480,7 +483,6 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
 
         if self.use_stl:
             self._apply_stl_materials()
-            self._eliminate_small_conformal_edges()
 
         # Fill PML BCs
         if self.activate_pml:
