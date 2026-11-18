@@ -26,7 +26,7 @@ def _sibc_solver(stl_path, **stabilization):
         stl_materials={"wall": [1.0, 1.0, 5.8e7]},
         stl_material_types={"wall": "sibc"},
         geometry_mode="conformal",
-        stl_method="interior_points",
+        stl_method="legacy",
         verbose=0,
         **stabilization,
     )

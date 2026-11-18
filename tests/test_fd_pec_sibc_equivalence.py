@@ -37,7 +37,7 @@ def _solver(stl_path, material_type):
         stl_materials={"wall": material},
         stl_material_types={"wall": material_type},
         geometry_mode="conformal",
-        stl_method="interior_points",
+        stl_method="legacy",
         verbose=0,
     )
     return SolverFIT3D_FD(
