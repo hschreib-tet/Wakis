@@ -277,8 +277,8 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
         }
 
         # Point-based STL masks on the primal and dual grids
-        self.primal_point_masks = {}
-        self.dual_point_masks = {}
+        self.primal_node_masks = {}
+        self.dual_node_masks = {}
 
         # Unique region IDs on primal and dual grid points.
         # Region 0 is always the background.
@@ -877,12 +877,12 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
             self.dual_masks[key] = dual_mask
 
             if self.geometry_mode == "conformal":
-                # The conformal point masks lie on the same lattice: primal
+                # The conformal node masks lie on the same lattice: primal
                 # nodes at even indices; dual points are the cell centres (odd
                 # indices) and their projections onto the domain faces.
-                self.primal_point_masks[key] = mask[::2, ::2, ::2].astype(bool)
+                self.primal_node_masks[key] = mask[::2, ::2, ::2].astype(bool)
                 dual_index = [np.r_[0, 1 : n - 1 : 2, n - 1] for n in mask.shape]
-                self.dual_point_masks[key] = mask[np.ix_(*dual_index)].astype(bool)
+                self.dual_node_masks[key] = mask[np.ix_(*dual_index)].astype(bool)
             else:
                 # Conformal grids report thin features from the exact STL
                 # crossings instead (_warn_interface_diagnostics).
@@ -1331,17 +1331,17 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
                         "grid_" + key, data=np.asarray(self.grid.cell_data[key])
                     )
 
-                # Conformal point masks (primal and dual grid points)
-                if key in self.primal_point_masks:
+                # Conformal node masks (primal and dual grid points)
+                if key in self.primal_node_masks:
                     hf.create_dataset(
-                        "grid_primal_points_" + key,
-                        data=np.asarray(self.primal_point_masks[key], dtype=bool),
+                        "grid_primal_nodes_" + key,
+                        data=np.asarray(self.primal_node_masks[key], dtype=bool),
                     )
 
-                if key in self.dual_point_masks:
+                if key in self.dual_node_masks:
                     hf.create_dataset(
-                        "grid_dual_points_" + key,
-                        data=np.asarray(self.dual_point_masks[key], dtype=bool),
+                        "grid_dual_nodes_" + key,
+                        data=np.asarray(self.dual_node_masks[key], dtype=bool),
                     )
 
     def load_from_h5(self, filename):
@@ -1538,34 +1538,34 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
                     material_mask.fromarray(mask)
                     getattr(self, name)[key] = material_mask
 
-            # Conformal point masks (only written in conformal mode).
+            # Conformal node masks (only written in conformal mode).
             for key in self.stl_solids.keys():
                 for name, masks, shape in (
                     (
-                        "grid_primal_points_",
-                        self.primal_point_masks,
+                        "grid_primal_nodes_",
+                        self.primal_node_masks,
                         (len(self.x), len(self.y), len(self.z)),
                     ),
                     (
-                        "grid_dual_points_",
-                        self.dual_point_masks,
+                        "grid_dual_nodes_",
+                        self.dual_node_masks,
                         (len(self.tx), len(self.ty), len(self.tz)),
                     ),
                 ):
                     if name + key not in hf:
                         continue
-                    point_mask = np.asarray(hf[name + key][()], dtype=bool)
-                    if point_mask.shape != shape:
+                    node_mask = np.asarray(hf[name + key][()], dtype=bool)
+                    if node_mask.shape != shape:
                         raise ValueError(
-                            f"Point mask '{name + key}' has shape "
-                            f"{point_mask.shape}; the current grid requires "
+                            f"Node mask '{name + key}' has shape "
+                            f"{node_mask.shape}; the current grid requires "
                             f"{shape}. Recreate and save the grid with the "
                             "current Wakis version."
                         )
-                    masks[key] = point_mask
+                    masks[key] = node_mask
 
-            if all(key in self.primal_point_masks for key in self.stl_solids) and all(
-                key in self.dual_point_masks for key in self.stl_solids
+            if all(key in self.primal_node_masks for key in self.stl_solids) and all(
+                key in self.dual_node_masks for key in self.stl_solids
             ):
                 self._build_conformal_interfaces()
 

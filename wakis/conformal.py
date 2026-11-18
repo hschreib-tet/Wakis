@@ -113,17 +113,17 @@ class ConformalGridMixin:
             self.region_id_to_key[region_id] = key
             self.region_key_to_id[key] = region_id
 
-    def _build_region_ids(self, point_masks, grid_type):
+    def _build_region_ids(self, node_masks, grid_type):
         """
-        Build unique region IDs from point masks on one grid.
+        Build unique region IDs from node masks on one grid.
 
         Later STL solids intentionally overwrite earlier solids in
         overlapping regions.
 
         Parameters
         ----------
-        point_masks : dict
-            Boolean point masks indexed by STL key.
+        node_masks : dict
+            Boolean node masks indexed by STL key.
         grid_type : str
             Either "primal" or "dual".
 
@@ -137,11 +137,11 @@ class ConformalGridMixin:
         region_ids = np.zeros(expected_shape, dtype=np.int32)
 
         for key in self.stl_solids.keys():
-            point_mask = np.asarray(point_masks[key], dtype=bool)
+            node_mask = np.asarray(node_masks[key], dtype=bool)
             region_id = self.region_key_to_id[key]
 
             # Later STL solids overwrite earlier ones.
-            region_ids[point_mask] = region_id
+            region_ids[node_mask] = region_id
 
         return region_ids
 
@@ -173,10 +173,10 @@ class ConformalGridMixin:
         self._build_region_maps()
 
         self.region_ids["primal"] = self._build_region_ids(
-            self.primal_point_masks, "primal"
+            self.primal_node_masks, "primal"
         )
 
-        self.region_ids["dual"] = self._build_region_ids(self.dual_point_masks, "dual")
+        self.region_ids["dual"] = self._build_region_ids(self.dual_node_masks, "dual")
 
         self.interface_edge_masks["primal"] = self._build_edge_transition_masks(
             self.region_ids["primal"]
@@ -753,10 +753,10 @@ class ConformalGridMixin:
 
                         raw_hits.setdefault(edge_index, []).extend(hits)
 
-                point_masks = (
-                    self.primal_point_masks
+                node_masks = (
+                    self.primal_node_masks
                     if grid_type == "primal"
-                    else self.dual_point_masks
+                    else self.dual_node_masks
                 )
 
                 for edge_index, hits in raw_hits.items():
@@ -772,7 +772,7 @@ class ConformalGridMixin:
                     start = int(start_regions[edge_index])
                     end = int(end_regions[edge_index])
                     start_inside = {
-                        self.region_key_to_id[key]: bool(point_masks[key][edge_index])
+                        self.region_key_to_id[key]: bool(node_masks[key][edge_index])
                         for key in self.stl_solids
                     }
                     regions, interfaces, thin_layer = self._resolve_edge_interfaces(
@@ -1559,10 +1559,10 @@ class ConformalGridMixin:
 
     def _build_conformal_interfaces(self):
         """
-        Build the conformal interface geometry from the STL point masks.
+        Build the conformal interface geometry from the STL node masks.
 
         Used both after classifying the grid points and after loading the
-        point masks from HDF5, so that both paths give identical cut-cell
+        node masks from HDF5, so that both paths give identical cut-cell
         geometry. The STL surfaces are traced again and must be readable.
         """
         self._build_interface_topology()
@@ -2478,8 +2478,8 @@ class ConformalSolverMixin:
 
         # Assign STL material values to primal and dual grid points.
         for key in self.stl_solids.keys():
-            primal_mask = self.grid.primal_point_masks[key]
-            dual_mask = self.grid.dual_point_masks[key]
+            primal_mask = self.grid.primal_node_masks[key]
+            dual_mask = self.grid.dual_node_masks[key]
             eps = self.stl_materials[key][0] * eps_0
             mu = self.stl_materials[key][1] * mu_0
             sigma = self.stl_materials[key][2]
