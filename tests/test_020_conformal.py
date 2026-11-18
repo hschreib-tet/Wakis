@@ -299,6 +299,40 @@ def test_stabilization_options():
             unit_grid(**invalid)
 
 
+def test_coincident_wall(tmp_path):
+    """A dielectric slab sharing one wall with the box cavity, both oblique
+    and triangulated differently. At that wall the interface is PEC|slab,
+    so its cut is represented by the slab surface, not by the coincident
+    but covered cavity surface; mixing both would leave faces uncut."""
+    for name, bounds, level in (
+        ("cav", (-0.15, 0.15, -0.11, 0.11, -0.085, 0.085), 1),
+        ("slab", (0.05, 0.15, -0.11, 0.11, -0.085, 0.085), 3),
+    ):
+        box = pv.Box(bounds=bounds, level=level).triangulate()
+        box.rotate_z(20).rotate_x(10).save(tmp_path / f"{name}.stl")
+    with pytest.warns(UserWarning, match="Conformal geometry diagnostics"):
+        grid = GridFIT3D(
+            *(-0.2, 0.2) * 3,
+            13,
+            13,
+            13,
+            stl_solids={key: str(tmp_path / f"{key}.stl") for key in ("cav", "slab")},
+            stl_materials={"cav": "vacuum", "slab": [4, 1, 0]},
+            bg_material_type="pec",
+            geometry_mode="conformal",
+            stl_method="legacy",
+            verbose=0,
+        )
+    slab = grid.region_key_to_id["slab"]
+    for direction in "xyz":
+        start, end = grid._get_edge_region_ids("primal", direction)
+        data = grid.interface_intersections["primal"][direction]
+        wall = data["has_crossing"] & (np.minimum(start, end) == 0)
+        wall &= np.maximum(start, end) == slab
+        assert wall.any()
+        assert np.all(data["surface_id"][wall] == slab)
+
+
 def test_conductor_background_type():
     """A conformal grid without bg_material_type traces its cuts with a
     normal background, so a PEC solver background is rejected."""

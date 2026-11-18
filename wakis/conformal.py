@@ -343,44 +343,31 @@ class ConformalGridMixin:
 
         return regions, interfaces, thin_layer
 
-    def _select_interface_group(self, groups, left_region, right_region):
+    def _select_interface_hit(self, groups, left_region, right_region):
         """
-        Choose the crossing that represents one interface.
+        Choose the STL hit that represents one interface: its position,
+        surface and facet normal.
 
-        A conductor surface defines the cut wall of a normal-conductor
-        interface; otherwise the surface of the later solid wins, as it does
-        in the point classification. Remaining ties go to the first crossing.
+        Hits on the surfaces of the two adjacent regions come first, and
+        among them a conductor surface, which defines the cut wall of a
+        normal-conductor interface. Then the surface of the later solid wins,
+        as it does in the point classification. Remaining ties go to the
+        first crossing along the edge and the lowest facet ID.
         """
-
-        def priority(group):
-            sides = {
-                surface_id
-                for surface_id in {hit["surface_id"] for hit in group}
-                if surface_id in (left_region, right_region)
-            }
-            conductor = any(
-                self._is_conductor_region(surface_id) for surface_id in sides
-            )
-            return (not conductor, -max(sides, default=-1))
-
-        return min(groups, key=priority)
-
-    def _select_representative_hit(self, hits):
-        """
-        Select one representative STL facet from coincident hits.
-
-        SIBC and PEC surfaces are preferred because their local facet
-        normals are particularly relevant for boundary-condition treatment.
-        """
-        material_priority = {"sibc": 0, "pec": 1, "normal": 2}
 
         def priority(hit):
             surface_id = hit["surface_id"]
-            material_type = self.region_material_types[surface_id]
+            side = surface_id in (left_region, right_region)
+            side_conductor = side and self._is_conductor_region(surface_id)
+            return (
+                not side_conductor,
+                not side,
+                -surface_id,
+                hit["alpha"],
+                hit["cell_id"],
+            )
 
-            return (material_priority[material_type], surface_id, hit["cell_id"])
-
-        return min(hits, key=priority)
+        return min((hit for group in groups for hit in group), key=priority)
 
     def _get_normal_normal_edge_mask(self, grid_type, direction):
         """
@@ -528,7 +515,7 @@ class ConformalGridMixin:
                         continue
 
                     candidates = [
-                        self._select_interface_group(groups, left, right)
+                        self._select_interface_hit(groups, left, right)
                         for groups, left, right in zip(
                             interfaces, regions[:-1], regions[1:]
                         )
@@ -538,18 +525,14 @@ class ConformalGridMixin:
                     # (a coating on it is dropped, not the wall moved);
                     # otherwise use the interface nearest the edge midpoint.
                     if self._is_conductor_region(end):
-                        selected_group = candidates[-1]
+                        representative = candidates[-1]
                     elif self._is_conductor_region(start):
-                        selected_group = candidates[0]
+                        representative = candidates[0]
                     else:
-                        selected_group = min(
-                            candidates,
-                            key=lambda group: abs(
-                                np.mean([hit["alpha"] for hit in group]) - 0.5
-                            ),
+                        representative = min(
+                            candidates, key=lambda hit: abs(hit["alpha"] - 0.5)
                         )
                     multiple = len(interfaces) > 1 or not consistent
-                    representative = self._select_representative_hit(selected_group)
                     intersections["has_crossing"][edge_index] = True
                     intersections["multiple_crossing_positions"][edge_index] = multiple
                     intersections["alpha"][edge_index] = representative["alpha"]
