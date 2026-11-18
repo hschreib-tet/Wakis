@@ -2457,16 +2457,6 @@ class ConformalSolverMixin:
         self.stl_materials = self.grid.stl_materials
         self.stl_colors = self.grid.stl_colors
 
-        # SIBC currently relies on cell-based surface masks and is therefore
-        # not yet compatible with the conformal material discretization.
-        if self.use_sibc and any(
-            self.stl_materials[key][2] > 0.0 for key in self.stl_solids.keys()
-        ):
-            raise NotImplementedError(
-                "SIBC for conductive STL materials is currently not supported "
-                "with geometry_mode='conformal'."
-            )
-
         # Point shapes: primal (Nx, Ny, Nz), dual (Nx+1, Ny+1, Nz+1).
         primal_shape = (self.Nx, self.Ny, self.Nz)
         dual_shape = (self.Nx + 1, self.Ny + 1, self.Nz + 1)
