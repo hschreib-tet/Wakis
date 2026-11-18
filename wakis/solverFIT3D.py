@@ -234,18 +234,7 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
 
         self.region_material_types = self.grid.region_material_types
         self.conformal_line_data = {"primal": {}, "dual": {}}
-        self.conformal_line_materials = {"primal": {}, "dual": {}}
         self.conformal_face_data = {"primal": {}, "dual": {}}
-        self.conformal_face_materials = {"primal": {}, "dual": {}}
-        self.conformal_diagonal_materials = {"eps_r": {}, "mu_r": {}, "sigma": {}}
-
-        # The cut-cell data exists once the grid has traced its STL solids.
-        conformal = self.grid.geometry_mode == "conformal" and bool(
-            self.grid.resolved_interface_edge_masks["primal"]
-        )
-        if conformal:
-            self._build_conformal_line_data()
-            self._build_conformal_line_materials()
 
         self.Nx = self.grid.Nx
         self.Ny = self.grid.Ny
@@ -262,58 +251,17 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
         # as well removes the conductor volume twice, which lowers the
         # stable time step and the accuracy.
         self.L_fraction = None
-        self.L_eff = None
-
         self.A_fraction = None
-        self.A_eff = None
 
+        # The cut-cell data exists once the grid has traced its STL solids.
+        conformal = self.grid.geometry_mode == "conformal" and bool(
+            self.grid.interface_intersections["primal"]
+        )
         if use_stl and conformal:
-            self._build_conformal_effective_lengths()
+            self._build_conformal_line_data()
             self._build_conformal_face_data()
-            self._build_conformal_face_materials()
-            self._build_conformal_effective_areas()
-            self._build_conformal_diagonal_materials()
-
-            # ----------------------------------------------------------
-            # Activate conformal primal metrics.
-            #
-            # From this point on, self.L and self.iA represent the
-            # metrics actually used by the solver.
-            # ----------------------------------------------------------
-
-            self.L = Field(
-                self.Nx,
-                self.Ny,
-                self.Nz,
-            )
-
-            self.L.fromarray(self.L_eff.toarray().copy())
-
-            A_values = self.A_eff.toarray()
-
-            # Ghost faces of the symmetric stencil have zero area (iA = 0);
-            # all physical faces must keep a positive effective area.
-            physical = self.grid.iA.toarray() != 0
-
-            if np.any(A_values[physical] <= 0.0):
-                raise RuntimeError(
-                    "Conformal primal effective face area must be positive."
-                )
-
-            self.iA = Field(
-                self.Nx,
-                self.Ny,
-                self.Nz,
-            )
-
-            self.iA.fromarray(
-                np.divide(
-                    1.0,
-                    A_values,
-                    out=np.zeros_like(A_values),
-                    where=physical,
-                )
-            )
+            # From here on, self.L and self.iA are the cut primal metrics.
+            self._build_conformal_metrics()
 
         self.update_logger(["grid", "background"])
 

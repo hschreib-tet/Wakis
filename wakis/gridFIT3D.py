@@ -176,9 +176,7 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
         conformal_min_edge_fraction : float, optional
             Area floor only: conductor-cut edges with a smaller active
             fraction are eliminated (E set to zero), 0 <= value < 0.5.
-            Default (None) uses the area floor value. With this choice no
-            spurious localized modes were found while the mesh resolves the
-            wavelength with at least about 6 cells.
+            Default (None) uses the area floor value.
 
         Attributes
         ----------
@@ -258,20 +256,8 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
             conformal_min_edge_fraction,
         )
 
-        # Primary and dual edges whose endpoints belong to different regions
-        self.interface_edge_masks = {
-            "primal": {},
-            "dual": {},
-        }
-
-        # Geometric STL intersections with primal and dual interface edges
+        # Geometric STL intersections with primal and dual grid edges
         self.interface_intersections = {
-            "primal": {},
-            "dual": {},
-        }
-
-        # Interface edges with an endpoint transition and an STL crossing
-        self.resolved_interface_edge_masks = {
             "primal": {},
             "dual": {},
         }
