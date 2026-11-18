@@ -331,6 +331,7 @@ class SolverFIT3D_FD(
 
         if not self.use_stl or self.grid.geometry_mode != "conformal":
             return
+        materials = ("eps_r", "mu_r", "sigma")
         for direction in ("x", "y", "z"):
             geom = self.grid.interface_face_data["primal"][direction]
             classified = self.conformal_face_data["primal"][direction]
@@ -380,8 +381,11 @@ class SolverFIT3D_FD(
                 sin_theta = np.sqrt(max(0.0, 1.0 - normal[axis] ** 2))
                 if sin_theta <= 1e-10:
                     raise RuntimeError(f"Degenerate SIBC angle: {direction} {index}")
-                wall_material = self._get_region_material_properties(region_id)
-                field_material = self._get_region_material_properties(field_ids[0])
+                # [eps_r, mu_r, sigma] of the SIBC wall and the field region.
+                wall_material, field_material = (
+                    [self.region_material_properties[name][rid] for name in materials]
+                    for rid in (region_id, field_ids[0])
+                )
                 if (
                     wall_material[2] <= 0
                     or wall_material[1] <= 0
