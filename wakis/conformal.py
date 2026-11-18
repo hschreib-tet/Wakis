@@ -36,7 +36,6 @@ from vtkmodules.vtkCommonCore import vtkIdList, vtkPoints
 from vtkmodules.vtkCommonDataModel import vtkStaticCellLocator
 
 from .field import Field
-from .materials import material_lib
 
 
 class ConformalGridMixin:
@@ -1384,174 +1383,6 @@ class ConformalSolverMixin:
                     "conductor_region_ids": (conductor_region_ids),
                 }
 
-    def _build_conformal_face_materials(self):
-        """
-        Effective materials on resolved interface faces: the area-weighted
-        (arithmetic) average over the normal-material part of the face.
-        The area reduction itself enters through A_eff.
-
-        Primal faces carry mu_r, dual faces eps_r and sigma.
-        """
-        self.conformal_face_materials = {"primal": {}, "dual": {}}
-        names = {"primal": ("mu_r",), "dual": ("eps_r", "sigma")}
-
-        for grid_type in ("primal", "dual"):
-            for direction in ("x", "y", "z"):
-                face_data = self.conformal_face_data[grid_type][direction]
-                geometry = self.grid.interface_face_data[grid_type][direction]
-                supported = face_data["supported"]
-                values = {
-                    name: np.full(supported.shape, np.nan, dtype=float)
-                    for name in names[grid_type]
-                }
-
-                for index_array in np.argwhere(supported):
-                    index = tuple(int(value) for value in index_array)
-                    fractions = geometry["region_area_fractions"][index]
-                    regions = face_data["normal_region_ids"][index]
-                    normal_fraction = sum(float(fractions[r]) for r in regions)
-
-                    for name in names[grid_type]:
-                        table = self.region_material_properties[name]
-                        values[name][index] = sum(
-                            float(fractions[r]) / normal_fraction * table[r]
-                            for r in regions
-                        )
-
-                self.conformal_face_materials[grid_type][direction] = values
-
-    def _get_region_material_properties(self, region_id):
-        """
-        Return [eps_r, mu_r, sigma] for one geometry region.
-
-        Region 0 is the background. All other regions correspond to STL solids.
-        """
-        region_id = int(region_id)
-
-        if region_id == 0:
-            material = self.background
-
-            if isinstance(material, str):
-                mat = material_lib[material.lower()]
-                material = [mat[0], mat[1], mat[2] if len(mat) == 3 else 0.0]
-            else:
-                material = list(material)
-
-                if len(material) == 2:
-                    material.append(0.0)
-        else:
-            key = self.grid.region_id_to_key[region_id]
-            material = self.grid.stl_materials[key]
-
-        return np.asarray(material, dtype=float)
-
-    def _build_region_material_properties(self):
-        """
-        Build numerical material-property tables indexed by region ID.
-        """
-        max_region_id = max(self.region_material_types)
-        eps_r = np.full(max_region_id + 1, np.nan, dtype=float)
-        mu_r = np.full(max_region_id + 1, np.nan, dtype=float)
-        sigma = np.full(max_region_id + 1, np.nan, dtype=float)
-
-        for region_id in self.region_material_types:
-            properties = self._get_region_material_properties(region_id)
-            eps_r[region_id] = properties[0]
-            mu_r[region_id] = properties[1]
-            sigma[region_id] = properties[2]
-
-        self.region_material_properties = {"eps_r": eps_r, "mu_r": mu_r, "sigma": sigma}
-
-    def _build_conformal_line_materials(self):
-        """
-        Build effective material values along resolved conformal edges.
-
-        Primal edges:
-            - normal-normal: harmonic eps_r and sigma
-            - normal-conductor: material properties of the normal segment
-
-        Dual edges (normal-normal only): harmonic mu_r
-
-        No FIT operators are modified here.
-        """
-        self._build_region_material_properties()
-        eps_r_regions = self.region_material_properties["eps_r"]
-        mu_r_regions = self.region_material_properties["mu_r"]
-        sigma_regions = self.region_material_properties["sigma"]
-        self.conformal_line_materials = {"primal": {}, "dual": {}}
-
-        for grid_type in ("primal", "dual"):
-            for direction in ("x", "y", "z"):
-                line_data = self.conformal_line_data[grid_type][direction]
-                alpha = line_data["alpha"]
-                start_regions = line_data["start_region"]
-                end_regions = line_data["end_region"]
-                normal_normal = line_data["normal_normal"]
-                normal_to_conductor = line_data["normal_to_conductor"]
-                conductor_to_normal = line_data["conductor_to_normal"]
-                shape = alpha.shape
-                start_eps_r = eps_r_regions[start_regions]
-                end_eps_r = eps_r_regions[end_regions]
-                start_mu_r = mu_r_regions[start_regions]
-                end_mu_r = mu_r_regions[end_regions]
-                start_sigma = sigma_regions[start_regions]
-                end_sigma = sigma_regions[end_regions]
-
-                if grid_type == "primal":
-                    eps_r_eff = np.full(shape, np.nan, dtype=float)
-                    sigma_eff = np.full(shape, np.nan, dtype=float)
-
-                    # Normal -> normal:
-                    # harmonic average along the edge
-                    eps_r_eff[normal_normal] = 1.0 / (
-                        alpha[normal_normal] / start_eps_r[normal_normal]
-                        + (1.0 - alpha[normal_normal]) / end_eps_r[normal_normal]
-                    )
-
-                    # Conductivity:
-                    #
-                    # For the present non-dispersive approximation,
-                    # use the corresponding series (harmonic)
-                    # conductivity. If either region is insulating,
-                    # the effective DC conductivity is zero.
-                    both_conductive = (
-                        normal_normal & (start_sigma > 0.0) & (end_sigma > 0.0)
-                    )
-
-                    sigma_eff[normal_normal] = 0.0
-
-                    sigma_eff[both_conductive] = 1.0 / (
-                        alpha[both_conductive] / start_sigma[both_conductive]
-                        + (1.0 - alpha[both_conductive]) / end_sigma[both_conductive]
-                    )
-
-                    # Normal -> PEC/SIBC
-                    eps_r_eff[normal_to_conductor] = start_eps_r[normal_to_conductor]
-                    sigma_eff[normal_to_conductor] = start_sigma[normal_to_conductor]
-
-                    # PEC/SIBC -> normal
-                    eps_r_eff[conductor_to_normal] = end_eps_r[conductor_to_normal]
-                    sigma_eff[conductor_to_normal] = end_sigma[conductor_to_normal]
-
-                    self.conformal_line_materials[grid_type][direction] = {
-                        "eps_r": eps_r_eff,
-                        "sigma": sigma_eff,
-                    }
-                else:
-                    mu_r_eff = np.full(shape, np.nan, dtype=float)
-
-                    # Normal -> normal:
-                    # harmonic average along dual edge
-                    mu_r_eff[normal_normal] = 1.0 / (
-                        alpha[normal_normal] / start_mu_r[normal_normal]
-                        + (1.0 - alpha[normal_normal]) / end_mu_r[normal_normal]
-                    )
-
-                    # Dual edges are only traced at normal-normal interfaces.
-                    self.conformal_line_materials[grid_type][direction] = {
-                        "mu_r": mu_r_eff
-                    }
-
     # Geometry array -> stored DOF mapping (symmetric FIT stencil)
     #
     # Nx, Ny, Nz count primal nodes. Every field component stores
@@ -1622,43 +1453,35 @@ class ConformalSolverMixin:
 
         return result
 
-    def _build_conformal_diagonal_materials(self, normal_tol=1e-12):
+    @staticmethod
+    def _harmonic_mean(alpha, start_values, end_values):
         """
-        Diagonal effective materials at normal-normal interfaces.
+        Series average along an edge, ``alpha`` of it in the start region.
+        A zero value (an insulator for sigma) makes the average zero.
+        """
+        with np.errstate(divide="ignore", invalid="ignore"):
+            mean = 1.0 / (alpha / start_values + (1.0 - alpha) / end_values)
+        return np.where((start_values == 0.0) | (end_values == 0.0), 0.0, mean)
+
+    def _diagonal_material(self, name, direction, line_grid, face_grid, tol=1e-12):
+        """
+        Diagonal effective material of one DOF component at normal-normal
+        interfaces.
 
         For the DOF component along x_i, with n the interface normal,
 
             m_ii = n_i^2 * m_perp + (1 - n_i^2) * m_parallel,
 
         where m_perp is the harmonic (series) value along the DOF edge and
-        m_parallel the arithmetic (parallel) value over its face:
+        m_parallel the area-weighted arithmetic (parallel) value over its
+        face:
 
             eps, sigma: primal edge (perp) and dual face (parallel)
             mu:         dual edge (perp) and primal face (parallel)
 
-        The arrays have the stored DOF shape (Nx, Ny, Nz) and are NaN where
+        Returns an array of the stored DOF shape (Nx, Ny, Nz), NaN where
         neither the edge nor its face is cut by a normal-normal interface.
         """
-        self.conformal_diagonal_materials = {"eps_r": {}, "mu_r": {}, "sigma": {}}
-        # E DOFs: primal edge (perp) and dual face (parallel); H DOFs: dual
-        # edge (perp) and primal face (parallel).
-        electric = ("primal", "dual")
-        magnetic = ("dual", "primal")
-
-        for direction in ("x", "y", "z"):
-            for name, (line_grid, face_grid) in (
-                ("eps_r", electric),
-                ("sigma", electric),
-                ("mu_r", magnetic),
-            ):
-                self.conformal_diagonal_materials[name][direction] = (
-                    self._diagonal_material_component(
-                        name, direction, line_grid, face_grid, normal_tol
-                    )
-                )
-
-    def _diagonal_material_component(self, name, direction, line_grid, face_grid, tol):
-        """One diagonal material component (see _build_conformal_diagonal_materials)."""
 
         def line_to_dof(values, fill=None):
             return self._geometry_array_to_field_component(
@@ -1673,6 +1496,7 @@ class ConformalSolverMixin:
         axis = "xyz".index(direction)
         line_data = self.conformal_line_data[line_grid][direction]
         face_data = self.conformal_face_data[face_grid][direction]
+        face_geometry = self.grid.interface_face_data[face_grid][direction]
         region_values = self.region_material_properties[name]
 
         line_cut = line_to_dof(line_data["normal_normal"], False).astype(bool)
@@ -1686,15 +1510,20 @@ class ConformalSolverMixin:
         valid = np.isfinite(norm) & (norm > 0.0)
         line_n2[valid] = (normals[..., axis][valid] / norm[valid]) ** 2
 
+        # Area-weighted value over the face and its normal component.
         face_n2 = np.full(face_data["normal_normal"].shape, np.nan, dtype=float)
-        segments = self.grid.interface_face_data[face_grid][direction]["segments"]
-        for index, segment in segments.items():
-            if not face_data["normal_normal"][index]:
-                continue
-            normal = np.asarray(segment["normal"], dtype=float)
-            norm = np.linalg.norm(normal)
-            if np.isfinite(norm) and norm > 0.0:
-                face_n2[index] = (normal[axis] / norm) ** 2
+        face_mean = np.full(face_data["normal_normal"].shape, np.nan, dtype=float)
+        for index in np.argwhere(face_data["normal_normal"]):
+            index = tuple(index)
+            fractions = face_geometry["region_area_fractions"][index]
+            regions = face_data["normal_region_ids"][index]
+            total = sum(float(fractions[r]) for r in regions)
+            face_mean[index] = sum(
+                float(fractions[r]) / total * region_values[r] for r in regions
+            )
+            normal = face_geometry["segments"][index]["normal"]
+            if normal is not None:
+                face_n2[index] = normal[axis] ** 2
 
         n2 = line_to_dof(line_n2)
         n2 = np.where(np.isfinite(n2), n2, face_to_dof(face_n2))
@@ -1703,19 +1532,20 @@ class ConformalSolverMixin:
         # single region: an uncut edge in its endpoint region, an uncut face
         # in the region of the edge midpoint, which it passes through.
         start, end = line_data["start_region"], line_data["end_region"]
-        uncut_edge = np.where(start == end, region_values[start], np.nan)
+        alpha = line_data["alpha"]
+        edge_value = np.where(
+            line_data["normal_normal"],
+            self._harmonic_mean(alpha, region_values[start], region_values[end]),
+            np.where(start == end, region_values[start], np.nan),
+        )
         # Crossing before the midpoint (alpha < 0.5): midpoint in the end region.
         # NaN alpha (uncut edge) compares False and selects the start region.
-        midpoint_region = np.where(line_data["alpha"] < 0.5, end, start)
+        midpoint_region = np.where(alpha < 0.5, end, start)
 
-        perp = np.where(
-            line_cut,
-            line_to_dof(self.conformal_line_materials[line_grid][direction][name]),
-            line_to_dof(uncut_edge),
-        )
+        perp = line_to_dof(edge_value)
         parallel = np.where(
             face_cut,
-            face_to_dof(self.conformal_face_materials[face_grid][direction][name]),
+            face_to_dof(face_mean),
             line_to_dof(region_values[midpoint_region]),
         )
 
@@ -1836,12 +1666,13 @@ class ConformalSolverMixin:
         Every DOF first takes the material of its edge endpoints (primal
         edges for E, dual edges for H): the region material if both lie in
         one region, the mean over the normal-material endpoints otherwise,
-        and a conductor (ieps = 0) if both lie in PEC/SIBC. Resolved
-        normal-conductor cuts then use the material of the normal part of
-        the edge (E) or face (H), and resolved normal-normal interfaces the
-        diagonal effective material, which takes precedence. Only edges
-        without a resolved crossing, which the conformal diagnostics warn
-        about, keep the endpoint value at a material transition.
+        and a conductor (ieps = 0) if both lie in PEC/SIBC; at a cut E edge
+        this is already the material of its normal part. H DOFs at faces cut
+        by a conductor take the material of the normal part of the face, and
+        resolved normal-normal interfaces the diagonal effective material
+        (``_diagonal_material``), which takes precedence. Only edges without
+        a resolved crossing, which the conformal diagnostics warn about,
+        keep the endpoint value at a material transition.
         """
         self.stl_solids = self.grid.stl_solids
         self.stl_materials = self.grid.stl_materials
@@ -1862,8 +1693,17 @@ class ConformalSolverMixin:
                         f"the maximal stable timestep."
                     )
 
-        self._build_region_material_properties()
-        region_values = self.region_material_properties
+        # Material table indexed by region ID; region 0 is the background.
+        table = np.array(
+            [[self.eps_bg / eps_0, self.mu_bg / mu_0, self.sigma_bg]]
+            + [self.stl_materials[key] for key in self.grid.region_key_to_id],
+            dtype=float,
+        )
+        self.region_material_properties = region_values = {
+            "eps_r": table[:, 0],
+            "mu_r": table[:, 1],
+            "sigma": table[:, 2],
+        }
         is_normal, is_conductor = self.grid._region_type_flags()
 
         def endpoint_material(name, start, end):
@@ -1891,20 +1731,8 @@ class ConformalSolverMixin:
             start = to_dof(start, "primal_edge", direction, "nearest")
             end = to_dof(end, "primal_edge", direction, "nearest")
             fully_conductor = is_conductor[start] & is_conductor[end]
-            line_data = self.conformal_line_data["primal"][direction]
-            line_materials = self.conformal_line_materials["primal"][direction]
-            cut = to_dof(
-                line_data["normal_to_conductor"] | line_data["conductor_to_normal"],
-                "primal_edge",
-                direction,
-            )
-
             for name in ("eps_r", "sigma"):
-                values = endpoint_material(name, start, end)
-                values[cut] = to_dof(line_materials[name], "primal_edge", direction)[
-                    cut
-                ]
-                materials[name][direction] = values
+                materials[name][direction] = endpoint_material(name, start, end)
 
             # Interior PEC/SIBC electric DOFs are eliminated through ieps = 0.
             materials["eps_r"][direction][fully_conductor] = np.inf
@@ -1915,20 +1743,23 @@ class ConformalSolverMixin:
             start = to_dof(start, "dual_edge", direction)
             end = to_dof(end, "dual_edge", direction)
             face_data = self.conformal_face_data["primal"][direction]
-            face_mu = self.conformal_face_materials["primal"][direction]["mu_r"]
-            cut = to_dof(
-                face_data["normal_conductor"],
-                "primal_face",
-                direction,
-            )
+            face_mu = np.full(face_data["normal_conductor"].shape, np.nan)
+            for index, regions in face_data["normal_region_ids"].items():
+                if face_data["normal_conductor"][index]:
+                    face_mu[index] = region_values["mu_r"][regions[0]]
+            cut = to_dof(face_data["normal_conductor"], "primal_face", direction)
             values = endpoint_material("mu_r", start, end)
             values[cut] = to_dof(face_mu, "primal_face", direction)[cut]
             materials["mu_r"][direction] = values
 
-        # The diagonal approximation at normal-normal interfaces takes
-        # precedence; NaN marks DOFs without such an interface.
-        for name, components in self.conformal_diagonal_materials.items():
-            for direction, values in components.items():
+            # The diagonal approximation at normal-normal interfaces takes
+            # precedence; NaN marks DOFs without such an interface.
+            for name, line_grid, face_grid in (
+                ("eps_r", "primal", "dual"),
+                ("sigma", "primal", "dual"),
+                ("mu_r", "dual", "primal"),
+            ):
+                values = self._diagonal_material(name, direction, line_grid, face_grid)
                 valid = np.isfinite(values)
                 materials[name][direction][valid] = values[valid]
 

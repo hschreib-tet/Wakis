@@ -234,18 +234,7 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
 
         self.region_material_types = self.grid.region_material_types
         self.conformal_line_data = {"primal": {}, "dual": {}}
-        self.conformal_line_materials = {"primal": {}, "dual": {}}
         self.conformal_face_data = {"primal": {}, "dual": {}}
-        self.conformal_face_materials = {"primal": {}, "dual": {}}
-        self.conformal_diagonal_materials = {"eps_r": {}, "mu_r": {}, "sigma": {}}
-
-        # The cut-cell data exists once the grid has traced its STL solids.
-        conformal = self.grid.geometry_mode == "conformal" and bool(
-            self.grid.interface_intersections["primal"]
-        )
-        if conformal:
-            self._build_conformal_line_data()
-            self._build_conformal_line_materials()
 
         self.Nx = self.grid.Nx
         self.Ny = self.grid.Ny
@@ -264,10 +253,13 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
         self.L_fraction = None
         self.A_fraction = None
 
+        # The cut-cell data exists once the grid has traced its STL solids.
+        conformal = self.grid.geometry_mode == "conformal" and bool(
+            self.grid.interface_intersections["primal"]
+        )
         if use_stl and conformal:
+            self._build_conformal_line_data()
             self._build_conformal_face_data()
-            self._build_conformal_face_materials()
-            self._build_conformal_diagonal_materials()
             # From here on, self.L and self.iA are the cut primal metrics.
             self._build_conformal_metrics()
 
