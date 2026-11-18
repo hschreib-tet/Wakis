@@ -247,6 +247,11 @@ class ConformalGridMixin:
             else:
                 groups.append([hit])
 
+        # VTK can report a hit for a facet coplanar with the grid line (e.g.
+        # an axis-aligned wall on a grid plane). Counted as a crossing, it
+        # would toggle inside/outside wrongly. The normals are unit vectors,
+        # so 1e-8 separates "line in the facet plane up to rounding" from any
+        # real tilt.
         return [
             group
             for group in groups
