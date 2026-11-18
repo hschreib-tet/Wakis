@@ -92,7 +92,7 @@ def _pillbox_grid(stls, geometry_mode, rod=False, n_cells=20):
         int(n_cells * L / (2 * h)) + 1,
         stl_solids={key: stls[key] for key in solids},
         stl_materials={key: materials[key] for key in solids},
-        stl_method="interior_points",
+        stl_method="legacy",
         geometry_mode=geometry_mode,
         verbose=0,
         **conformal,
@@ -152,7 +152,7 @@ def test_pillbox_frequency(pillbox_stls, tmp_path):
     """TM010 of the empty PEC pillbox.
 
     With R spanning only about 9.5 cells, the conformal error is about
-    0.25-0.3 %; the staircase error is about 1.7 %.
+    0.25 %; the staircase error is about 3.9 %.
     """
     tm010, _ = _mode_errors(pillbox_stls, tmp_path, "conformal")
     assert abs(tm010) < 5e-3
@@ -165,7 +165,7 @@ def test_dielectric_rod_frequency(pillbox_stls, tmp_path):
     TM010 has only Ez, parallel to the rod surface (measured error 0.14 %).
     The radial E field of TM011 crosses the rod surface, so it also tests
     the edges cut by the interface whose dual face is not cut (measured
-    0.71 %; 0.93 % when those edges kept staircase materials; 4.8 % with
+    0.71 %; 0.93 % when those edges kept staircase materials; 2.7 % with
     the staircase geometry).
     """
     tm010, tm011 = _mode_errors(pillbox_stls, tmp_path, "conformal", rod=True)
@@ -176,7 +176,7 @@ def test_dielectric_rod_frequency(pillbox_stls, tmp_path):
 def test_conformal_beats_staircase(pillbox_stls, tmp_path):
     """On the same coarse mesh, conformal cuts reduce the TM010 error at
     least threefold compared with the staircase geometry
-    (measured: about sevenfold)."""
+    (measured: about sixteenfold)."""
     conformal, _ = _mode_errors(pillbox_stls, tmp_path, "conformal")
     staircase, _ = _mode_errors(pillbox_stls, tmp_path, "staircase")
     assert abs(conformal) < 0.3 * abs(staircase)
@@ -215,7 +215,7 @@ def _slanted_box_grid(stl_file, **kwargs):
         stl_material_types={"cav": "normal"},
         bg_material_type="pec",
         geometry_mode="conformal",
-        stl_method="interior_points",
+        stl_method="legacy",
         verbose=0,
         **kwargs,
     )
@@ -350,7 +350,8 @@ def test_plot_mesh_materials_diagnostics(tmp_path):
     feature on the z edges through it) and an open box surface (inconsistent
     x edges at the missing face). The markers appear in the planes holding
     the flagged edges, on the dual grid also where the flagged primal edges
-    pierce the faces, and the legend counts them."""
+    pierce the faces, and the legend counts them. The open box is also
+    reported as not closed (the same check runs for staircase grids)."""
     from matplotlib.figure import Figure
 
     n = 10
@@ -368,7 +369,7 @@ def test_plot_mesh_materials_diagnostics(tmp_path):
         tmp_path / "box.stl"
     )
 
-    with pytest.warns(UserWarning, match="Conformal geometry diagnostics"):
+    with pytest.warns(UserWarning) as record:
         grid = GridFIT3D(
             -0.5,
             0.5,
@@ -387,6 +388,9 @@ def test_plot_mesh_materials_diagnostics(tmp_path):
             geometry_mode="conformal",
             verbose=0,
         )
+    messages = [str(warning.message) for warning in record]
+    assert any("Conformal geometry diagnostics" in m for m in messages)
+    assert any("'box' is not a closed surface" in m for m in messages)
     solver = SolverFIT3D(grid, use_stl=True, bg="pec", verbose=0)
 
     for grid_type, normal, index, expected in (
