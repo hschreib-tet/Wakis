@@ -150,28 +150,6 @@ class ConformalGridMixin:
             return (region_ids[:, :-1, :], region_ids[:, 1:, :])
         return (region_ids[:, :, :-1], region_ids[:, :, 1:])
 
-    def _get_edge_endpoints(self, grid_type, direction, index):
-        """
-        Return the Cartesian endpoints of one grid edge.
-
-        Parameters
-        ----------
-        grid_type : str
-            Either "primal" or "dual".
-        direction : str
-            Edge direction: "x", "y", or "z".
-        index : tuple of int
-            Edge index (i, j, k).
-        """
-        coordinates = self._get_grid_coordinates(grid_type)
-        end_index = list(index)
-        end_index["xyz".index(direction)] += 1
-        start_point = np.array([c[n] for c, n in zip(coordinates, index)], dtype=float)
-        end_point = np.array(
-            [c[n] for c, n in zip(coordinates, end_index)], dtype=float
-        )
-        return start_point, end_point
-
     def _trace_grid_line(
         self,
         grid_type,
@@ -660,548 +638,196 @@ class ConformalGridMixin:
                 stacklevel=2,
             )
 
-    def _build_face_candidate_masks(self):
+    @staticmethod
+    def _polygon_area(points_2d):
+        """Area of a simple polygon from its vertices in order (shoelace)."""
+        u, v = points_2d[:, 0], points_2d[:, 1]
+        return float(abs(0.5 * (np.dot(u, np.roll(v, -1)) - np.dot(v, np.roll(u, -1)))))
+
+    def _split_face(self, grid_type, face_direction, index):
         """
-        Build masks of grid faces adjacent to resolved interface edges.
+        Split one grid face along the interface segment that crosses it.
 
-        A face is marked as a candidate when at least one of its four
-        boundary edges contains a resolved geometric interface crossing.
+        The cut points are the represented crossings of the four boundary
+        edges. A face with exactly two distinct cut points of one common STL
+        surface, none from an edge with several crossings, has an interface
+        segment. It is split into two polygons when each side contains
+        corners of a single region and the two regions differ.
 
-        Face directions denote the face normal:
-            x -> yz face
-            y -> xz face
-            z -> xy face
+        Returns
+        -------
+        segment : dict or None
+            ``surface_id``, ``length`` and unit mean facet ``normal`` (None
+            if the facet normals cancel) of the interface segment.
+        polygons : list of dict or None
+            For both sides: ``region_id``, ``vertices`` (Cartesian, in
+            boundary order) and ``area_fraction`` of the face.
         """
-        self.face_candidate_masks = {"primal": {}, "dual": {}}
-
-        for grid_type in ("primal", "dual"):
-            intersections = self.interface_intersections[grid_type]
-            x_edges = intersections["x"]["has_crossing"]
-            y_edges = intersections["y"]["has_crossing"]
-            z_edges = intersections["z"]["has_crossing"]
-
-            # x-normal faces (yz)
-            #
-            # Boundary:
-            #   two y-directed edges at z_k and z_{k+1}
-            #   two z-directed edges at y_j and y_{j+1}
-            #
-            # Shape:
-            #   (nx, ny - 1, nz - 1) for nx, ny, nz grid points
-            x_faces = (
-                y_edges[:, :, :-1]
-                | y_edges[:, :, 1:]
-                | z_edges[:, :-1, :]
-                | z_edges[:, 1:, :]
-            )
-
-            # y-normal faces (xz)
-            #
-            # Boundary:
-            #   two x-directed edges at z_k and z_{k+1}
-            #   two z-directed edges at x_i and x_{i+1}
-            #
-            # Shape:
-            #   (nx - 1, ny, nz - 1)
-            y_faces = (
-                x_edges[:, :, :-1]
-                | x_edges[:, :, 1:]
-                | z_edges[:-1, :, :]
-                | z_edges[1:, :, :]
-            )
-
-            # z-normal faces (xy)
-            #
-            # Boundary:
-            #   two x-directed edges at y_j and y_{j+1}
-            #   two y-directed edges at x_i and x_{i+1}
-            #
-            # Shape:
-            #   (nx - 1, ny - 1, nz)
-            z_faces = (
-                x_edges[:, :-1, :]
-                | x_edges[:, 1:, :]
-                | y_edges[:-1, :, :]
-                | y_edges[1:, :, :]
-            )
-
-            self.face_candidate_masks[grid_type] = {
-                "x": x_faces,
-                "y": y_faces,
-                "z": z_faces,
-            }
-
-    def _get_face_boundary_edges(self, grid_type, face_direction, index):
-        """
-        Return the four boundary edges of one grid face.
-
-        The edges are ordered counter-clockwise with respect to the
-        positive face normal. ``boundary_sign`` gives the orientation
-        of the stored grid edge relative to this boundary traversal.
-
-        Face directions denote the face normal:
-            x -> yz face
-            y -> xz face
-            z -> xy face
-        """
-        x, y, z = self._get_grid_coordinates(grid_type)
-        i, j, k = (int(value) for value in index)
-
-        if face_direction == "x":
-            # Local coordinates:
-            # u = y, v = z
-            #
-            # e_y x e_z = e_x
-            return [
-                {"direction": "y", "index": (i, j, k), "boundary_sign": 1},
-                {"direction": "z", "index": (i, j + 1, k), "boundary_sign": 1},
-                {"direction": "y", "index": (i, j, k + 1), "boundary_sign": -1},
-                {"direction": "z", "index": (i, j, k), "boundary_sign": -1},
-            ]
-
-        if face_direction == "y":
-            # Local coordinates:
-            # u = z, v = x
-            #
-            # e_z x e_x = e_y
-            return [
-                {"direction": "z", "index": (i, j, k), "boundary_sign": 1},
-                {"direction": "x", "index": (i, j, k + 1), "boundary_sign": 1},
-                {"direction": "z", "index": (i + 1, j, k), "boundary_sign": -1},
-                {"direction": "x", "index": (i, j, k), "boundary_sign": -1},
-            ]
-
-        # face_direction == "z"
-        #
-        # Local coordinates:
-        # u = x, v = y
-        #
-        # e_x x e_y = e_z
-        return [
-            {"direction": "x", "index": (i, j, k), "boundary_sign": 1},
-            {"direction": "y", "index": (i + 1, j, k), "boundary_sign": 1},
-            {"direction": "x", "index": (i, j + 1, k), "boundary_sign": -1},
-            {"direction": "y", "index": (i, j, k), "boundary_sign": -1},
-        ]
-
-    def _get_face_boundary_intersections(self, grid_type, face_direction, index):
-        """
-        Return unique resolved interface intersections on a face boundary.
-
-        Coincident intersections at a face corner are grouped into one
-        geometric point while the individual edge-hit information is
-        preserved.
-        """
-        boundary_edges = self._get_face_boundary_edges(grid_type, face_direction, index)
+        normal_axis = "xyz".index(face_direction)
+        a, b = (normal_axis + 1) % 3, (normal_axis + 2) % 3
+        coordinates = self._get_grid_coordinates(grid_type)
         intersections = self.interface_intersections[grid_type]
-        raw_hits = []
-        edge_lengths = []
 
-        for boundary_order, edge in enumerate(boundary_edges):
-            direction = edge["direction"]
-            edge_index = edge["index"]
-            boundary_sign = edge["boundary_sign"]
+        # Corners counter-clockwise about the face normal (e_a x e_b = e_n);
+        # boundary edge m runs from corner m to corner m + 1, so a point at
+        # boundary parameter m + t lies on it at fraction t.
+        corner_indices = []
+        for da, db in ((0, 0), (1, 0), (1, 1), (0, 1)):
+            corner = list(index)
+            corner[a] += da
+            corner[b] += db
+            corner_indices.append(tuple(corner))
+        corners = np.array(
+            [[coordinates[d][c[d]] for d in range(3)] for c in corner_indices],
+            dtype=float,
+        )
 
-            start_point, end_point = self._get_edge_endpoints(
-                grid_type, direction, edge_index
-            )
-
-            edge_length = np.linalg.norm(end_point - start_point)
-            edge_lengths.append(edge_length)
-
-            if not intersections[direction]["has_crossing"][edge_index]:
+        cut_points = []
+        for m in range(4):
+            c0, c1 = corner_indices[m], corner_indices[(m + 1) % 4]
+            axis = next(d for d in range(3) if c0[d] != c1[d])
+            forward = c1[axis] > c0[axis]
+            edge = c0 if forward else c1
+            data = intersections["xyz"[axis]]
+            if not data["has_crossing"][edge]:
                 continue
-
-            intersection_data = intersections[direction]
-            alpha = float(intersection_data["alpha"][edge_index])
-            point = start_point + alpha * (end_point - start_point)
-
-            if boundary_sign > 0:
-                local_boundary_coordinate = alpha
-            else:
-                local_boundary_coordinate = 1.0 - alpha
-
-            raw_hits.append(
+            alpha = float(data["alpha"][edge])
+            start, end = (m, (m + 1) % 4) if forward else ((m + 1) % 4, m)
+            cut_points.append(
                 {
-                    "point": point,
-                    "boundary_parameter": boundary_order + local_boundary_coordinate,
-                    "surface_id": int(intersection_data["surface_id"][edge_index]),
-                    "normal": np.asarray(
-                        intersection_data["normal"][edge_index], dtype=float
-                    ),
-                    "multiple_crossing_positions": bool(
-                        intersection_data["multiple_crossing_positions"][edge_index]
-                    ),
+                    "point": corners[start] + alpha * (corners[end] - corners[start]),
+                    "parameter": m + (alpha if forward else 1.0 - alpha),
+                    "surface_id": int(data["surface_id"][edge]),
+                    "normal": data["normal"][edge],
+                    "multiple": bool(data["multiple_crossing_positions"][edge]),
                 }
             )
 
-        if not raw_hits:
-            return []
-
-        point_tolerance = 1e-8 * max(edge_lengths)
-
-        raw_hits.sort(key=lambda hit: hit["boundary_parameter"])
-        point_groups = []
-
-        for hit in raw_hits:
-            matching_group = None
-
-            for group in point_groups:
-                if np.linalg.norm(hit["point"] - group["point"]) <= point_tolerance:
-                    matching_group = group
+        # Cut points of two edges at their shared corner are one point.
+        tolerance = 1e-8 * np.max(
+            np.linalg.norm(np.roll(corners, -1, 0) - corners, axis=1)
+        )
+        groups = []
+        for cut in sorted(cut_points, key=lambda cut: cut["parameter"]):
+            for group in groups:
+                if np.linalg.norm(cut["point"] - group["point"]) <= tolerance:
+                    group["cuts"].append(cut)
+                    group["parameter"] = min(group["parameter"], cut["parameter"])
                     break
-
-            if matching_group is None:
-                point_groups.append(
+            else:
+                groups.append(
                     {
-                        "point": (hit["point"].copy()),
-                        "boundary_parameter": (hit["boundary_parameter"]),
-                        "hits": [hit],
+                        "point": cut["point"],
+                        "parameter": cut["parameter"],
+                        "cuts": [cut],
                     }
                 )
-            else:
-                matching_group["hits"].append(hit)
+        groups.sort(key=lambda group: group["parameter"])
 
-                matching_group["boundary_parameter"] = min(
-                    matching_group["boundary_parameter"], hit["boundary_parameter"]
-                )
-
-        point_groups.sort(key=lambda group: group["boundary_parameter"])
-
-        return point_groups
-
-    def _get_face_intersection_segment(self, grid_type, face_direction, index):
-        """
-        Reconstruct one simple interface segment crossing a grid face.
-
-        Only faces with exactly two unique boundary-intersection points
-        belonging to one common STL surface are resolved; other cases are
-        returned as unresolved.
-
-        The returned segment orientation follows the order of the
-        boundary-intersection points. It is purely geometric, not the
-        oriented boundary direction of Stokes' theorem.
-        """
-        point_groups = self._get_face_boundary_intersections(
-            grid_type, face_direction, index
-        )
-
-        result = {
-            "resolved": False,
-            "point_groups": point_groups,
-            "length": np.nan,
-            "surface_id": -1,
-            "normal": None,
+        if len(groups) != 2 or any(
+            cut["multiple"] for group in groups for cut in group["cuts"]
+        ):
+            return None, None
+        common = {cut["surface_id"] for cut in groups[0]["cuts"]} & {
+            cut["surface_id"] for cut in groups[1]["cuts"]
         }
+        if len(common) != 1:
+            return None, None
 
-        # Resolved case: exactly two distinct boundary-intersection positions.
-        if len(point_groups) != 2:
-            return result
-
-        # Reject an edge for which more than one crossing position
-        # existed inside the same grid edge.
-        for group in point_groups:
-            if any(hit["multiple_crossing_positions"] for hit in group["hits"]):
-                return result
-
-        surface_ids_0 = {hit["surface_id"] for hit in point_groups[0]["hits"]}
-        surface_ids_1 = {hit["surface_id"] for hit in point_groups[1]["hits"]}
-        common_surface_ids = surface_ids_0 & surface_ids_1
-
-        # For now only resolve an unambiguous interface surface.
-        if len(common_surface_ids) != 1:
-            return result
-
-        surface_id = next(iter(common_surface_ids))
-        length = float(
-            np.linalg.norm(point_groups[1]["point"] - point_groups[0]["point"])
-        )
-
-        # Mean facet normal of the selected STL surface (None if the facet
-        # normals cancel).
+        surface_id = common.pop()
         mean_normal = np.mean(
             [
-                hit["normal"]
-                for group in point_groups
-                for hit in group["hits"]
-                if hit["surface_id"] == surface_id
+                cut["normal"]
+                for group in groups
+                for cut in group["cuts"]
+                if cut["surface_id"] == surface_id
             ],
             axis=0,
         )
         norm = np.linalg.norm(mean_normal)
-        normal = mean_normal / norm if norm > 0.0 else None
+        segment = {
+            "surface_id": surface_id,
+            "length": float(np.linalg.norm(groups[1]["point"] - groups[0]["point"])),
+            "normal": mean_normal / norm if norm > 0.0 else None,
+        }
 
-        result.update(
-            {
-                "resolved": True,
-                "length": length,
-                "surface_id": int(surface_id),
-                "normal": normal,
-            }
-        )
-
-        return result
-
-    def _get_face_corners(self, grid_type, face_direction, index):
-        """
-        Return the four corners of one grid face in positive boundary order.
-
-        The ordering is counter-clockwise with respect to the positive
-        face normal.
-        """
-        x, y, z = self._get_grid_coordinates(grid_type)
+        # Both sides: from one cut point along the boundary, through the
+        # corners passed, to the other cut point.
         region_ids = self.region_ids[grid_type]
-        i, j, k = (int(value) for value in index)
-
-        if face_direction == "x":
-            corner_indices = [
-                (i, j, k),
-                (i, j + 1, k),
-                (i, j + 1, k + 1),
-                (i, j, k + 1),
-            ]
-        elif face_direction == "y":
-            corner_indices = [
-                (i, j, k),
-                (i, j, k + 1),
-                (i + 1, j, k + 1),
-                (i + 1, j, k),
-            ]
-        else:
-            corner_indices = [
-                (i, j, k),
-                (i + 1, j, k),
-                (i + 1, j + 1, k),
-                (i, j + 1, k),
-            ]
-
-        corners = []
-
-        for boundary_parameter, corner_index in enumerate(corner_indices):
-            ci, cj, ck = corner_index
-
-            corners.append(
+        face_area = self._polygon_area(corners[:, [a, b]])
+        polygons = []
+        for p, q in ((groups[0], groups[1]), (groups[1], groups[0])):
+            start, end = p["parameter"], q["parameter"]
+            if end <= start:
+                end += 4.0
+            # Corner m lies at boundary parameter m, unwrapped past start.
+            unwrapped = sorted((m + 4.0 if m <= start else m, m) for m in range(4))
+            passed = [m for parameter, m in unwrapped if start < parameter < end]
+            regions = {int(region_ids[corner_indices[m]]) for m in passed}
+            if len(regions) != 1:
+                return segment, None
+            vertices = np.array([p["point"], *corners[passed], q["point"]])
+            area = self._polygon_area(vertices[:, [a, b]])
+            if area <= 1e-12 * face_area:
+                return segment, None
+            polygons.append(
                 {
-                    "point": np.array([x[ci], y[cj], z[ck]], dtype=float),
-                    "region_id": int(region_ids[corner_index]),
-                    "boundary_parameter": float(boundary_parameter),
+                    "region_id": regions.pop(),
+                    "vertices": vertices,
+                    "area_fraction": area / face_area,
                 }
             )
 
-        return corners
-
-    @staticmethod
-    def _compute_face_polygon_area(vertices, face_direction):
-        """
-        Compute the area of a polygon lying in one coordinate-aligned grid face.
-        """
-        vertices = np.asarray(vertices, dtype=float)
-
-        if len(vertices) < 3:
-            return 0.0
-
-        if face_direction == "x":
-            points_2d = vertices[:, [1, 2]]
-        elif face_direction == "y":
-            points_2d = vertices[:, [2, 0]]
-        else:
-            points_2d = vertices[:, [0, 1]]
-
-        u = points_2d[:, 0]
-        v = points_2d[:, 1]
-        signed_area = 0.5 * (np.dot(u, np.roll(v, -1)) - np.dot(v, np.roll(u, -1)))
-
-        return float(abs(signed_area))
-
-    @staticmethod
-    def _get_face_boundary_path(corners, start_group, end_group):
-        """
-        Return the positive face-boundary path from one intersection
-        point to another, including all face corners encountered.
-
-        The face boundary is parameterized periodically over [0, 4).
-        If the path crosses the parameter wrap-around at 4 -> 0, corner
-        parameters are shifted by one period and explicitly sorted before
-        the polygon path is assembled.
-        """
-        start_parameter = float(start_group["boundary_parameter"])
-        end_parameter = float(end_group["boundary_parameter"])
-
-        if end_parameter <= start_parameter:
-            end_parameter += 4.0
-
-        vertices = [np.asarray(start_group["point"], dtype=float)]
-
-        # Map all face corners onto the same unwrapped boundary
-        # interval as start_parameter -> end_parameter.
-        #
-        # The original corner list always has the geometric order
-        #
-        #     0, 1, 2, 3
-        #
-        # but after a periodic wrap the correct path may instead be
-        #
-        #     3, 0
-        #
-        # or
-        #
-        #     2, 3, 0, 1.
-        #
-        # Therefore the shifted boundary parameters must be sorted
-        # explicitly before constructing the polygon boundary.
-
-        path_corner_candidates = []
-
-        for corner in corners:
-            parameter = float(corner["boundary_parameter"])
-
-            if parameter <= start_parameter:
-                parameter += 4.0
-
-            if start_parameter < parameter < end_parameter:
-                path_corner_candidates.append((parameter, corner))
-
-        path_corner_candidates.sort(key=lambda item: item[0])
-        path_corners = [corner for _, corner in path_corner_candidates]
-
-        for corner in path_corners:
-            vertices.append(np.asarray(corner["point"], dtype=float))
-
-        vertices.append(np.asarray(end_group["point"], dtype=float))
-
-        return (np.asarray(vertices, dtype=float), path_corners)
-
-    def _split_face_by_interface(self, grid_type, face_direction, index):
-        """
-        Split one rectangular grid face into two region polygons.
-
-        Handles a single resolved interface segment with exactly two
-        distinct boundary-intersection points. Material treatment is not
-        performed here.
-
-        Returns both geometric region polygons together with their areas
-        and the orientation of the cut segment on each polygon boundary.
-        """
-        segment = self._get_face_intersection_segment(grid_type, face_direction, index)
-
-        result = {"resolved": False, "segment": segment, "polygons": []}
-
-        if not segment["resolved"]:
-            return result
-
-        point_groups = segment["point_groups"]
-
-        corners = self._get_face_corners(grid_type, face_direction, index)
-
-        # Full rectangular face area.
-        corner_points = np.asarray([corner["point"] for corner in corners], dtype=float)
-        face_area = self._compute_face_polygon_area(corner_points, face_direction)
-
-        if face_area <= 0.0:
-            return result
-
-        p0_group = point_groups[0]
-        p1_group = point_groups[1]
-
-        # Polygon 0:
-        #
-        # p0 -> positive outer boundary -> p1
-        # then interface p1 -> p0
-        (path_0, corners_0) = self._get_face_boundary_path(corners, p0_group, p1_group)
-
-        # Polygon 1:
-        #
-        # p1 -> positive outer boundary -> p0
-        # then interface p0 -> p1
-        (path_1, corners_1) = self._get_face_boundary_path(corners, p1_group, p0_group)
-
-        # Each region must contain at least one actual
-        # face corner away from the interface.
-        if not corners_0 or not corners_1:
-            return result
-
-        region_ids_0 = {corner["region_id"] for corner in corners_0}
-        region_ids_1 = {corner["region_id"] for corner in corners_1}
-
-        # Require one unique effective region on each side of the interface.
-        if len(region_ids_0) != 1 or len(region_ids_1) != 1:
-            return result
-
-        region_id_0 = next(iter(region_ids_0))
-        region_id_1 = next(iter(region_ids_1))
-
-        if region_id_0 == region_id_1:
-            return result
-
-        area_0 = self._compute_face_polygon_area(path_0, face_direction)
-        area_1 = self._compute_face_polygon_area(path_1, face_direction)
-        area_tolerance = 1e-12 * face_area
-
-        if area_0 <= area_tolerance or area_1 <= area_tolerance:
-            return result
-
-        if not np.isclose(area_0 + area_1, face_area, rtol=1e-10, atol=area_tolerance):
-            return result
-
-        polygons = [
-            {
-                "region_id": int(region_id),
-                "vertices": path,
-                "area_fraction": float(area / face_area),
-            }
-            for region_id, path, area in (
-                (region_id_0, path_0, area_0),
-                (region_id_1, path_1, area_1),
-            )
-        ]
-
-        result.update({"resolved": True, "polygons": polygons})
-
-        return result
+        if polygons[0]["region_id"] == polygons[1]["region_id"]:
+            return segment, None
+        return segment, polygons
 
     def _build_interface_face_data(self):
         """
-        Build geometric conformal-interface data for all candidate faces.
+        Build the interface segments and split polygons of all grid faces
+        with a cut boundary edge.
 
-        The grid layer stores geometry and region IDs only. Material
-        interpretation is intentionally deferred to the solver.
+        The grid layer stores geometry and region IDs only; the solver
+        interprets them in terms of materials.
         """
         self.interface_face_data = {"primal": {}, "dual": {}}
 
-        for grid_type in ("primal", "dual"):
-            for face_direction in ("x", "y", "z"):
-                candidate = np.asarray(
-                    self.face_candidate_masks[grid_type][face_direction], dtype=bool
-                )
+        def edge_pair(cut, axis):
+            # The two parallel boundary edges of each face along ``axis``.
+            low = [slice(None)] * 3
+            high = [slice(None)] * 3
+            low[axis], high[axis] = slice(None, -1), slice(1, None)
+            return cut[tuple(low)] | cut[tuple(high)]
 
-                resolved = np.zeros_like(candidate, dtype=bool)
+        for grid_type in ("primal", "dual"):
+            intersections = self.interface_intersections[grid_type]
+            for normal_axis, face_direction in enumerate("xyz"):
+                a, b = (normal_axis + 1) % 3, (normal_axis + 2) % 3
+                candidate = edge_pair(
+                    intersections["xyz"[a]]["has_crossing"], b
+                ) | edge_pair(intersections["xyz"[b]]["has_crossing"], a)
+
+                resolved = np.zeros_like(candidate)
                 segments = {}
                 polygons = {}
                 region_area_fractions = {}
 
-                for index_array in np.argwhere(candidate):
-                    index = tuple(int(value) for value in index_array)
-                    split = self._split_face_by_interface(
-                        grid_type, face_direction, index
-                    )
-                    segment = split["segment"]
+                for index in np.argwhere(candidate):
+                    index = tuple(int(value) for value in index)
+                    segment, split = self._split_face(grid_type, face_direction, index)
 
-                    # Keep a reconstructed segment even if the polygon split
-                    # fails, so that the SIBC can detect unresolved faces.
-                    if segment["resolved"]:
-                        segments[index] = {
-                            key: segment[key]
-                            for key in ("surface_id", "length", "normal")
-                        }
-
-                    if not split["resolved"]:
+                    # Keep a segment even if the split fails, so that the
+                    # SIBC can detect unresolved faces.
+                    if segment is not None:
+                        segments[index] = segment
+                    if split is None:
                         continue
 
                     resolved[index] = True
-                    polygons[index] = split["polygons"]
+                    polygons[index] = split
                     region_area_fractions[index] = {
                         polygon["region_id"]: polygon["area_fraction"]
-                        for polygon in split["polygons"]
+                        for polygon in split
                     }
 
                 self.interface_face_data[grid_type][face_direction] = {
@@ -1238,8 +864,7 @@ class ConformalGridMixin:
         # Warn about thin features and inconsistent STL crossings.
         self._warn_interface_diagnostics()
 
-        # Build masks of grid faces adjacent to resolved interface edges
-        self._build_face_candidate_masks()
+        # Split the grid faces crossed by an interface.
         self._build_interface_face_data()
 
 
