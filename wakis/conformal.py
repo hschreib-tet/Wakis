@@ -16,27 +16,24 @@ as mixins:
 - ``ConformalSolverMixin`` is mixed into ``SolverFIT3D`` and turns the grid
   data into effective lengths/areas and conformal material tensors.
 
-Both are only used when ``geometry_mode="conformal"``. The entry points
-are ``GridFIT3D._mark_cells_in_stl_conformal`` and
-``SolverFIT3D._apply_stl_materials_conformal``, called from the
-``_mark_cells_in_stl`` / ``_apply_stl_materials`` dispatchers.
+Both are only used when ``geometry_mode="conformal"``. The grid points
+are classified together with the staircase masks in
+``GridFIT3D._mark_cells_in_stl``, which then calls
+``_build_conformal_interfaces``; the solver entry point is
+``SolverFIT3D._apply_stl_materials_conformal``.
 """
 
-import itertools
 import warnings
 
 import numpy as np
-import pyvista as pv
 from scipy.constants import epsilon_0 as eps_0
 from scipy.constants import mu_0 as mu_0
 
 # Import only the needed VTK modules: the full ``import vtk`` loads modules
-# whose factory overrides change PyVista filters used elsewhere in Wakis
-# (point_data_to_cell_data then returns truncated uint8 averages, which
-# shrinks the staircase STL masks).
+# whose factory overrides can change the results of PyVista filters used
+# elsewhere in Wakis (see ImpedanCEI/Wakis#123).
 from vtkmodules.vtkCommonCore import vtkIdList, vtkPoints
 from vtkmodules.vtkCommonDataModel import vtkStaticCellLocator
-from vtkmodules.vtkFiltersModeling import vtkSelectEnclosedPoints
 
 from .field import Field
 from .materials import material_lib
@@ -101,88 +98,6 @@ class ConformalGridMixin:
         if grid_type == "primal":
             return self.x, self.y, self.z
         return self.tx, self.ty, self.tz
-
-    @staticmethod
-    def _classify_points_in_stl(surf, points, method, stl_tolerance, check_surface):
-        """
-        Classify single points (rows of ``points``) with respect to an STL.
-
-        ``check_surface`` lets PyVista verify that ``surf`` is closed; it is
-        False only for surfaces already known to be open (a warning has been
-        issued). Point lists are not on an image grid, so
-        ``voxelize_rectilinear`` falls back to ``interior_points`` here.
-        """
-        cloud = pv.PolyData(np.asarray(points, dtype=float))
-
-        if method == "implicit_distance":
-            distance = cloud.compute_implicit_distance(surf)["implicit_distance"]
-            return np.asarray(distance) <= 0.0
-
-        selected = cloud.select_interior_points(
-            surf,
-            method="cell_locator",
-            locator_tolerance=stl_tolerance,
-            check_surface=check_surface,
-        )
-        return np.asarray(selected["selected_points"], dtype=bool)
-
-    def _classify_primal_points_in_stl(
-        self, surf, method, stl_tolerance, progress_bar, check_surface
-    ):
-        """
-        Classify all primal grid points with respect to an STL surface.
-
-        Returns a boolean mask with shape (Nx, Ny, Nz).
-        """
-        x, y, z = self.x, self.y, self.z
-        shape = (len(x), len(y), len(z))
-
-        if method != "voxelize_rectilinear":
-            xx, yy, zz = np.meshgrid(x, y, z, indexing="ij")
-            points = np.column_stack((xx.ravel(), yy.ravel(), zz.ravel()))
-            return self._classify_points_in_stl(
-                surf, points, method, stl_tolerance, check_surface
-            ).reshape(shape)
-
-        spacings = []
-        for coords in (x, y, z):
-            differences = np.diff(coords)
-            if not np.allclose(differences, differences[0]):
-                raise ValueError(
-                    "voxelize_rectilinear requires uniformly spaced grid coordinates."
-                )
-            spacings.append(float(differences[0]))
-
-        reference_volume = pv.ImageData(
-            dimensions=shape, origin=(x[0], y[0], z[0]), spacing=tuple(spacings)
-        )
-        vox = surf.voxelize_rectilinear(
-            reference_volume=reference_volume, progress_bar=progress_bar
-        )
-        voxel_mask = np.asarray(vox.cell_data["mask"], dtype=bool)
-        if voxel_mask.size != np.prod(shape):
-            raise RuntimeError(
-                f"Unexpected voxelize_rectilinear mask size {voxel_mask.size}; "
-                f"expected {np.prod(shape)}."
-            )
-        return np.reshape(voxel_mask, shape, order="F")
-
-    def _count_inside_corners(self, primal_mask):
-        """
-        Number of inside primal neighbours of every dual point.
-
-        Each dual point lies between up to 8 primal points: the 8 corners of
-        its cell, or 4, 2 or 1 on the domain boundary. Edge padding repeats
-        the boundary nodes, so boundary dual points count their real
-        neighbours repeatedly and reach 0 or 8 when these agree. For the
-        interior dual points this is the corner count of their cell.
-        """
-        shape = (self.Nx + 1, self.Ny + 1, self.Nz + 1)
-        padded = np.pad(np.asarray(primal_mask, dtype=np.uint8), 1, mode="edge")
-        count = np.zeros(shape, dtype=np.uint8)
-        for a, b, c in itertools.product((0, 1), repeat=3):
-            count += padded[a : a + shape[0], b : b + shape[1], c : c + shape[2]]
-        return count
 
     def _build_region_maps(self):
         """
@@ -1641,128 +1556,6 @@ class ConformalGridMixin:
                         f"{len(segments)} segments, "
                         f"{np.count_nonzero(resolved)} resolved splits"
                     )
-
-    def _mark_cells_in_stl_conformal(self, method):
-        """
-        Generate conformal STL masks on the primal and dual FIT grids.
-
-        The primal grid points are classified with the selected STL method.
-        Dual points take the value of their primal neighbours where these
-        agree for every solid and are classified exactly where they differ for
-        any solid (next to a surface). The cell mask stored in
-        ``self.grid[key]`` follows from the same corner count (at least 5 of
-        8 corners inside).
-
-        Parameters
-        ----------
-        method : str
-            STL classification method. Supported methods are
-            "legacy", "interior_points", "implicit_distance",
-            and "voxelize_rectilinear".
-        """
-        stl_tolerance = (
-            np.min([np.min(self.dx), np.min(self.dy), np.min(self.dz)]) * self.stl_tol
-        )
-
-        progress_bar = False
-        if self.verbose > 1:
-            progress_bar = True
-
-        method = method.lower()
-
-        valid_methods = (
-            "legacy",
-            "interior_points",
-            "implicit_distance",
-            "voxelize_rectilinear",
-        )
-
-        if method not in valid_methods:
-            raise ValueError(
-                f"[!] Error: stl_method {method} not recognized. "
-                "Use 'legacy', 'interior_points', "
-                "'implicit_distance', or "
-                "'voxelize_rectilinear'."
-            )
-
-        # Primal points: every solid with the selected STL method.
-        surfaces, closed, corner_counts = {}, {}, {}
-        for key in self.stl_solids.keys():
-            surf = self.read_stl(key)
-
-            if self.verbose:
-                print(f" * Marking grid points inside STL solid '{key}'...")
-
-            # Inside/outside is only well defined for a closed surface. Test it
-            # once per solid (same VTK check PyVista uses) and warn, instead of
-            # silently retrying without the check on any exception.
-            check_surface = bool(vtkSelectEnclosedPoints.IsSurfaceClosed(surf))
-            if not check_surface:
-                warnings.warn(
-                    f"STL solid '{key}' is not a closed surface; grid points are "
-                    "classified without the closed-surface check. Repair the STL "
-                    "if the material masks look wrong.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-
-            primal_mask = self._classify_primal_points_in_stl(
-                surf, method, stl_tolerance, progress_bar, check_surface
-            )
-            self.primal_point_masks[key] = primal_mask
-            surfaces[key], closed[key] = surf, check_surface
-            corner_counts[key] = self._count_inside_corners(primal_mask)
-
-            # Cell mask for plots, overlap checks and HDF5: at least 5 of the
-            # 8 corners inside. Dual point (i+1, j+1, k+1) is the centre of
-            # cell (i, j, k); the high-side ghost cells repeat the boundary.
-            self.grid[key] = np.reshape(
-                corner_counts[key][1:, 1:, 1:] >= 5, self.Nx * self.Ny * self.Nz
-            )
-
-        # Dual points take the value of their primal neighbours where these
-        # agree. They are classified exactly wherever the neighbours disagree
-        # for any solid: a layer thinner than a cell can lie between corners
-        # that are all outside it, but its neighbours on both sides differ.
-        near_surface = np.zeros((self.Nx + 1, self.Ny + 1, self.Nz + 1), dtype=bool)
-        for count in corner_counts.values():
-            near_surface |= (count > 0) & (count < 8)
-        i, j, k = np.nonzero(near_surface)
-        points = np.column_stack((self.tx[i], self.ty[j], self.tz[k]))
-
-        for key in self.stl_solids.keys():
-            dual_mask = corner_counts[key] == 8
-            if len(points):
-                dual_mask[near_surface] = self._classify_points_in_stl(
-                    surfaces[key], points, method, stl_tolerance, closed[key]
-                )
-            self.dual_point_masks[key] = dual_mask
-
-        for key in self.stl_solids.keys():
-            # Diagnostics
-            if self.verbose and np.sum(self.grid[key]) == 0:
-                print(
-                    f"[!] Warning: no cells were marked "
-                    f"inside STL solid '{key}'. "
-                    "Consider checking the STL geometry, "
-                    "classification method, or grid resolution."
-                )
-
-            if self.verbose:
-                print(
-                    f"    * STL solid {key}: "
-                    f"{np.sum(self.primal_point_masks[key])} "
-                    "primal points, "
-                    f"{np.sum(self.grid[key])} "
-                    "cell centers, and "
-                    f"{np.sum(self.dual_point_masks[key])} "
-                    "dual points marked inside the solid."
-                )
-
-        # Build material-region topology and the cut-cell geometry.
-        #
-        # Must be done only after all STL point masks are available.
-        self._build_conformal_interfaces()
 
     def _build_conformal_interfaces(self):
         """

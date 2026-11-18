@@ -10,6 +10,7 @@ import h5py
 import numpy as np
 import pyvista as pv
 from scipy.optimize import least_squares
+from vtkmodules.vtkFiltersModeling import vtkSelectEnclosedPoints
 
 from .conformal import ConformalGridMixin
 from .field import Field
@@ -817,6 +818,18 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
             if self.verbose:
                 print(f" * Marking cells inside STL solid '{key}'...")
 
+            # Inside/outside is only defined for a closed surface (no boundary
+            # or non-manifold edges); classify anyway, but tell the user.
+            closed = bool(vtkSelectEnclosedPoints.IsSurfaceClosed(surf))
+            if not closed:
+                warnings.warn(
+                    f"STL solid '{key}' is not a closed surface; grid points are "
+                    "classified without the closed-surface check. Repair the STL "
+                    "if the material masks look wrong.",
+                    UserWarning,
+                    stacklevel=3,
+                )
+
             # mark cells in stl [True == in stl, False == out stl]
             if method.lower() == "voxelize_rectilinear":
                 # Perform solid voxelization and extract detected voxels mask
@@ -828,21 +841,12 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
                 )
 
             elif method.lower() == "legacy":
-                try:
-                    classified_grid = reference_volume.select_interior_points(
-                        surf, method="cell_locator", locator_tolerance=stl_tolerance
-                    )
-                except RuntimeError:
-                    classified_grid = reference_volume.select_interior_points(
-                        surf,
-                        method="cell_locator",
-                        locator_tolerance=stl_tolerance,
-                        check_surface=False,
-                    )
-                    if self.verbose > 1:
-                        print(
-                            f"[!] Warning: stl solid {key} may have issues with closed surfaces. Consider checking the STL file."
-                        )
+                classified_grid = reference_volume.select_interior_points(
+                    surf,
+                    method="cell_locator",
+                    locator_tolerance=stl_tolerance,
+                    check_surface=closed,
+                )
                 mask = np.asarray(
                     classified_grid.point_data["selected_points"]
                 ).reshape(reference_volume.dimensions, order="F")
@@ -872,7 +876,17 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
             dual_mask.to_matrix("z")[:-1, :-1, :] = mask[1::2, 1::2, ::2]
             self.dual_masks[key] = dual_mask
 
-            self._check_thin_features(key, mask)
+            if self.geometry_mode == "conformal":
+                # The conformal point masks lie on the same lattice: primal
+                # nodes at even indices; dual points are the cell centres (odd
+                # indices) and their projections onto the domain faces.
+                self.primal_point_masks[key] = mask[::2, ::2, ::2].astype(bool)
+                dual_index = [np.r_[0, 1 : n - 1 : 2, n - 1] for n in mask.shape]
+                self.dual_point_masks[key] = mask[np.ix_(*dual_index)].astype(bool)
+            else:
+                # Conformal grids report thin features from the exact STL
+                # crossings instead (_warn_interface_diagnostics).
+                self._check_thin_features(key, mask)
 
             solid_mask = primal_mask.array
             del mask, classified_grid
@@ -889,7 +903,7 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
                 )
 
         if self.geometry_mode == "conformal":
-            self._mark_cells_in_stl_conformal(method)
+            self._build_conformal_interfaces()
 
     def _check_thin_features(self, key, mask):
         """Report under-resolved solid features sampled only at edge midpoints."""
