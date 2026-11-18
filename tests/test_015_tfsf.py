@@ -152,8 +152,7 @@ def test_serial_tfsf_injection_lifecycle():
     assert np.any(solver.E.toarray())
 
 
-@pytest.fixture(params=["legacy", "voxelize_rectilinear"])
-def straight_pipe_grid(tmp_path, request):
+def _straight_pipe_grid(tmp_path, **kwargs):
     """Circular vacuum pipe extending beyond both longitudinal boundaries."""
     path = tmp_path / "pipe.stl"
     pv.Cylinder(
@@ -175,9 +174,14 @@ def straight_pipe_grid(tmp_path, request):
         81,
         stl_solids={"pipe": str(path)},
         stl_materials={"pipe": "vacuum"},
-        stl_method=request.param,
         verbose=0,
+        **kwargs,
     )
+
+
+@pytest.fixture(params=["legacy", "voxelize_rectilinear"])
+def straight_pipe_grid(tmp_path, request):
+    return _straight_pipe_grid(tmp_path, stl_method=request.param)
 
 
 @pytest.mark.parametrize(
@@ -246,6 +250,48 @@ def test_straight_pipe_wake(tmp_path, straight_pipe_grid, dtype):
     dc_tolerance = 0.1 if dtype == np.float32 else 0.005
     assert abs(wake.Zx[0]) < dc_tolerance
     assert abs(wake.Zy[0]) < dc_tolerance
+
+
+def test_tfsf_conformal_no_static_remnant(tmp_path):
+    """TF/SF injection into a conformal straight pipe leaves no static field.
+
+    The injected transverse fields must use the cut edge lengths
+    ``solver.L``: with the uncut grid lengths they violate the discrete
+    Faraday law at the wall edges, and a static magnetic field of about
+    57 A/m remains at both injection planes after the bunch has left (the
+    wake itself is unaffected). Propagating fields are absorbed by the CPML,
+    so the remaining field is small (measured: 0.035 A/m).
+    """
+    grid = _straight_pipe_grid(
+        tmp_path,
+        geometry_mode="conformal",
+        bg_material_type="pec",
+        conformal_stabilization="area_floor",
+    )
+    wake = WakeSolver(
+        q=1e-9,
+        sigmaz=0.03,
+        xsource=0.02,
+        xtest=0.0,
+        skip_cells=9,
+        save=False,
+        verbose=0,
+        results_folder=str(tmp_path),
+        Ez_file=str(tmp_path / "Ez.h5"),
+    )
+    solver = SolverFIT3D(
+        grid,
+        wake,
+        use_stl=True,
+        bg="pec",
+        bc_low=["pec", "pec", "cpml"],
+        bc_high=["pec", "pec", "cpml"],
+        n_pml=6,
+        dtype=np.float64,
+        verbose=0,
+    )
+    solver.wakesolve(wakelength=1.5, plot=False)
+    assert np.abs(solver.H.toarray()).max() < 1.0
 
 
 def test_tfsf_matches_serial_across_mpi_boundary():
