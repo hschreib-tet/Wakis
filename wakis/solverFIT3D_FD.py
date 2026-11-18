@@ -70,9 +70,6 @@ class SolverFIT3D_FD(
         if not self.use_stl or self.grid.geometry_mode != "conformal":
             return active
 
-        if not self.region_material_types:
-            self._build_region_material_types()
-
         for component, direction in enumerate(("x", "y", "z")):
             start_ids, end_ids = self.grid._get_edge_region_ids("primal", direction)
             conductor_ids = [
@@ -104,12 +101,12 @@ class SolverFIT3D_FD(
                 & (alpha_fraction <= 0.0)
             )
 
-            unresolved_stored = self._edge_array_to_field_component(
-                unresolved, direction
+            unresolved_stored = self._geometry_array_to_field_component(
+                unresolved, "primal_edge", direction
             )
 
-            zero_length_stored = self._edge_array_to_field_component(
-                zero_length, direction
+            zero_length_stored = self._geometry_array_to_field_component(
+                zero_length, "primal_edge", direction
             )
 
             n_unresolved = np.count_nonzero(unresolved_stored)
@@ -144,7 +141,9 @@ class SolverFIT3D_FD(
                 )
 
                 if np.any(
-                    self._edge_array_to_field_component(unresolved_sibc, direction)
+                    self._geometry_array_to_field_component(
+                        unresolved_sibc, "primal_edge", direction
+                    )
                 ):
                     raise RuntimeError(
                         f"Unresolved SIBC geometry on stored {direction}-edges."
@@ -165,8 +164,8 @@ class SolverFIT3D_FD(
                     f"stored {direction}-edges."
                 )
 
-            active_component = self._edge_array_to_field_component(
-                ~fully_conductor, direction
+            active_component = self._geometry_array_to_field_component(
+                ~fully_conductor, "primal_edge", direction
             )
             active[component * self.N : (component + 1) * self.N] = (
                 active_component.ravel(order="F")
@@ -312,7 +311,7 @@ class SolverFIT3D_FD(
 
         Stored magnetic unknown Hx(i,j,k) is the flux through primal face
         (i,j,k), as defined by the curl matrix C (see
-        _primal_face_array_to_dual_edge_component). With the symmetric FIT
+        _geometry_array_to_field_component). With the symmetric FIT
         stencil every physical primal face, including the domain-boundary
         faces on both sides, has a stored magnetic DOF.
 
@@ -406,8 +405,8 @@ class SolverFIT3D_FD(
                 (self.sibc_mu_wall, mu_wall, 0.0),
                 (self.sibc_mu_field, mu_field, 1.0),
             ):
-                stored[target] = self._primal_face_array_to_dual_edge_component(
-                    values, direction, fill
+                stored[target] = self._geometry_array_to_field_component(
+                    values, "primal_face", direction, fill
                 ).ravel(order="F")
 
         self.has_sibc = bool(np.any(self.sibc_g > 0))

@@ -133,17 +133,17 @@ def test_pec_sibc_identical_before_dzs(solvers):
         conductor_conductor = start_conductor & end_conductor
 
         # Map full geometric edge arrays to stored electric DOFs.
-        nn = sibc._edge_array_to_field_component(normal_normal, direction).ravel(
-            order="C"
-        )
+        nn = sibc._geometry_array_to_field_component(
+            normal_normal, "primal_edge", direction
+        ).ravel(order="C")
 
-        nc = sibc._edge_array_to_field_component(normal_conductor, direction).ravel(
-            order="C"
-        )
+        nc = sibc._geometry_array_to_field_component(
+            normal_conductor, "primal_edge", direction
+        ).ravel(order="C")
 
-        cc = sibc._edge_array_to_field_component(conductor_conductor, direction).ravel(
-            order="C"
-        )
+        cc = sibc._geometry_array_to_field_component(
+            conductor_conductor, "primal_edge", direction
+        ).ravel(order="C")
 
         offset = component * sibc.N
         extra = extra_sibc[offset : offset + sibc.N]
