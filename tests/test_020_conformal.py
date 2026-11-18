@@ -92,7 +92,7 @@ def _pillbox_grid(stls, geometry_mode, rod=False, n_cells=20):
         int(n_cells * L / (2 * h)) + 1,
         stl_solids={key: stls[key] for key in solids},
         stl_materials={key: materials[key] for key in solids},
-        stl_method="interior_points",
+        stl_method="legacy",
         geometry_mode=geometry_mode,
         verbose=0,
         **conformal,
@@ -215,7 +215,7 @@ def _slanted_box_grid(stl_file, **kwargs):
         stl_material_types={"cav": "normal"},
         bg_material_type="pec",
         geometry_mode="conformal",
-        stl_method="interior_points",
+        stl_method="legacy",
         verbose=0,
         **kwargs,
     )
