@@ -92,35 +92,6 @@ class ConformalGridMixin:
             return self.x, self.y, self.z
         return self.tx, self.ty, self.tz
 
-    def _build_region_ids(self):
-        """
-        Assign region IDs and build them on the primal and dual grid points.
-
-        Region 0 is the background; STL solids get IDs 1, 2, ... in the
-        order of ``self.stl_solids``, and later solids overwrite earlier ones
-        where they overlap. ``region_material_types`` maps every region ID to
-        its material type; a background without ``bg_material_type`` is
-        treated as normal (the solver rejects a conductor background then).
-        """
-        self.region_id_to_key = {0: None}
-        self.region_key_to_id = {}
-        self.region_material_types = {0: self.bg_material_type or "normal"}
-
-        for region_id, key in enumerate(self.stl_solids.keys(), start=1):
-            self.region_id_to_key[region_id] = key
-            self.region_key_to_id[key] = region_id
-            self.region_material_types[region_id] = self.stl_material_types[key]
-
-        for grid_type, node_masks in (
-            ("primal", self.primal_node_masks),
-            ("dual", self.dual_node_masks),
-        ):
-            shape = tuple(len(c) for c in self._get_grid_coordinates(grid_type))
-            region_ids = np.zeros(shape, dtype=np.int32)
-            for key, region_id in self.region_key_to_id.items():
-                region_ids[np.asarray(node_masks[key], dtype=bool)] = region_id
-            self.region_ids[grid_type] = region_ids
-
     def _region_type_flags(self):
         """
         Boolean arrays indexed by region ID: normal material, and
@@ -933,8 +904,6 @@ class ConformalGridMixin:
         node masks from HDF5, so that both paths give identical cut-cell
         geometry. The STL surfaces are traced again and must be readable.
         """
-        self._build_region_ids()
-
         # Determine exact STL intersections with primal and dual edges
         #
         # This uses the geometric full-grid-line tracing developed above

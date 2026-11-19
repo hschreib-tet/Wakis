@@ -217,6 +217,7 @@ grid = GridFIT3D(xmin, xmax, ymin, ymax, zmin, zmax,
 - `stl_material_types` tells the grid which solids are PEC walls; solids with the `'pec'` material are detected automatically. `bg_material_type` must match the `bg` passed to `SolverFIT3D`; if it is omitted, the grid treats the background as a normal material, so set it to `'pec'` for a PEC background.
 - Very small cut cells at PEC walls lower the stable timestep. `conformal_stabilization='area_floor'` limits this and is recommended whenever PEC walls cut through the cells.
 - Structures thinner than a cell and inconsistent STL crossings (e.g. open surfaces) are reported in a warning; `solver.plot_mesh_materials()` shows where they are.
+- `conformal_method` selects how the intersections are computed; the default `'raytracing'` intersects the grid lines exactly with the STL triangles.
 - SIBC is not yet supported in conformal mode.
 
 The notebook `004_Conformal-geometry.ipynb` walks through a complete example and compares it with the staircase geometry.

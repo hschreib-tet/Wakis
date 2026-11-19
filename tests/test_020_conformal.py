@@ -288,12 +288,14 @@ def test_stabilization_options():
     )
     assert conformal.logger.grid["geometry_mode"] == "conformal"
     assert conformal.logger.grid["conformal_area_floor"] == pytest.approx(0.1)
+    assert conformal.logger.grid["conformal_method"] == "raytracing"
     assert "geometry_mode" not in grid.logger.grid
 
     for invalid in (
         dict(conformal_stabilization="snapping"),
         dict(conformal_stabilization="area_floor", conformal_stabilization_fraction=0),
         dict(conformal_stabilization="area_floor", conformal_min_edge_fraction=0.5),
+        dict(conformal_method="unknown"),
     ):
         with pytest.raises(ValueError):
             unit_grid(**invalid)
@@ -364,6 +366,36 @@ def test_surface_on_grid_planes(tmp_path):
         for direction in "xyz":
             _, inconsistent = grid._get_edge_diagnostic_masks(grid_type, direction)
             assert not inconsistent.any(), (grid_type, direction)
+
+
+def test_flat_field_index():
+    """The flat field index of every primal/dual edge and face is the
+    field entry the solver assigns it (including the shift of the dual
+    grid), and every DOF with a geometric counterpart is reached once."""
+    grid = GridFIT3D(0, 1, 0, 1, 0, 1, 4, 5, 6, geometry_mode="conformal", verbose=0)
+    solver = SolverFIT3D(grid, verbose=0)
+    nodes = np.array([grid.Nx, grid.Ny, grid.Nz])
+    for grid_type, kind, shift in (
+        ("primal", "edge", [-1, 0]),
+        ("primal", "face", [0, -1]),
+        ("dual", "edge", [0, 1]),
+        ("dual", "face", [1, 0]),
+    ):
+        for axis, direction in enumerate("xyz"):
+            # Geometry shape: (along axis, transverse) offset from the nodes.
+            shape = nodes + shift[1]
+            shape[axis] = nodes[axis] + shift[0]
+            geometry_id = np.arange(np.prod(shape)).reshape(shape)
+            expected = solver._geometry_array_to_field_component(
+                geometry_id, f"{grid_type}_{kind}", direction, fill_value=-1
+            ).ravel(order="F")
+
+            index = np.indices(shape).reshape(3, -1).T
+            flat = grid._flat_field_index(grid_type, kind, direction, index)
+            valid = flat >= 0
+            local = flat[valid] - axis * solver.N
+            assert np.array_equal(expected[local], geometry_id.ravel()[valid])
+            assert np.array_equal(np.sort(local), np.flatnonzero(expected >= 0))
 
 
 def test_conductor_background_type():

@@ -22,6 +22,9 @@ from .materials import (
 )
 from .plotting import PlotMixinGrid as PlotMixin
 
+# Backends computing the STL intersections in conformal mode.
+CONFORMAL_METHODS = ("raytracing",)
+
 try:
     from mpi4py import MPI
 
@@ -74,6 +77,7 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
         conformal_stabilization=None,
         conformal_stabilization_fraction=None,
         conformal_min_edge_fraction=None,
+        conformal_method="raytracing",
         load_from_h5=None,
         verbose=2,
         stl_material_types=None,
@@ -177,6 +181,10 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
             Area floor only: conductor-cut edges with a smaller active
             fraction are eliminated (E set to zero), 0 <= value < 0.5.
             Default (None) uses the area floor value.
+        conformal_method : {"raytracing"}, optional
+            Backend computing the STL intersections in conformal mode.
+            ``"raytracing"`` intersects the grid lines exactly with the STL
+            triangles. Default is ``"raytracing"``.
 
         Attributes
         ----------
@@ -255,6 +263,7 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
             conformal_stabilization_fraction,
             conformal_min_edge_fraction,
         )
+        self._set_conformal_method(conformal_method)
 
         # Geometric STL intersections with primal and dual grid edges
         self.interface_intersections = {
@@ -361,6 +370,7 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
                     "geometry_mode",
                     "stl_material_types",
                     "bg_material_type",
+                    "conformal_method",
                     "conformal_stabilization",
                     "conformal_area_floor",
                     "conformal_min_edge_fraction",
@@ -596,6 +606,7 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
                 conformal_stabilization=self.conformal_stabilization,
                 conformal_stabilization_fraction=self.conformal_area_floor,
                 conformal_min_edge_fraction=self.conformal_min_edge_fraction,
+                conformal_method=self.conformal_method,
             )
         return _grid
 
@@ -738,6 +749,7 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
                 )
 
         self._prepare_stl_material_types()
+        self._build_solid_ids()
 
         # Material library lookup and conversion to [eps, mu, sigma] format
         for key in self.stl_solids.keys():
@@ -890,7 +902,108 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
                 )
 
         if self.geometry_mode == "conformal":
+            self._build_intersections()
+
+    def _set_conformal_method(self, method):
+        """Validate and store the conformal intersection backend."""
+        method = str(method).lower()
+        if method not in CONFORMAL_METHODS:
+            raise ValueError(
+                f"conformal_method must be one of {CONFORMAL_METHODS}, got {method!r}."
+            )
+        self.conformal_method = method
+
+    def _build_solid_ids(self):
+        """
+        Number the background and the STL solids for the geometry backends.
+
+        Solid ID 0 is the background; the STL solids get IDs 1, 2, ... in
+        the order of ``self.stl_solids``, which is also their precedence
+        (later solids overwrite earlier ones). ``region_material_types`` maps
+        every ID to its material type; a background without
+        ``bg_material_type`` is treated as normal (the solver rejects a
+        conductor background then). Users keep working with the STL keys.
+        """
+        self.region_id_to_key = {0: None}
+        self.region_key_to_id = {}
+        self.region_material_types = {0: self.bg_material_type or "normal"}
+
+        for region_id, key in enumerate(self.stl_solids.keys(), start=1):
+            self.region_id_to_key[region_id] = key
+            self.region_key_to_id[key] = region_id
+            self.region_material_types[region_id] = self.stl_material_types[key]
+
+    def _build_region_ids(self):
+        """
+        Solid ID of every primal and dual node from the node masks.
+
+        This shared node classification is the input of every conformal
+        backend; later solids overwrite earlier ones where they overlap.
+        """
+        dtype = np.min_scalar_type(len(self.stl_solids))
+        for grid_type, node_masks in (
+            ("primal", self.primal_node_masks),
+            ("dual", self.dual_node_masks),
+        ):
+            shape = tuple(len(c) for c in self._get_grid_coordinates(grid_type))
+            region_ids = np.zeros(shape, dtype=dtype)
+            for key, region_id in self.region_key_to_id.items():
+                region_ids[np.asarray(node_masks[key], dtype=bool)] = region_id
+            self.region_ids[grid_type] = region_ids
+
+    def _build_intersections(self):
+        """Classify the nodes and run the selected conformal backend."""
+        self._build_region_ids()
+        if self.conformal_method == "raytracing":
             self._build_conformal_interfaces()
+
+    def _flat_field_index(self, grid_type, kind, direction, index):
+        """
+        Flat field index of primal/dual edges or faces.
+
+        Parameters
+        ----------
+        grid_type : {"primal", "dual"}
+        kind : {"edge", "face"}
+            Edges are given by their direction, faces by their normal.
+        direction : {"x", "y", "z"}
+        index : array_like of int, shape (..., 3)
+            Indices (i, j, k) into the geometry array of that edge or face
+            family, e.g. shape (Nx-1, Ny, Nz) for primal x-edges.
+
+        Returns
+        -------
+        ndarray of int64
+            Index into ``Field.array``, ``c * N + i + Nx * (j + Ny * k)``
+            for the field component c of the DOF, or -1 where the edge or
+            face has no field DOF (dual edges and faces on the low domain
+            boundary).
+
+        Notes
+        -----
+        Primal edges and faces carry the E and H DOFs at their own index.
+        The dual grid has one more node per axis, starting on the boundary,
+        so the midpoint between primal nodes i and i+1 is dual node i+1:
+        the dual x-edge (i, j+1, k+1) belongs to Hx(i, j, k), the dual
+        x-face (i+1, j, k) to Ex(i, j, k), and likewise for y and z.
+        """
+        axis = "xyz".index(direction)
+        offset = np.zeros(3, dtype=np.int64)
+        if grid_type == "dual" and kind == "edge":
+            offset[:] = 1
+            offset[axis] = 0
+        elif grid_type == "dual":
+            offset[axis] = 1
+
+        field = np.asarray(index, dtype=np.int64) - offset
+        shape = np.array([self.Nx, self.Ny, self.Nz])
+        valid = np.all((field >= 0) & (field < shape), axis=-1)
+        flat = (
+            axis * self.Nx * self.Ny * self.Nz
+            + field[..., 0]
+            + self.Nx * (field[..., 1] + self.Ny * field[..., 2])
+        )
+        return np.where(valid, flat, -1)
 
     def _check_thin_features(self, key, mask):
         """Report under-resolved solid features sampled only at edge midpoints."""
@@ -1273,6 +1386,7 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
             hf.attrs["conformal_stabilization"] = self.conformal_stabilization
             hf.attrs["conformal_area_floor"] = self.conformal_area_floor
             hf.attrs["conformal_min_edge_fraction"] = self.conformal_min_edge_fraction
+            hf.attrs["conformal_method"] = self.conformal_method
             if self.bg_material_type is not None:
                 hf.attrs["bg_material_type"] = self.bg_material_type
 
@@ -1399,6 +1513,11 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
             if "bg_material_type" in hf.attrs:
                 self.bg_material_type = str(hf.attrs["bg_material_type"])
 
+            # Grids saved before the backends were selectable used ray tracing.
+            self._set_conformal_method(
+                str(hf.attrs.get("conformal_method", "raytracing"))
+            )
+
             # ----------------------------------------------------------
             # Preserve STL ordering
             # ----------------------------------------------------------
@@ -1471,6 +1590,7 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
 
             # Fill missing types and validate the resulting dictionary.
             self._prepare_stl_material_types()
+            self._build_solid_ids()
 
         # recompute dx, dy, dz
         self.dx = np.diff(self.x)
@@ -1554,7 +1674,7 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
             if all(key in self.primal_node_masks for key in self.stl_solids) and all(
                 key in self.dual_node_masks for key in self.stl_solids
             ):
-                self._build_conformal_interfaces()
+                self._build_intersections()
 
         # add verbosity
         if self.verbose > 1:
