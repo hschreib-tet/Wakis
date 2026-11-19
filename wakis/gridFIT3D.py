@@ -14,6 +14,7 @@ from vtkmodules.vtkFiltersModeling import vtkSelectEnclosedPoints
 
 from .conformal import ConformalGridMixin
 from .field import Field
+from .intersection import IntersectionGridMixin
 from .logger import Logger
 from .materials import (
     VALID_MATERIAL_TYPES,
@@ -33,7 +34,7 @@ except ImportError:
     imported_mpi = False
 
 
-class GridFIT3D(PlotMixin, ConformalGridMixin):
+class GridFIT3D(PlotMixin, IntersectionGridMixin, ConformalGridMixin):
     """
     Store symmetric FIT grid geometry and handle STL solids using PyVista.
 
@@ -265,11 +266,11 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
         )
         self._set_conformal_method(conformal_method)
 
-        # Geometric STL intersections with primal and dual grid edges
-        self.interface_intersections = {
-            "primal": {},
-            "dual": {},
-        }
+        # Sparse STL intersections from the conformal backend (see
+        # intersection.py) and its geometry diagnostics.
+        self.edge_intersections = {}
+        self.face_intersections = {}
+        self.conformal_diagnostics = {}
 
         # Point-based STL masks on the primal and dual grids
         self.primal_node_masks = {}
@@ -285,11 +286,6 @@ class GridFIT3D(PlotMixin, ConformalGridMixin):
         self.region_id_to_key = {0: None}
         self.region_key_to_id = {}
         self.region_material_types = {}
-
-        self.interface_face_data = {
-            "primal": {},
-            "dual": {},
-        }
 
         # Grid data
         # generate from file

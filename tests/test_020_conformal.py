@@ -3,6 +3,8 @@ Conformal (cut-cell) geometry: accuracy against analytic cavity modes,
 stability of the explicit update with cut cells, and grid persistence.
 """
 
+import warnings
+
 import numpy as np
 import pytest
 import pyvista as pv
@@ -303,36 +305,70 @@ def test_stabilization_options():
 
 def test_coincident_wall(tmp_path):
     """A dielectric slab sharing one wall with the box cavity, both oblique
-    and triangulated differently. At that wall the interface is PEC|slab,
-    so its cut is represented by the slab surface, not by the coincident
-    but covered cavity surface; mixing both would leave faces uncut."""
-    for name, bounds, level in (
-        ("cav", (-0.15, 0.15, -0.11, 0.11, -0.085, 0.085), 1),
-        ("slab", (0.05, 0.15, -0.11, 0.11, -0.085, 0.085), 3),
-    ):
-        box = pv.Box(bounds=bounds, level=level).triangulate()
-        box.rotate_z(20).rotate_x(10).save(tmp_path / f"{name}.stl")
-    with pytest.warns(UserWarning, match="Conformal geometry diagnostics"):
-        grid = GridFIT3D(
-            *(-0.2, 0.2) * 3,
-            13,
-            13,
-            13,
-            stl_solids={key: str(tmp_path / f"{key}.stl") for key in ("cav", "slab")},
-            stl_materials={"cav": "vacuum", "slab": [4, 1, 0]},
-            bg_material_type="pec",
-            geometry_mode="conformal",
-            stl_method="legacy",
-            verbose=0,
-        )
+    and triangulated differently. At that wall the interface is PEC|slab, so
+    it is cut by the slab surface alone: the cut edges and faces there are
+    the same as for a cavity ending inside the slab, where only the slab
+    surface exists. Mixing in the coincident cavity surface would leave
+    faces uncut."""
+
+    def build(cavity_x_max, folder):
+        folder.mkdir()
+        for name, bounds, level in (
+            ("cav", (-0.15, cavity_x_max, -0.11, 0.11, -0.085, 0.085), 1),
+            ("slab", (0.05, 0.15, -0.11, 0.11, -0.085, 0.085), 3),
+        ):
+            box = pv.Box(bounds=bounds, level=level).triangulate()
+            box.rotate_z(20).rotate_x(10).save(folder / f"{name}.stl")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # thin features at the slab corners
+            return GridFIT3D(
+                *(-0.2, 0.2) * 3,
+                13,
+                13,
+                13,
+                stl_solids={key: str(folder / f"{key}.stl") for key in ("cav", "slab")},
+                stl_materials={"cav": "vacuum", "slab": [4, 1, 0]},
+                bg_material_type="pec",
+                geometry_mode="conformal",
+                stl_method="legacy",
+                verbose=0,
+            )
+
+    grid = build(0.15, tmp_path / "coincident")
+    reference = build(0.10, tmp_path / "reference")
     slab = grid.region_key_to_id["slab"]
-    for direction in "xyz":
-        start, end = grid._get_edge_region_ids("primal", direction)
-        data = grid.interface_intersections["primal"][direction]
-        wall = data["has_crossing"] & (np.minimum(start, end) == 0)
-        wall &= np.maximum(start, end) == slab
-        assert wall.any()
-        assert np.all(data["surface_id"][wall] == slab)
+    np.testing.assert_array_equal(
+        grid.region_ids["primal"], reference.region_ids["primal"]
+    )
+
+    def wall(g):
+        cuts = g.edge_intersections["primal"]
+        axis, index = g._flat_index_to_geometry("primal", "edge", cuts.edge)
+        regions = g.region_ids["primal"]
+        start = regions[tuple(index.T)]
+        end = regions[tuple((index + np.eye(3, dtype=int)[axis]).T)]
+        edges = np.minimum(start, end) == 0
+        edges &= np.maximum(start, end) == slab
+        faces = g.face_intersections["primal"]
+        split = (faces.region_a == 0) & (faces.region_b == slab)
+        return (
+            cuts.edge[edges],
+            cuts.alpha[edges],
+            faces.face[split],
+            faces.fraction_a[split],
+        )
+
+    edges, alpha, faces, fraction = wall(grid)
+    ref_edges, ref_alpha, ref_faces, ref_fraction = wall(reference)
+    assert len(faces) > 0
+    np.testing.assert_array_equal(np.sort(edges), np.sort(ref_edges))
+    np.testing.assert_allclose(
+        alpha[np.argsort(edges)], ref_alpha[np.argsort(ref_edges)], atol=1e-6
+    )
+    np.testing.assert_array_equal(np.sort(faces), np.sort(ref_faces))
+    np.testing.assert_allclose(
+        fraction[np.argsort(faces)], ref_fraction[np.argsort(ref_faces)], atol=1e-6
+    )
 
 
 def test_surface_on_grid_planes(tmp_path):
@@ -414,7 +450,7 @@ def test_conformal_grid_h5_roundtrip(pillbox_stls, tmp_path):
     loaded = GridFIT3D(load_from_h5=str(tmp_path / "grid.h5"), verbose=0)
 
     original, reloaded = _pec_solver(grid), _pec_solver(loaded)
-    for name in ("L", "A_fraction", "ieps", "imu"):
+    for name in ("L", "iA", "ieps", "imu"):
         np.testing.assert_array_equal(
             getattr(original, name).toarray(), getattr(reloaded, name).toarray()
         )

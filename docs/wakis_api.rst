@@ -11,6 +11,7 @@ Overview of ``wakis`` classes and functions, generated from their docstrings.
 
    wakis_gridFIT3D
    wakis_solverFIT3D
+   wakis_intersection
    wakis_wakeSolver
    wakis_field
    wakis_field_monitors

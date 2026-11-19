@@ -14,8 +14,8 @@ from scipy.sparse import csc_matrix as sparse_mat
 from scipy.sparse import diags, hstack, vstack
 
 from .boundaries import BCsMixin
-from .conformal import ConformalSolverMixin
 from .field import Field
+from .intersection import IntersectionSolverMixin
 from .logger import Logger
 from .materials import VALID_MATERIAL_TYPES, material_lib
 from .plotting import PlotMixinSolver as PlotMixin
@@ -38,7 +38,7 @@ except ImportError:
     imported_mkl = False
 
 
-class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
+class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, IntersectionSolverMixin):
     def __init__(
         self,
         grid,
@@ -233,8 +233,6 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
         self._validate_background_material(bg)
 
         self.region_material_types = self.grid.region_material_types
-        self.conformal_line_data = {"primal": {}, "dual": {}}
-        self.conformal_face_data = {"primal": {}, "dual": {}}
 
         self.Nx = self.grid.Nx
         self.Ny = self.grid.Ny
@@ -250,16 +248,14 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, ConformalSolverMixin):
         # dual metrics tL and itA keep their full grid values: cutting them
         # as well removes the conductor volume twice, which lowers the
         # stable time step and the accuracy.
-        self.L_fraction = None
-        self.A_fraction = None
+        self.area_floored_faces = None
 
         # The cut-cell data exists once the grid has traced its STL solids.
-        conformal = self.grid.geometry_mode == "conformal" and bool(
-            self.grid.interface_intersections["primal"]
+        conformal = (
+            self.grid.geometry_mode == "conformal"
+            and "primal" in self.grid.edge_intersections
         )
         if use_stl and conformal:
-            self._build_conformal_line_data()
-            self._build_conformal_face_data()
             # From here on, self.L and self.iA are the cut primal metrics.
             self._build_conformal_metrics()
 

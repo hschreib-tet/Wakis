@@ -1762,13 +1762,21 @@ class PlotMixinSolver:
         # The cut-cell metrics only exist when the solver applies the STL
         # materials (use_stl=True); otherwise show the uncut mesh.
         conformal = (
-            grid.geometry_mode == "conformal"
-            and bool(self.conformal_line_data["primal"])
-            and self.A_fraction is not None
+            grid.geometry_mode == "conformal" and self.area_floored_faces is not None
         )
         if conformal:
             _, is_conductor = grid._region_type_flags()
-            line_data = self.conformal_line_data["primal"]
+            region_ids = grid.region_ids["primal"]
+            cuts = grid.edge_intersections["primal"]
+            order = np.argsort(cuts.edge)
+            cut_edges, cut_alpha = cuts.edge[order], cuts.alpha[order]
+
+            def edge_alpha(direction, edge):
+                flat = grid._flat_field_index("primal", "edge", direction, edge)
+                position = np.searchsorted(cut_edges, flat)
+                if position < len(cut_edges) and cut_edges[position] == flat:
+                    return float(cut_alpha[position])
+                return np.nan
 
         faces = []
         edges = []
@@ -1776,11 +1784,8 @@ class PlotMixinSolver:
         if grid_type == "primal":
             mu_r = 1.0 / (np.asarray(self.imu.to_matrix(normal)) * mu_0)
             if conformal:
-                region_ids = grid.region_ids["primal"]
-                polygons = grid.interface_face_data["primal"][normal]["polygons"]
-                floored = np.asarray(self.A_fraction.to_matrix(normal)) > (
-                    np.asarray(self.A_fraction_geometric.to_matrix(normal)) + 1e-12
-                )
+                split_faces = set(grid.face_intersections["primal"].face.tolist())
+                floored_faces = set(self.area_floored_faces.tolist())
 
             for j_a in range(len(ca) - 1):
                 for j_b in range(len(cb) - 1):
@@ -1800,7 +1805,9 @@ class PlotMixinSolver:
                                 (b, 1, 0),
                             )
                         ),
-                        "floored": conformal and bool(floored[face]),
+                        "floored": conformal
+                        and int(grid._flat_field_index("primal", "face", normal, face))
+                        in floored_faces,
                         "unresolved": False,
                     }
                     if conformal:
@@ -1811,11 +1818,17 @@ class PlotMixinSolver:
                             ]
                         ]
                         if conductor_corners.any() and not conductor_corners.all():
+                            flat = int(
+                                grid._flat_field_index("primal", "face", normal, face)
+                            )
+                            polygons = (
+                                grid._contract_polygons("primal", normal, face)
+                                if flat in split_faces
+                                else None
+                            )
                             parts = {
-                                bool(is_conductor[p["region_id"]]): np.asarray(
-                                    p["vertices"]
-                                )[:, [ia, ib]]
-                                for p in polygons.get(face, [])
+                                bool(is_conductor[region]): vertices[:, [ia, ib]]
+                                for region, vertices, _ in polygons or []
                             }
                             if False in parts:
                                 record["vertices"] = parts[False]
@@ -1834,10 +1847,11 @@ class PlotMixinSolver:
                         t0, t1, style = 0.0, 1.0, "mesh"
                         live = ieps[d][edge] != 0.0
                         if conformal:
-                            data = line_data[d]
-                            start = is_conductor[data["start_region"][edge]]
-                            end = is_conductor[data["end_region"][edge]]
-                            alpha = data["alpha"][edge]
+                            end_node = list(edge)
+                            end_node["xyz".index(d)] += 1
+                            start = is_conductor[region_ids[edge]]
+                            end = is_conductor[region_ids[tuple(end_node)]]
+                            alpha = edge_alpha(d, edge)
                             if start and end:
                                 style = "pec"
                             elif not live:
@@ -1872,15 +1886,12 @@ class PlotMixinSolver:
             else:
                 values = np.asarray(self.sigma.to_matrix(normal))
                 label = rf"$\sigma_{{{normal}}}$ [S/m]"
-            eliminated = np.zeros(ieps[normal].shape, dtype=bool)
+            eliminated = np.zeros(ieps[normal].size, dtype=bool)
             if conformal:
-                cut = (
-                    line_data[normal]["normal_to_conductor"]
-                    | line_data[normal]["conductor_to_normal"]
-                )
-                eliminated = self._geometry_array_to_field_component(
-                    cut, "primal_edge", normal
-                ) & (ieps[normal] == 0.0)
+                N = ieps[normal].size
+                removed = self.eliminated_edges
+                eliminated[removed[removed // N == "xyz".index(normal)] % N] = True
+            eliminated = eliminated.reshape(ieps[normal].shape, order="F")
 
             for j_a in range(len(ca) - 1):
                 for j_b in range(len(cb) - 1):
@@ -1946,7 +1957,7 @@ class PlotMixinSolver:
         empty = np.empty((0, 2))
         result = {"thin_feature": [empty], "inconsistent": [empty]}
         grid = self.grid
-        if not conformal or not grid.interface_intersections[grid_type]:
+        if not conformal or not grid.conformal_diagnostics:
             return {key: empty for key in result}
 
         axis = "xyz".index(normal)
@@ -1972,7 +1983,7 @@ class PlotMixinSolver:
 
         # Dual plane t[i] cuts the primal edges i-1 along the normal at their
         # midpoints: these edges pierce the dual faces of the plane.
-        if grid_type == "dual" and grid.interface_intersections["primal"]:
+        if grid_type == "dual":
             primal = (grid.x, grid.y, grid.z)
             collect(
                 grid._get_edge_diagnostic_masks("primal", normal),
