@@ -9,10 +9,10 @@ Ray-tracing backend of the conformal geometry.
 Every primal grid line, and every dual grid line holding an edge between two
 normal materials, is intersected exactly with the STL triangles (VTK
 ``IntersectWithLine``). Per edge, the crossings are grouped, checked against
-the node classification and reduced to one represented crossing; the grid
-faces are split along their cut points. The result is the sparse
-intersection contract of ``intersection.py`` (``edge_intersections`` and
-``face_intersections``) plus the geometry diagnostics.
+the node classification and reduced to one represented crossing. The result
+is the sparse edge contract of ``intersection.py`` (``EdgeIntersections``
+per grid and direction) plus the geometry diagnostics; the faces are split
+in ``intersection.py``, the same for every backend.
 
 The entry point is ``trace_intersections(grid)``, called by
 ``GridFIT3D._build_intersections`` for ``conformal_method="raytracing"``.
@@ -26,13 +26,7 @@ import numpy as np
 from vtkmodules.vtkCommonCore import vtkIdList, vtkPoints
 from vtkmodules.vtkCommonDataModel import vtkStaticCellLocator
 
-from .intersection import (
-    EdgeIntersections,
-    FaceIntersections,
-    face_cut_groups,
-    face_polygons,
-    normal_normal_edge_mask,
-)
+from .intersection import EdgeIntersections, normal_normal_edge_mask
 
 
 def _trace_grid_line(
@@ -330,9 +324,8 @@ def _resolve_edge(grid, hits, axis, start, end, start_inside, planar, alpha_tole
     Returns
     -------
     crossing : dict or None
-        The representative hit (``alpha``, ``surface_id``, ``normal``)
-        and ``multiple`` (several interfaces, or an ambiguous one), or
-        None if the edge has no crossing to represent.
+        The representative hit (``alpha``, ``normal``), or None if the
+        edge has no crossing to represent.
     thin_feature, inconsistent : bool
         Diagnostics of the edge.
     """
@@ -400,12 +393,7 @@ def _resolve_edge(grid, hits, axis, start, end, start_inside, planar, alpha_tole
         representative = candidates[0]
     else:
         representative = min(candidates, key=lambda hit: abs(hit["alpha"] - 0.5))
-    crossing = {
-        "alpha": representative["alpha"],
-        "surface_id": representative["surface_id"],
-        "normal": representative["normal"],
-        "multiple": len(interfaces) > 1 or not consistent,
-    }
+    crossing = {"alpha": representative["alpha"], "normal": representative["normal"]}
     return crossing, thin_feature, not consistent
 
 
@@ -421,10 +409,8 @@ def _trace_edges(grid, grid_type, direction, surfaces, facet_planes, alpha_toler
 
     Returns
     -------
-    cuts : dict of ndarray
-        ``index`` (n, 3) geometry indices of the cut edges, ``alpha``,
-        ``normal`` (n, 3), and the backend-internal ``surface`` and
-        ``multiple``.
+    cuts : EdgeIntersections
+        The cut edges with their represented crossing.
     diagnostics : dict of ndarray
         ``thin_feature`` and ``inconsistent`` edges as geometry indices
         (n, 3); inconsistent includes material transitions without a
@@ -449,13 +435,7 @@ def _trace_edges(grid, grid_type, direction, surfaces, facet_planes, alpha_toler
         np.min(np.diff(c)) for c in grid._get_grid_coordinates("primal")
     )
 
-    records = {
-        "index": [],
-        "alpha": [],
-        "normal": [],
-        "surface": [],
-        "multiple": [],
-    }
+    records = {"index": [], "alpha": [], "normal": []}
     diagnostics = {"thin_feature": [], "inconsistent": []}
     for line in lines:
         line_hits = _trace_grid_line(
@@ -511,19 +491,15 @@ def _trace_edges(grid, grid_type, direction, surfaces, facet_planes, alpha_toler
             records["index"].append(edge_index)
             records["alpha"].append(crossing["alpha"])
             records["normal"].append(crossing["normal"])
-            records["surface"].append(crossing["surface_id"])
-            records["multiple"].append(crossing["multiple"])
 
-    cuts = {
-        "index": np.array(records["index"], dtype=np.int64).reshape(-1, 3),
-        "alpha": np.array(records["alpha"], dtype=float),
-        "normal": np.array(records["normal"], dtype=float).reshape(-1, 3),
-        "surface": np.array(records["surface"], dtype=np.int32),
-        "multiple": np.array(records["multiple"], dtype=bool),
-    }
+    cuts = EdgeIntersections(
+        index=np.array(records["index"], dtype=np.int64).reshape(-1, 3),
+        alpha=np.array(records["alpha"], dtype=float),
+        normal=np.array(records["normal"], dtype=float).reshape(-1, 3),
+    )
     # Material transitions without a represented crossing.
     missing = transition.copy()
-    missing[tuple(cuts["index"].T)] = False
+    missing[tuple(cuts.index.T)] = False
     inconsistent = np.zeros(transition.shape, dtype=bool)
     if diagnostics["inconsistent"]:
         inconsistent[tuple(np.array(diagnostics["inconsistent"]).T)] = True
@@ -535,139 +511,8 @@ def _trace_edges(grid, grid_type, direction, surfaces, facet_planes, alpha_toler
     }
 
     if grid.verbose:
-        print(
-            f"    * {grid_type} {direction}-edges: {len(cuts['alpha'])} "
-            f"crossings, {np.count_nonzero(cuts['multiple'])} with multiple "
-            "crossing positions"
-        )
+        print(f"    * {grid_type} {direction}-edges: {len(cuts.alpha)} crossings")
     return cuts, diagnostics
-
-
-def _split_faces(grid, grid_type, cuts):
-    """
-    Split the grid faces of one grid along their cut points.
-
-    A face with exactly two distinct cut points of one common STL
-    surface, none from an edge with several crossings, is split when
-    each side holds corners of a single region and the two regions
-    differ (``face_polygons``). Its interface normal is the mean facet
-    normal at the two cut points.
-
-    Returns
-    -------
-    FaceIntersections
-    """
-    shape = grid.region_ids[grid_type].shape
-    rows = {}
-    for axis, direction in enumerate("xyz"):
-        edge_shape = list(shape)
-        edge_shape[axis] -= 1
-        keys = np.ravel_multi_index(cuts[direction]["index"].T, edge_shape)
-        rows[axis] = (edge_shape, dict(zip(keys.tolist(), range(len(keys)))))
-
-    def lookup(axis, edge_index):
-        edge_shape, row_of = rows[axis]
-        row = row_of.get(int(np.ravel_multi_index(edge_index, edge_shape)))
-        if row is None:
-            return None
-        data = cuts["xyz"[axis]]
-        return float(data["alpha"][row]), (
-            int(data["surface"][row]),
-            data["normal"][row],
-            bool(data["multiple"][row]),
-        )
-
-    records = {
-        "face": [],
-        "direction": [],
-        "a": [],
-        "b": [],
-        "fraction_a": [],
-        "normal": [],
-    }
-    for normal_axis, face_direction in enumerate("xyz"):
-        a, b = (normal_axis + 1) % 3, (normal_axis + 2) % 3
-        face_shape = np.array(shape) - 1
-        face_shape[normal_axis] += 1
-        # Faces next to a cut edge: an edge along a borders the faces at
-        # its own index and one below along b, and vice versa.
-        candidates = []
-        for edge_axis, other in ((a, b), (b, a)):
-            index = cuts["xyz"[edge_axis]]["index"]
-            for shift in (0, -1):
-                face = index.copy()
-                face[:, other] += shift
-                inside = np.all((face >= 0) & (face < face_shape), axis=1)
-                candidates.append(face[inside])
-        candidates = np.unique(np.concatenate(candidates), axis=0)
-
-        for index in candidates:
-            index = tuple(int(value) for value in index)
-            corner_indices, corners, plane_axes, groups = face_cut_groups(
-                grid, grid_type, face_direction, index, lookup
-            )
-            if len(groups) != 2 or any(
-                cut["data"][2] for group in groups for cut in group["cuts"]
-            ):
-                continue
-            common = {cut["data"][0] for cut in groups[0]["cuts"]} & {
-                cut["data"][0] for cut in groups[1]["cuts"]
-            }
-            if len(common) != 1:
-                continue
-            polygons = face_polygons(
-                grid, grid_type, corner_indices, corners, plane_axes, groups
-            )
-            if polygons is None:
-                continue
-
-            surface_id = common.pop()
-            mean_normal = np.mean(
-                [
-                    cut["data"][1]
-                    for group in groups
-                    for cut in group["cuts"]
-                    if cut["data"][0] == surface_id
-                ],
-                axis=0,
-            )
-            norm = np.linalg.norm(mean_normal)
-            (region_a, _, fraction_a), (region_b, _, _) = sorted(
-                polygons, key=lambda polygon: polygon[0]
-            )
-            records["face"].append(index)
-            records["direction"].append(normal_axis)
-            records["a"].append(region_a)
-            records["b"].append(region_b)
-            records["fraction_a"].append(fraction_a)
-            records["normal"].append(
-                mean_normal / norm if norm > 0.0 else np.full(3, np.nan)
-            )
-
-        if grid.verbose:
-            print(
-                f"    * {grid_type} {face_direction}-faces: {len(candidates)} "
-                "candidates"
-            )
-
-    index = np.array(records["face"], dtype=np.int64).reshape(-1, 3)
-    normal_axis = np.array(records["direction"], dtype=np.int64)
-    face = np.empty(len(index), dtype=np.int64)
-    for axis, face_direction in enumerate("xyz"):
-        selected = normal_axis == axis
-        face[selected] = grid._flat_field_index(
-            grid_type, "face", face_direction, index[selected]
-        )
-    # Faces without a field DOF (dual faces on the low domain boundary)
-    # are not part of the contract.
-    keep = face >= 0
-    return FaceIntersections(
-        face=face[keep],
-        region_a=np.array(records["a"], dtype=grid.region_ids[grid_type].dtype)[keep],
-        region_b=np.array(records["b"], dtype=grid.region_ids[grid_type].dtype)[keep],
-        fraction_a=np.array(records["fraction_a"], dtype=float)[keep],
-        normal=np.array(records["normal"], dtype=float).reshape(-1, 3)[keep],
-    )
 
 
 def trace_intersections(grid):
@@ -686,36 +531,24 @@ def trace_intersections(grid):
 
     Returns
     -------
-    edge_intersections, face_intersections : dict
-        ``EdgeIntersections`` and ``FaceIntersections`` per grid type.
+    edge_intersections : dict
+        ``EdgeIntersections`` per grid type and direction.
+    face_intersections : None
+        Ray tracing leaves the face split to ``intersection.split_faces``.
     diagnostics : dict
         Per grid type and direction, ``thin_feature`` and ``inconsistent``
         edges as geometry indices (n, 3).
     """
     alpha_tolerance = 1e-8
     surfaces, facet_planes = _load_stl_surfaces(grid)
-    edge_intersections, face_intersections, diagnostics = {}, {}, {}
+    edge_intersections, diagnostics = {}, {}
     for grid_type in ("primal", "dual"):
-        cuts = {}
-        diagnostics[grid_type] = {}
+        edge_intersections[grid_type], diagnostics[grid_type] = {}, {}
         for direction in "xyz":
-            cuts[direction], diagnostics[grid_type][direction] = _trace_edges(
+            (
+                edge_intersections[grid_type][direction],
+                diagnostics[grid_type][direction],
+            ) = _trace_edges(
                 grid, grid_type, direction, surfaces, facet_planes, alpha_tolerance
             )
-        face_intersections[grid_type] = _split_faces(grid, grid_type, cuts)
-
-        # Edges without a field DOF (dual edges on the low domain boundary)
-        # serve only the face split.
-        edge = np.concatenate(
-            [
-                grid._flat_field_index(grid_type, "edge", d, cuts[d]["index"])
-                for d in "xyz"
-            ]
-        )
-        keep = edge >= 0
-        edge_intersections[grid_type] = EdgeIntersections(
-            edge=edge[keep],
-            alpha=np.concatenate([cuts[d]["alpha"] for d in "xyz"])[keep],
-            normal=np.concatenate([cuts[d]["normal"] for d in "xyz"])[keep],
-        )
-    return edge_intersections, face_intersections, diagnostics
+    return edge_intersections, None, diagnostics

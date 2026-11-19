@@ -1769,16 +1769,16 @@ class PlotMixinSolver:
         if conformal:
             _, is_conductor = grid._region_type_flags()
             region_ids = grid.region_ids["primal"]
-            cuts = grid.edge_intersections["primal"]
-            order = np.argsort(cuts.edge)
-            cut_edges, cut_alpha = cuts.edge[order], cuts.alpha[order]
+            primal_cuts = grid.edge_intersections["primal"]
+            cut_alpha = {
+                direction: dict(
+                    zip(map(tuple, cuts.index.tolist()), cuts.alpha.tolist())
+                )
+                for direction, cuts in primal_cuts.items()
+            }
 
             def edge_alpha(direction, edge):
-                flat = grid._flat_field_index("primal", "edge", direction, edge)
-                position = np.searchsorted(cut_edges, flat)
-                if position < len(cut_edges) and cut_edges[position] == flat:
-                    return float(cut_alpha[position])
-                return np.nan
+                return cut_alpha[direction].get(tuple(int(i) for i in edge), np.nan)
 
         faces = []
         edges = []

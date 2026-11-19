@@ -36,32 +36,34 @@ from .field import Field
 @dataclass
 class EdgeIntersections:
     """
-    Cut edges of one grid (primal or dual).
+    Cut edges of one grid (primal or dual) and one direction.
 
     On the primal grid every edge whose end nodes have different solid IDs
     is cut; on the dual grid only edges between two different normal
     materials, since conductor walls never cut the dual metric. Each edge
-    carries one crossing.
+    carries one crossing. Dual edges in the domain boundary planes are
+    included: they have no field DOF but bound the boundary dual faces.
 
     Attributes
     ----------
-    edge : ndarray of int64, shape (n,)
-        Flat field index of the edge.
+    index : ndarray of int64, shape (n, 3)
+        Geometry index (i, j, k) of the edge in its edge family, e.g.
+        shape (Nx-1, Ny, Nz) for primal x-edges.
     alpha : ndarray of float, shape (n,)
         Crossing position along the edge, 0 to 1, from its start node.
     normal : ndarray of float, shape (n, 3)
         Unit normal of the interface at the crossing; its sign is not used.
     """
 
-    edge: np.ndarray
+    index: np.ndarray
     alpha: np.ndarray
     normal: np.ndarray
 
     def __post_init__(self):
-        n = len(self.edge)
-        if len(self.alpha) != n or np.shape(self.normal) != (n, 3):
+        n = len(self.alpha)
+        if np.shape(self.index) != (n, 3) or np.shape(self.normal) != (n, 3):
             raise ValueError(
-                "EdgeIntersections needs edge (n,), alpha (n,) and normal (n, 3)."
+                "EdgeIntersections needs index (n, 3), alpha (n,) and normal (n, 3)."
             )
 
 
@@ -242,18 +244,121 @@ def face_polygons(grid, grid_type, corner_indices, corners, plane_axes, groups):
     return polygons
 
 
-def contract_polygons(grid, grid_type, face_direction, index):
+def _edge_lookup(grid, grid_type, edges):
     """
-    Polygons of one face listed in ``face_intersections``, rebuilt from
-    the cut edges of the contract (for plotting).
+    Cut-edge lookup for ``face_cut_groups``: ``lookup(axis, edge_index)``
+    returns ``(alpha, normal)`` of a cut edge, or None.
     """
-    cuts = grid.edge_intersections[grid_type]
+    shape = grid.region_ids[grid_type].shape
+    rows = {}
+    for axis, direction in enumerate("xyz"):
+        edge_shape = list(shape)
+        edge_shape[axis] -= 1
+        keys = np.ravel_multi_index(edges[direction].index.T, edge_shape)
+        rows[axis] = (edge_shape, dict(zip(keys.tolist(), range(len(keys)))))
 
     def lookup(axis, edge_index):
-        flat = grid._flat_field_index(grid_type, "edge", "xyz"[axis], edge_index)
-        position = _sparse_lookup(cuts.edge, flat)
-        return None if position < 0 else (float(cuts.alpha[position]), None)
+        edge_shape, row_of = rows[axis]
+        row = row_of.get(int(np.ravel_multi_index(edge_index, edge_shape)))
+        if row is None:
+            return None
+        cuts = edges["xyz"[axis]]
+        return float(cuts.alpha[row]), cuts.normal[row]
 
+    return lookup
+
+
+def split_faces(grid, grid_type, edges):
+    """
+    Split the faces of one grid along the cut points of their edges.
+
+    A face with exactly two distinct cut points is split by the straight
+    line between them when each side holds corners of a single region and
+    the two regions differ (``face_polygons``). This is the same for every
+    backend: the cut lengths and the cut areas then describe the same
+    geometry. The interface normal of the face is the mean normal at its
+    cut points.
+
+    Parameters
+    ----------
+    grid : GridFIT3D
+    grid_type : {"primal", "dual"}
+    edges : dict
+        ``EdgeIntersections`` of this grid per direction.
+
+    Returns
+    -------
+    FaceIntersections
+    """
+    shape = grid.region_ids[grid_type].shape
+    lookup = _edge_lookup(grid, grid_type, edges)
+    records = {"face": [], "a": [], "b": [], "fraction_a": [], "normal": []}
+    for normal_axis, face_direction in enumerate("xyz"):
+        a, b = (normal_axis + 1) % 3, (normal_axis + 2) % 3
+        face_shape = np.array(shape) - 1
+        face_shape[normal_axis] += 1
+        # Faces next to a cut edge: an edge along a borders the faces at its
+        # own index and one below along b, and vice versa.
+        candidates = []
+        for edge_axis, other in ((a, b), (b, a)):
+            index = edges["xyz"[edge_axis]].index
+            for shift in (0, -1):
+                face = index.copy()
+                face[:, other] += shift
+                inside = np.all((face >= 0) & (face < face_shape), axis=1)
+                candidates.append(face[inside])
+        candidates = np.unique(np.concatenate(candidates), axis=0)
+
+        for index in candidates:
+            index = tuple(int(value) for value in index)
+            corner_indices, corners, plane_axes, groups = face_cut_groups(
+                grid, grid_type, face_direction, index, lookup
+            )
+            if len(groups) != 2:
+                continue
+            polygons = face_polygons(
+                grid, grid_type, corner_indices, corners, plane_axes, groups
+            )
+            if polygons is None:
+                continue
+
+            mean_normal = np.mean(
+                [cut["data"] for group in groups for cut in group["cuts"]], axis=0
+            )
+            norm = np.linalg.norm(mean_normal)
+            (region_a, _, fraction_a), (region_b, _, _) = sorted(
+                polygons, key=lambda polygon: polygon[0]
+            )
+            records["face"].append(
+                grid._flat_field_index(grid_type, "face", face_direction, index)
+            )
+            records["a"].append(region_a)
+            records["b"].append(region_b)
+            records["fraction_a"].append(fraction_a)
+            records["normal"].append(
+                mean_normal / norm if norm > 0.0 else np.full(3, np.nan)
+            )
+
+    # Faces without a field DOF (dual faces on the low domain boundary) are
+    # not listed.
+    face = np.array(records["face"], dtype=np.int64)
+    keep = face >= 0
+    dtype = grid.region_ids[grid_type].dtype
+    return FaceIntersections(
+        face=face[keep],
+        region_a=np.array(records["a"], dtype=dtype)[keep],
+        region_b=np.array(records["b"], dtype=dtype)[keep],
+        fraction_a=np.array(records["fraction_a"], dtype=float)[keep],
+        normal=np.array(records["normal"], dtype=float).reshape(-1, 3)[keep],
+    )
+
+
+def contract_polygons(grid, grid_type, face_direction, index):
+    """
+    Polygons of one face, rebuilt from the cut edges of the contract by the
+    straight line between its cut points (for plotting).
+    """
+    lookup = _edge_lookup(grid, grid_type, grid.edge_intersections[grid_type])
     corner_indices, corners, plane_axes, groups = face_cut_groups(
         grid, grid_type, face_direction, index, lookup
     )
@@ -377,11 +482,10 @@ def geometry_array_to_field_component(values, kind, direction, shape, fill_value
     return result
 
 
-def cut_edge_regions(grid, grid_type, edge):
-    """Solid IDs at the start and end node of listed cut edges."""
-    axis, index = grid._flat_index_to_geometry(grid_type, "edge", edge)
+def cut_edge_regions(grid, grid_type, direction, index):
+    """Solid IDs at the start and end node of edges (geometry indices)."""
     region_ids = grid.region_ids[grid_type]
-    end = index + np.eye(3, dtype=np.int64)[axis]
+    end = index + np.eye(3, dtype=np.int64)["xyz".index(direction)]
     return region_ids[tuple(index.T)], region_ids[tuple(end.T)]
 
 
@@ -400,12 +504,18 @@ def conductor_cuts(grid):
     """
     is_normal, is_conductor = grid._region_type_flags()
 
-    cuts = grid.edge_intersections["primal"]
-    start, end = cut_edge_regions(grid, "primal", cuts.edge)
-    to_conductor = is_normal[start] & is_conductor[end]
-    from_conductor = is_conductor[start] & is_normal[end]
-    selected = to_conductor | from_conductor
-    edge_fraction = np.where(to_conductor, cuts.alpha, 1.0 - cuts.alpha)[selected]
+    edges, edge_fractions = [], []
+    for direction, cuts in grid.edge_intersections["primal"].items():
+        start, end = cut_edge_regions(grid, "primal", direction, cuts.index)
+        to_conductor = is_normal[start] & is_conductor[end]
+        from_conductor = is_conductor[start] & is_normal[end]
+        selected = to_conductor | from_conductor
+        edges.append(
+            grid._flat_field_index("primal", "edge", direction, cuts.index[selected])
+        )
+        edge_fractions.append(
+            np.where(to_conductor, cuts.alpha, 1.0 - cuts.alpha)[selected]
+        )
 
     faces = grid.face_intersections["primal"]
     a_normal = is_normal[faces.region_a] & is_conductor[faces.region_b]
@@ -414,8 +524,8 @@ def conductor_cuts(grid):
     face_fraction = np.where(a_normal, faces.fraction_a, 1.0 - faces.fraction_a)
     normal_region = np.where(a_normal, faces.region_a, faces.region_b)
     return (
-        cuts.edge[selected],
-        edge_fraction,
+        np.concatenate(edges),
+        np.concatenate(edge_fractions),
         faces.face[conductor_face],
         face_fraction[conductor_face],
         normal_region[conductor_face],
@@ -546,12 +656,15 @@ def _diagonal_material(grid, region_values, axis, line_grid, face_grid, tol=1e-1
 
     # Cut edges of this component (any type: their normal and position also
     # serve an uncut face) and the normal-normal ones among them.
-    edges = grid.edge_intersections[line_grid]
-    in_component = edges.edge // N == axis
-    edge_dof = edges.edge[in_component] % N
-    edge_alpha = edges.alpha[in_component]
-    edge_normal = edges.normal[in_component]
-    start, end = cut_edge_regions(grid, line_grid, edges.edge[in_component])
+    direction = "xyz"[axis]
+    edges = grid.edge_intersections[line_grid][direction]
+    # Dual edges in the boundary planes have no DOF.
+    flat = grid._flat_field_index(line_grid, "edge", direction, edges.index)
+    has_dof = flat >= 0
+    edge_dof = flat[has_dof] - axis * N
+    edge_alpha = edges.alpha[has_dof]
+    edge_normal = edges.normal[has_dof]
+    start, end = cut_edge_regions(grid, line_grid, direction, edges.index[has_dof])
     edge_nn = is_normal[start] & is_normal[end]
 
     # Normal-normal cut faces of this component.

@@ -247,6 +247,13 @@ def _field_growth(solver, dt, n_steps=3000):
     return np.linalg.norm(solver.E.toarray()) / norm0
 
 
+def test_area_method_requires_backend_faces(tmp_path):
+    """The ray-tracing backend leaves the face split to the shared
+    straight-line method, so asking for its own area fractions fails."""
+    with pytest.raises(ValueError, match="provides no area fractions"):
+        _slanted_box_grid(tmp_path / "cav.stl", conformal_area_method="backend")
+
+
 def test_stable_timestep(tmp_path):
     """compute_stable_timestep() gives the exact leapfrog limit.
 
@@ -302,6 +309,7 @@ def test_stabilization_options():
         dict(conformal_stabilization="area_floor", conformal_stabilization_fraction=0),
         dict(conformal_stabilization="area_floor", conformal_min_edge_fraction=0.5),
         dict(conformal_method="unknown"),
+        dict(conformal_area_method="unknown"),
     ):
         with pytest.raises(ValueError):
             unit_grid(**invalid)
@@ -346,18 +354,22 @@ def test_coincident_wall(tmp_path):
     )
 
     def wall(g):
-        cuts = g.edge_intersections["primal"]
-        axis, index = g._flat_index_to_geometry("primal", "edge", cuts.edge)
+        # Cut edges between PEC (0) and the slab, and the faces split there.
+        edges = []
         regions = g.region_ids["primal"]
-        start = regions[tuple(index.T)]
-        end = regions[tuple((index + np.eye(3, dtype=int)[axis]).T)]
-        edges = np.minimum(start, end) == 0
-        edges &= np.maximum(start, end) == slab
+        for direction, cuts in g.edge_intersections["primal"].items():
+            step = np.eye(3, dtype=int)["xyz".index(direction)]
+            start = regions[tuple(cuts.index.T)]
+            end = regions[tuple((cuts.index + step).T)]
+            pair = (np.minimum(start, end) == 0) & (np.maximum(start, end) == slab)
+            flat = g._flat_field_index("primal", "edge", direction, cuts.index[pair])
+            edges.append(np.column_stack((flat, cuts.alpha[pair])))
+        edges = np.concatenate(edges)
         faces = g.face_intersections["primal"]
         split = (faces.region_a == 0) & (faces.region_b == slab)
         return (
-            cuts.edge[edges],
-            cuts.alpha[edges],
+            edges[:, 0].astype(int),
+            edges[:, 1],
             faces.face[split],
             faces.fraction_a[split],
         )

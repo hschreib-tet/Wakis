@@ -14,7 +14,7 @@ from vtkmodules.vtkFiltersModeling import vtkSelectEnclosedPoints
 
 from .conformal import trace_intersections
 from .field import Field
-from .intersection import warn_diagnostics
+from .intersection import split_faces, warn_diagnostics
 from .logger import Logger
 from .materials import (
     VALID_MATERIAL_TYPES,
@@ -24,8 +24,8 @@ from .materials import (
 from .plotting import PlotMixinGrid as PlotMixin
 
 # Backends computing the STL intersections in conformal mode: each takes the
-# grid and returns its edge intersections, face intersections and geometry
-# diagnostics (see intersection.py).
+# grid and returns its edge intersections, its face intersections (or None)
+# and its geometry diagnostics (see intersection.py).
 CONFORMAL_BACKENDS = {"raytracing": trace_intersections}
 
 try:
@@ -81,6 +81,7 @@ class GridFIT3D(PlotMixin):
         conformal_stabilization_fraction=None,
         conformal_min_edge_fraction=None,
         conformal_method="raytracing",
+        conformal_area_method="straight_line",
         load_from_h5=None,
         verbose=2,
         stl_material_types=None,
@@ -188,6 +189,12 @@ class GridFIT3D(PlotMixin):
             Backend computing the STL intersections in conformal mode.
             ``"raytracing"`` intersects the grid lines exactly with the STL
             triangles. Default is ``"raytracing"``.
+        conformal_area_method : {"straight_line", "backend"}, optional
+            Experimental, for comparing backends. ``"straight_line"`` splits
+            every cut face along the straight line between the cut points of
+            its edges, the same for every backend (default). ``"backend"``
+            uses the area fractions of the backend; ``"raytracing"`` provides
+            none.
 
         Attributes
         ----------
@@ -267,6 +274,12 @@ class GridFIT3D(PlotMixin):
             conformal_min_edge_fraction,
         )
         self._set_conformal_method(conformal_method)
+        if conformal_area_method not in ("straight_line", "backend"):
+            raise ValueError(
+                "conformal_area_method must be 'straight_line' or 'backend', got "
+                f"{conformal_area_method!r}."
+            )
+        self.conformal_area_method = conformal_area_method
 
         # Sparse STL intersections from the conformal backend (see
         # intersection.py) and its geometry diagnostics.
@@ -369,6 +382,7 @@ class GridFIT3D(PlotMixin):
                     "stl_material_types",
                     "bg_material_type",
                     "conformal_method",
+                    "conformal_area_method",
                     "conformal_stabilization",
                     "conformal_area_floor",
                     "conformal_min_edge_fraction",
@@ -605,6 +619,7 @@ class GridFIT3D(PlotMixin):
                 conformal_stabilization_fraction=self.conformal_area_floor,
                 conformal_min_edge_fraction=self.conformal_min_edge_fraction,
                 conformal_method=self.conformal_method,
+                conformal_area_method=self.conformal_area_method,
             )
         return _grid
 
@@ -968,27 +983,6 @@ class GridFIT3D(PlotMixin):
             return (region_ids[:, :-1, :], region_ids[:, 1:, :])
         return (region_ids[:, :, :-1], region_ids[:, :, 1:])
 
-    def _flat_index_to_geometry(self, grid_type, kind, flat):
-        """
-        Inverse of ``_flat_field_index``: direction axis and geometry
-        indices (n, 3) of the edges or faces with the given flat indices.
-        """
-        flat = np.asarray(flat, dtype=np.int64)
-        N = self.Nx * self.Ny * self.Nz
-        axis = flat // N
-        index = np.column_stack(
-            np.unravel_index(flat % N, (self.Nx, self.Ny, self.Nz), order="F")
-        )
-        if grid_type == "dual":
-            offset = np.zeros_like(index)
-            for k in range(3):
-                if kind == "edge":
-                    offset[:, k] = axis != k
-                else:
-                    offset[:, k] = axis == k
-            index = index + offset
-        return axis, index
-
     def _set_conformal_method(self, method):
         """Validate and store the conformal intersection backend."""
         method = str(method).lower()
@@ -1041,9 +1035,21 @@ class GridFIT3D(PlotMixin):
         """Classify the nodes and run the selected conformal backend."""
         self._build_region_ids()
         backend = CONFORMAL_BACKENDS[self.conformal_method]
-        self.edge_intersections, self.face_intersections, self.conformal_diagnostics = (
-            backend(self)
+        self.edge_intersections, backend_faces, self.conformal_diagnostics = backend(
+            self
         )
+        if self.conformal_area_method == "straight_line":
+            self.face_intersections = {
+                grid_type: split_faces(self, grid_type, edges)
+                for grid_type, edges in self.edge_intersections.items()
+            }
+        elif backend_faces is None:
+            raise ValueError(
+                f"conformal_method={self.conformal_method!r} provides no area "
+                "fractions; use conformal_area_method='straight_line'."
+            )
+        else:
+            self.face_intersections = backend_faces
         warn_diagnostics(self.conformal_diagnostics)
 
     def _flat_field_index(self, grid_type, kind, direction, index):
@@ -1476,6 +1482,7 @@ class GridFIT3D(PlotMixin):
             hf.attrs["conformal_area_floor"] = self.conformal_area_floor
             hf.attrs["conformal_min_edge_fraction"] = self.conformal_min_edge_fraction
             hf.attrs["conformal_method"] = self.conformal_method
+            hf.attrs["conformal_area_method"] = self.conformal_area_method
             if self.bg_material_type is not None:
                 hf.attrs["bg_material_type"] = self.bg_material_type
 
@@ -1605,6 +1612,9 @@ class GridFIT3D(PlotMixin):
             # Grids saved before the backends were selectable used ray tracing.
             self._set_conformal_method(
                 str(hf.attrs.get("conformal_method", "raytracing"))
+            )
+            self.conformal_area_method = str(
+                hf.attrs.get("conformal_area_method", "straight_line")
             )
 
             # ----------------------------------------------------------
