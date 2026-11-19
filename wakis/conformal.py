@@ -231,9 +231,11 @@ class ConformalGridMixin:
 
         Hits within ``alpha_tolerance`` belong to one geometric point (a
         line through a shared triangle edge or vertex, or coincident
-        surfaces of different solids). A group is a crossing if at least one
-        facet normal has a component along the edge; otherwise it is a
-        tangential contact and dropped.
+        surfaces of different solids). A surface crosses the edge there if
+        its facet normals have a component along the edge, all with the same
+        sign. Hits of a surface lying in the line (no component) or touching
+        it (both signs: the line enters and leaves at the same point, e.g.
+        tangent to a cylinder) are dropped, and so are groups left empty.
         """
         hits = sorted(hits, key=lambda hit: hit["alpha"])
         groups = [[hits[0]]]
@@ -248,15 +250,25 @@ class ConformalGridMixin:
                 groups.append([hit])
 
         # VTK can report a hit for a facet coplanar with the grid line (e.g.
-        # an axis-aligned wall on a grid plane). Counted as a crossing, it
-        # would toggle inside/outside wrongly. The normals are unit vectors,
-        # so 1e-8 separates "line in the facet plane up to rounding" from any
-        # real tilt.
-        return [
-            group
-            for group in groups
-            if any(abs(hit["normal"][axis]) > 1e-8 for hit in group)
-        ]
+        # an axis-aligned wall on a grid plane), and a line grazing a curved
+        # surface hits the facets on both sides of the contact. Counted as
+        # crossings, both would toggle inside/outside wrongly. The normals
+        # are unit vectors, so 1e-8 separates "line in the facet plane up to
+        # rounding" from any real tilt.
+        crossings = []
+        for group in groups:
+            signs = {}
+            for hit in group:
+                if abs(hit["normal"][axis]) > 1e-8:
+                    signs.setdefault(hit["surface_id"], set()).add(
+                        hit["normal"][axis] > 0
+                    )
+            crossing = [
+                hit for hit in group if len(signs.get(hit["surface_id"], ())) == 1
+            ]
+            if crossing:
+                crossings.append(crossing)
+        return crossings
 
     # Interior pieces of an edge shorter than this fraction of the edge are
     # not treated as material of their own. Coincident surfaces of different
@@ -445,6 +457,7 @@ class ConformalGridMixin:
                 }
 
                 raw_hits = {}
+                planar_surfaces = {}
 
                 # Dual grid: restrict to normal-normal interface edges and
                 # trace only the grid lines that contain such edges.
@@ -466,6 +479,15 @@ class ConformalGridMixin:
                         alpha_tolerance=alpha_tolerance,
                     )
 
+                    # Surfaces with a facet in the plane of this line: the
+                    # line runs along them, and its crossings of them are at
+                    # the rim of that planar part.
+                    planar_surfaces[transverse_index] = {
+                        hit["surface_id"]
+                        for hits in line_hits.values()
+                        for hit in hits
+                        if abs(hit["normal"][axis]) <= 1e-8
+                    }
                     for edge_index, hits in line_hits.items():
                         if scope is not None and not scope[edge_index]:
                             continue
@@ -495,10 +517,31 @@ class ConformalGridMixin:
                         crossing_groups, start_inside
                     )
 
-                    # Crossings that contradict the point classification (an
-                    # open surface, a crossing on a grid point) cannot be
-                    # resolved: keep all of them as one ambiguous interface.
+                    # Where the surface passes through a grid node or the
+                    # line runs along a surface, the line touches the surface
+                    # rather than crossing it, and the node classification
+                    # already decided the side. If such crossings contradict
+                    # it, they must not toggle the material again.
                     consistent = regions[0] == start and regions[-1] == end
+                    if not consistent:
+                        planar = planar_surfaces[tuple(np.delete(edge_index, axis))]
+                        clean = [
+                            group
+                            for group in crossing_groups
+                            if alpha_tolerance
+                            < np.mean([hit["alpha"] for hit in group])
+                            < 1.0 - alpha_tolerance
+                            and not {hit["surface_id"] for hit in group} <= planar
+                        ]
+                        retry = self._resolve_edge_interfaces(clean, start_inside)
+                        if retry[0][0] == start and retry[0][-1] == end:
+                            crossing_groups = clean
+                            regions, interfaces, thin_layer = retry
+                            consistent = True
+
+                    # Crossings that contradict the point classification (an
+                    # open surface) cannot be resolved: keep all of them as
+                    # one ambiguous interface.
                     if not consistent:
                         regions, interfaces = [start, end], [crossing_groups]
                         intersections["inconsistent"][edge_index] = True

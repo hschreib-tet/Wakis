@@ -333,6 +333,35 @@ def test_coincident_wall(tmp_path):
         assert np.all(data["surface_id"][wall] == slab)
 
 
+def test_surface_on_grid_planes(tmp_path):
+    """A cylinder spanning exactly the domain, as when the domain is set to
+    the STL bounds: its end caps lie in the boundary grid planes and its
+    side touches the side planes along four lines. Grid lines there touch
+    the surface instead of crossing it, and the node classification decides
+    the side, so no edge is reported as inconsistent."""
+    pv.Cylinder(radius=0.4, height=1.0, direction=(0, 0, 1), resolution=64).save(
+        tmp_path / "cyl.stl"
+    )
+    grid = GridFIT3D(
+        *(-0.4, 0.4) * 2,
+        -0.5,
+        0.5,
+        11,
+        11,
+        11,
+        stl_solids={"cyl": str(tmp_path / "cyl.stl")},
+        stl_materials={"cyl": "vacuum"},
+        bg_material_type="pec",
+        geometry_mode="conformal",
+        stl_method="voxelize_rectilinear",
+        verbose=0,
+    )
+    for grid_type in ("primal", "dual"):
+        for direction in "xyz":
+            _, inconsistent = grid._get_edge_diagnostic_masks(grid_type, direction)
+            assert not inconsistent.any(), (grid_type, direction)
+
+
 def test_conductor_background_type():
     """A conformal grid without bg_material_type traces its cuts with a
     normal background, so a PEC solver background is rejected."""
