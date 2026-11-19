@@ -14,8 +14,8 @@ from scipy.special import j0, j1, jn_zeros, y0, y1
 
 from wakis import GridFIT3D, SolverFIT3D, WakeSolver
 from wakis.intersection import (
-    contract_polygons,
     edge_diagnostic_masks,
+    face_polygons,
     geometry_array_to_field_component,
 )
 
@@ -451,29 +451,81 @@ def test_flat_field_index():
             assert np.array_equal(np.sort(local), np.flatnonzero(expected >= 0))
 
 
-def test_face_split_matches_single_face(pillbox_stls):
-    """The vectorized face split gives every listed face the same two
-    regions and area fraction as the single-face split used for plotting,
-    on both grids of the pillbox with a dielectric rod (PEC and dielectric
-    interfaces)."""
-    grid = _pillbox_grid(pillbox_stls, "conformal", rod=True, n_cells=10)
+def test_face_split_tilted_plane(tmp_path):
+    """A half-space bounded by a tilted plane cuts every face along a
+    straight line, so the split is exact: on both grids, all faces with
+    corners on both sides are split and listed, with the area fractions of
+    the face clipped by the plane, and the returned polygons have these
+    areas."""
+    center = np.array([0.513, 0.47, 0.5])
+    normal = np.array([np.cos(np.radians(25)), np.sin(np.radians(25)), 0.0])
+    # Box whose +x face is the plane, reaching beyond the domain elsewhere.
+    box = pv.Box(bounds=(-3, 0, -3, 3, -3, 3)).triangulate()
+    box.rotate_z(25).translate(center).save(tmp_path / "half.stl")
+    grid = GridFIT3D(
+        *(0, 1) * 3,
+        9,
+        9,
+        9,
+        stl_solids={"half": str(tmp_path / "half.stl")},
+        stl_materials={"half": [2, 1, 0]},
+        geometry_mode="conformal",
+        stl_method="legacy",
+        verbose=0,
+    )
+    solid = grid.region_key_to_id["half"]
+
+    def area(polygon):
+        # Area of a planar polygon in 3D; repeated vertices add nothing.
+        return 0.5 * np.linalg.norm(np.cross(polygon, np.roll(polygon, -1, 0)).sum(0))
+
+    def outside_fraction(corners):
+        # Face clipped to the background side of the plane (one-line
+        # Sutherland-Hodgman).
+        kept = []
+        for p, q in zip(corners, np.roll(corners, -1, axis=0)):
+            fp, fq = (p - center) @ normal, (q - center) @ normal
+            if fp > 0:
+                kept.append(p)
+            if (fp > 0) != (fq > 0):
+                kept.append(p + fp / (fp - fq) * (q - p))
+        return area(np.array(kept)) / area(corners)
+
     for grid_type in ("primal", "dual"):
-        faces = grid.face_intersections[grid_type]
-        assert len(faces.face) > 0
-        N = grid.Nx * grid.Ny * grid.Nz
-        offset = np.zeros((len(faces.face), 3), dtype=int)
-        if grid_type == "dual":
-            offset[np.arange(len(faces.face)), faces.face // N] = 1
-        index = np.column_stack(
-            np.unravel_index(faces.face % N, (grid.Nx, grid.Ny, grid.Nz), order="F")
-        )
-        for k, (axis, face) in enumerate(zip(faces.face // N, index + offset)):
-            polygons = contract_polygons(grid, grid_type, "xyz"[axis], tuple(face))
-            (region_a, _, fraction_a), (region_b, _, _) = sorted(
-                polygons, key=lambda polygon: polygon[0]
+        coordinates = np.array(grid._get_grid_coordinates(grid_type))
+        n_listed = 0
+        for axis, direction in enumerate("xyz"):
+            a, b = (axis + 1) % 3, (axis + 2) % 3
+            shape = np.full(3, len(coordinates[0]) - 1)
+            shape[axis] += 1
+            face = np.indices(shape).reshape(3, -1).T
+            unit = np.eye(3, dtype=int)
+            corner_index = np.stack(
+                [face, face + unit[a], face + unit[a] + unit[b], face + unit[b]], axis=1
             )
-            assert (region_a, region_b) == (faces.region_a[k], faces.region_b[k])
-            assert fraction_a == pytest.approx(faces.fraction_a[k], abs=1e-12)
+            corners = np.stack(
+                [coordinates[d][corner_index[:, :, d]] for d in range(3)], axis=-1
+            )
+            side = (corners - center) @ normal > 0
+            crossed = np.flatnonzero(side.any(axis=1) & ~side.all(axis=1))
+
+            split = face_polygons(
+                grid, grid_type, direction, face, grid.edge_intersections[grid_type]
+            )
+            np.testing.assert_array_equal(np.sort(split["position"]), crossed)
+            assert np.all(split["regions"] == [0, solid])
+            for k, position in enumerate(split["position"]):
+                face_area = area(corners[position])
+                expected = outside_fraction(corners[position])
+                # STL vertices are stored in single precision.
+                assert split["fractions"][k, 0] == pytest.approx(expected, abs=1e-6)
+                for polygon, fraction in zip(
+                    split["vertices"][k], split["fractions"][k]
+                ):
+                    assert area(polygon) == pytest.approx(fraction * face_area)
+            flat = grid._flat_field_index(grid_type, "face", direction, face[crossed])
+            n_listed += np.count_nonzero(flat >= 0)
+        assert len(grid.face_intersections[grid_type].face) == n_listed
 
 
 def test_conductor_background_type():
@@ -587,7 +639,7 @@ def test_plot_mesh_materials_diagnostics(tmp_path):
         ("dual", "z", 6, {"thin_feature": 25, "inconsistent": 0}),
         ("primal", "z", 2, {"thin_feature": 0, "inconsistent": 3}),
     ):
-        data = solver._mesh_slice_data(grid_type, normal, index, "eps")
+        data = solver._mesh_slice_data(grid_type, normal, index, "eps", [])
         counts = {key: len(points) for key, points in data["diagnostics"].items()}
         assert counts == expected
 
@@ -606,6 +658,6 @@ def test_plot_mesh_materials_diagnostics(tmp_path):
 
     # Without use_stl the solver has no cut-cell metrics: plain mesh, no markers.
     plain = SolverFIT3D(grid, bg="pec", verbose=0)
-    data = plain._mesh_slice_data("dual", "z", 6, "eps")
+    data = plain._mesh_slice_data("dual", "z", 6, "eps", [])
     assert all(len(points) == 0 for points in data["diagnostics"].values())
     plain.plot_mesh_materials("primal", normal="z", ax=Figure().add_subplot())

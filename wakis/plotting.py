@@ -9,7 +9,7 @@ import pyvista as pv
 from scipy.constants import epsilon_0 as eps_0
 from scipy.constants import mu_0
 
-from .intersection import contract_polygons, edge_diagnostic_masks
+from .intersection import face_polygons
 
 
 class PlotMixinSolver:
@@ -1629,7 +1629,8 @@ class PlotMixinSolver:
             primal grid, eps or sigma on the dual grid, so the buttons also
             switch the grid) and the plane normal, and a slider for the plane
             index. ``grid_type``, ``normal``, ``index`` and ``quantity`` set
-            the starting view. Requires an interactive backend, e.g.
+            the starting view; the plot is redrawn when the slider is
+            released. Requires an interactive backend, e.g.
             ``%matplotlib widget`` in Jupyter (``ipympl``). Default False.
         show_stl : bool, optional
             Draw the intersection of the STL surfaces with the plane as black
@@ -1679,6 +1680,12 @@ class PlotMixinSolver:
         else:
             fig = ax.figure
 
+        # Read once: every redraw slices the same surfaces.
+        surfaces = (
+            [self.grid.read_stl(key) for key in self.grid.stl_solids]
+            if show_stl and self.grid.stl_solids
+            else []
+        )
         state = {
             "grid_type": grid_type,
             "normal": normal,
@@ -1690,9 +1697,13 @@ class PlotMixinSolver:
         def draw():
             ax.clear()
             data = self._mesh_slice_data(
-                state["grid_type"], state["normal"], state["index"], state["quantity"]
+                state["grid_type"],
+                state["normal"],
+                state["index"],
+                state["quantity"],
+                surfaces,
             )
-            state["index"] = data["index"]
+            state["index"] = state["shown_index"] = data["index"]
             mappable = self._draw_mesh_slice(
                 ax, data, cmap, show_stl, show_stabilization, show_diagnostics
             )
@@ -1719,13 +1730,15 @@ class PlotMixinSolver:
         # Dual planes 0 and N lie on the domain boundary and carry no DOFs.
         return (0, n_nodes - 1) if grid_type == "primal" else (1, n_nodes - 1)
 
-    def _mesh_slice_data(self, grid_type, normal, index, quantity):
+    def _mesh_slice_data(self, grid_type, normal, index, quantity, surfaces):
         """
         Collect the faces, edges and STL lines of one grid plane.
 
-        Returns plain 2D geometry (in the in-plane coordinates) with the
-        material value and flags of every face, so that drawing is separate
-        from the FIT data access.
+        Returns plain 2D geometry (in the in-plane coordinates a, b) as
+        arrays over the plane: the material value and flags of every face,
+        the polygons of cut faces and the edge segments per style, so that
+        drawing is separate from the FIT data access. ``surfaces`` are the
+        STL surfaces (read once by the caller) to intersect with the plane.
         """
         low, high = self._mesh_slice_range(grid_type, normal)
         if index is None:
@@ -1741,183 +1754,200 @@ class PlotMixinSolver:
         a, b = (d for d in "xyz" if d != normal)
         ia, ib = "xyz".index(a), "xyz".index(b)
         grid = self.grid
-        coords = (
-            (grid.x, grid.y, grid.z)
-            if grid_type == "primal"
-            else (grid.tx, grid.ty, grid.tz)
-        )
+        coords = grid._get_grid_coordinates(grid_type)
         ca, cb = coords[ia], coords[ib]
 
-        def at(i_normal, j_a, j_b):
-            idx = [0, 0, 0]
-            idx[axis], idx[ia], idx[ib] = i_normal, j_a, j_b
-            return tuple(idx)
+        def plane(values, plane_index=index):
+            # 2D (a, b) slice of a 3D array at the plane.
+            return np.take(np.asarray(values), plane_index, axis=axis)
 
-        def rectangle(j_a, j_b):
-            return np.array(
+        def runs(mask, c_along, c_across):
+            # One segment per run of consecutive True edges along axis 0 of
+            # ``mask`` (edge i spans c_along[i] ... c_along[i + 1], line j
+            # lies at c_across[j]): long lines instead of single edges.
+            padded = np.zeros((mask.shape[1], mask.shape[0] + 2), dtype=np.int8)
+            padded[:, 1:-1] = mask.T
+            change = np.diff(padded, axis=1)
+            line, first = np.nonzero(change == 1)
+            _, stop = np.nonzero(change == -1)
+            return np.stack(
                 [
-                    (ca[j_a], cb[j_b]),
-                    (ca[j_a + 1], cb[j_b]),
-                    (ca[j_a + 1], cb[j_b + 1]),
-                    (ca[j_a], cb[j_b + 1]),
-                ]
+                    np.column_stack((c_along[first], c_across[line])),
+                    np.column_stack((c_along[stop], c_across[line])),
+                ],
+                axis=1,
             )
 
-        ieps = {d: np.asarray(self.ieps.to_matrix(d)) for d in "xyz"}
+        def in_plane(segments, d):
+            # (along, across) segments of edges along d in (a, b) order.
+            return segments if d == a else segments[..., ::-1]
+
+        ieps = {d: self.ieps.to_matrix(d) for d in "xyz"}
         # The cut-cell metrics only exist when the solver applies the STL
         # materials (use_stl=True); otherwise show the uncut mesh.
         conformal = (
             grid.geometry_mode == "conformal" and self.area_floored_faces is not None
         )
-        if conformal:
-            _, is_conductor = grid._region_type_flags()
-            region_ids = grid.region_ids["primal"]
-            primal_cuts = grid.edge_intersections["primal"]
-            cut_alpha = {
-                direction: dict(
-                    zip(map(tuple, cuts.index.tolist()), cuts.alpha.tolist())
-                )
-                for direction, cuts in primal_cuts.items()
-            }
-
-            def edge_alpha(direction, edge):
-                return cut_alpha[direction].get(tuple(int(i) for i in edge), np.nan)
-
-        faces = []
-        edges = []
+        empty_polygons = np.empty((0, 6, 2))
+        material_polygons, pec_polygons = empty_polygons, empty_polygons
+        polygon_values = np.empty(0)
+        segments = {"mesh": [], "pec": [], "eliminated": []}
 
         if grid_type == "primal":
-            mu_r = 1.0 / (np.asarray(self.imu.to_matrix(normal)) * mu_0)
+            # Faces (Na-1, Nb-1) and the edges along a (Na-1, Nb) and b
+            # (Na, Nb-1) of the plane.
+            live = {a: plane(ieps[a])[:-1, :] != 0.0, b: plane(ieps[b])[:, :-1] != 0.0}
+            values = 1.0 / (plane(self.imu.to_matrix(normal))[:-1, :-1] * mu_0)
+            # No active edge around the face: no circulation of E drives
+            # this H DOF, the face is inside PEC.
+            pec = (
+                ~live[a][:, :-1] & ~live[a][:, 1:] & ~live[b][:-1, :] & ~live[b][1:, :]
+            )
+            face = np.stack(
+                np.meshgrid(
+                    np.arange(len(ca) - 1), np.arange(len(cb) - 1), indexing="ij"
+                ),
+                axis=-1,
+            ).reshape(-1, 2)
+            face = np.insert(face, axis, index, axis=1)
+            flat = grid._flat_field_index("primal", "face", normal, face)
+            floored = np.zeros(values.shape, dtype=bool)
+            unresolved = np.zeros(values.shape, dtype=bool)
             if conformal:
-                split_faces = set(grid.face_intersections["primal"].face.tolist())
-                floored_faces = set(self.area_floored_faces.tolist())
-
-            for j_a in range(len(ca) - 1):
-                for j_b in range(len(cb) - 1):
-                    face = at(index, j_a, j_b)
-                    record = {
-                        "vertices": rectangle(j_a, j_b),
-                        "cell": rectangle(j_a, j_b),
-                        "value": mu_r[face],
-                        # No active edge around the face: no circulation of
-                        # E drives this H DOF, the face is inside PEC.
-                        "pec": all(
-                            ieps[d][at(index, j_a + da, j_b + db)] == 0.0
-                            for d, da, db in (
-                                (a, 0, 0),
-                                (a, 0, 1),
-                                (b, 0, 0),
-                                (b, 1, 0),
-                            )
-                        ),
-                        "floored": conformal
-                        and int(grid._flat_field_index("primal", "face", normal, face))
-                        in floored_faces,
-                        "unresolved": False,
-                    }
-                    if conformal:
-                        conductor_corners = is_conductor[
-                            [
-                                region_ids[at(index, j_a + da, j_b + db)]
-                                for da, db in ((0, 0), (1, 0), (1, 1), (0, 1))
-                            ]
-                        ]
-                        if conductor_corners.any() and not conductor_corners.all():
-                            flat = int(
-                                grid._flat_field_index("primal", "face", normal, face)
-                            )
-                            polygons = (
-                                contract_polygons(grid, "primal", normal, face)
-                                if flat in split_faces
-                                else None
-                            )
-                            parts = {
-                                bool(is_conductor[region]): vertices[:, [ia, ib]]
-                                for region, vertices, _ in polygons or []
-                            }
-                            if False in parts:
-                                record["vertices"] = parts[False]
-                                record["pec_part"] = parts.get(True)
-                            else:
-                                record["unresolved"] = True
-                    faces.append(record)
+                floored = np.isin(flat, self.area_floored_faces).reshape(values.shape)
+                _, is_conductor = grid._region_type_flags()
+                conductor = is_conductor[plane(grid.region_ids["primal"])]
+                corners = np.stack(
+                    [
+                        conductor[:-1, :-1],
+                        conductor[1:, :-1],
+                        conductor[1:, 1:],
+                        conductor[:-1, 1:],
+                    ]
+                )
+                mixed = (corners.any(axis=0) & ~corners.all(axis=0)).ravel()
+                # Faces cut by a conductor wall and split in the contract:
+                # draw the part in the normal material and the conductor
+                # part separately.
+                listed = mixed & np.isin(flat, grid.face_intersections["primal"].face)
+                split = face_polygons(
+                    grid,
+                    "primal",
+                    normal,
+                    face[listed],
+                    grid.edge_intersections["primal"],
+                )
+                normal_side = ~is_conductor[split["regions"]]
+                drawn = normal_side.any(axis=1)
+                cell = np.flatnonzero(listed)[split["position"]][drawn]
+                rows = np.arange(len(cell))
+                side = np.argmax(normal_side[drawn], axis=1)
+                vertices = split["vertices"][drawn][:, :, :, [ia, ib]]
+                resolved = np.zeros(mixed.shape, dtype=bool)
+                resolved[cell] = True
+                unresolved = (mixed & ~resolved).reshape(values.shape)
+                # Faces inside PEC stay grey as a whole.
+                shown = ~pec.ravel()[cell]
+                material_polygons = vertices[rows, side][shown]
+                pec_polygons = vertices[rows, 1 - side][shown]
+                polygon_values = values.ravel()[cell[shown]]
+                resolved[cell[~shown]] = False
+                values = np.where(resolved.reshape(values.shape), np.nan, values)
 
             # In-plane primal edges: E DOFs. The active part (in the normal
             # material) is drawn dark, edges and edge parts in PEC lighter.
-            for d in (a, b):
-                c_d, c_other = (ca, cb) if d == a else (cb, ca)
-                for j_d in range(len(c_d) - 1):
-                    for j_o in range(len(c_other)):
-                        edge = at(index, j_d, j_o) if d == a else at(index, j_o, j_d)
-                        t0, t1, style = 0.0, 1.0, "mesh"
-                        live = ieps[d][edge] != 0.0
-                        if conformal:
-                            end_node = list(edge)
-                            end_node["xyz".index(d)] += 1
-                            start = is_conductor[region_ids[edge]]
-                            end = is_conductor[region_ids[tuple(end_node)]]
-                            alpha = edge_alpha(d, edge)
-                            if start and end:
-                                style = "pec"
-                            elif not live:
-                                style = "eliminated"  # removed entirely
-                            elif start != end and np.isfinite(alpha):
-                                t0, t1 = (alpha, 1.0) if start else (0.0, alpha)
-                        elif not live:
-                            style = "pec"
+            for d, other in ((a, b), (b, a)):
+                c_d, c_other = coords["xyz".index(d)], coords["xyz".index(other)]
+                # Edge arrays with the edge direction along axis 0.
+                orient = (lambda x: x) if d == a else np.transpose
+                alive = orient(live[d])
+                if not conformal:
+                    segments["pec"].append(in_plane(runs(~alive, c_d, c_other), d))
+                    segments["mesh"].append(in_plane(runs(alive, c_d, c_other), d))
+                    continue
+                start = orient(conductor[:-1, :] if d == a else conductor[:, :-1])
+                end = orient(conductor[1:, :] if d == a else conductor[:, 1:])
+                cuts = grid.edge_intersections["primal"][d]
+                on_plane = cuts.index[:, axis] == index
+                alpha = np.full(alive.shape, np.nan)
+                alpha[
+                    cuts.index[on_plane, "xyz".index(d)],
+                    cuts.index[on_plane, "xyz".index(other)],
+                ] = cuts.alpha[on_plane]
 
-                        def segment(s0, s1):
-                            p0 = c_d[j_d] + s0 * (c_d[j_d + 1] - c_d[j_d])
-                            p1 = c_d[j_d] + s1 * (c_d[j_d + 1] - c_d[j_d])
-                            q = c_other[j_o]
-                            return [(p0, q), (p1, q)] if d == a else [(q, p0), (q, p1)]
+                full_pec = start & end
+                eliminated = ~full_pec & ~alive  # removed entirely
+                cut = ~full_pec & alive & (start != end) & np.isfinite(alpha)
+                segments["pec"].append(in_plane(runs(full_pec, c_d, c_other), d))
+                segments["eliminated"].append(
+                    in_plane(runs(eliminated, c_d, c_other), d)
+                )
+                segments["mesh"].append(
+                    in_plane(runs(~full_pec & ~eliminated & ~cut, c_d, c_other), d)
+                )
+                # Cut edges: the active part up to the wall, and the part
+                # inside the conductor.
+                i, j = np.nonzero(cut)
+                t = alpha[i, j]
+                from_start = start[i, j]
+                p0, p1, q = c_d[i], c_d[i + 1], c_other[j]
 
-                        edges.append({"segment": segment(t0, t1), "style": style})
-                        # The part of a cut edge inside the conductor.
-                        if t0 > 0.0:
-                            edges.append({"segment": segment(0.0, t0), "style": "pec"})
-                        elif t1 < 1.0:
-                            edges.append({"segment": segment(t1, 1.0), "style": "pec"})
+                def piece(s0, s1, p0=p0, p1=p1, q=q):
+                    return np.stack(
+                        [
+                            np.column_stack((p0 + s0 * (p1 - p0), q)),
+                            np.column_stack((p0 + s1 * (p1 - p0), q)),
+                        ],
+                        axis=1,
+                    )
+
+                segments["mesh"].append(
+                    in_plane(
+                        piece(
+                            np.where(from_start, t, 0.0), np.where(from_start, 1.0, t)
+                        ),
+                        d,
+                    )
+                )
+                segments["pec"].append(
+                    in_plane(
+                        piece(
+                            np.where(from_start, 0.0, t), np.where(from_start, t, 1.0)
+                        ),
+                        d,
+                    )
+                )
 
             label = rf"$\mu_{{r,{normal}}}$"
             log_scale = False
 
         else:
             e_index = index - 1  # dual plane t[i] holds the E DOFs of edge i-1
+            eps_plane = plane(ieps[normal], e_index)
+            pec = eps_plane == 0.0
             if quantity == "eps":
                 with np.errstate(divide="ignore"):  # PEC edges: ieps = 0
-                    values = 1.0 / (ieps[normal] * eps_0)
+                    values = 1.0 / (eps_plane * eps_0)
                 label = rf"$\varepsilon_{{r,{normal}}}$"
             else:
-                values = np.asarray(self.sigma.to_matrix(normal))
+                values = np.array(plane(self.sigma.to_matrix(normal), e_index))
                 label = rf"$\sigma_{{{normal}}}$ [S/m]"
-            eliminated = np.zeros(ieps[normal].size, dtype=bool)
+            values = np.where(pec, np.nan, values)
+            floored = np.zeros(pec.shape, dtype=bool)
             if conformal:
-                N = ieps[normal].size
+                N = self.N
                 removed = self.eliminated_edges
-                eliminated[removed[removed // N == "xyz".index(normal)] % N] = True
-            eliminated = eliminated.reshape(ieps[normal].shape, order="F")
-
-            for j_a in range(len(ca) - 1):
-                for j_b in range(len(cb) - 1):
-                    dof = at(e_index, j_a, j_b)
-                    pec = ieps[normal][dof] == 0.0
-                    faces.append(
-                        {
-                            "vertices": rectangle(j_a, j_b),
-                            "cell": rectangle(j_a, j_b),
-                            "value": np.nan if pec else values[dof],
-                            "pec": pec,
-                            "floored": bool(eliminated[dof]),
-                            "unresolved": False,
-                        }
-                    )
+                removed = removed[removed // N == axis] % N
+                edge = np.column_stack(
+                    np.unravel_index(removed, (self.Nx, self.Ny, self.Nz), order="F")
+                )
+                edge = edge[edge[:, axis] == e_index]
+                floored[edge[:, ia], edge[:, ib]] = True
+            unresolved = np.zeros(pec.shape, dtype=bool)
             # Dual edges are never cut: draw them as full grid lines.
-            edges += [
-                {"segment": [(ca[0], q), (ca[-1], q)], "style": "mesh"} for q in cb
-            ]
-            edges += [
-                {"segment": [(p, cb[0]), (p, cb[-1])], "style": "mesh"} for p in ca
+            segments["mesh"] += [
+                np.array([[(ca[0], q), (ca[-1], q)] for q in cb]),
+                np.array([[(p, cb[0]), (p, cb[-1])] for p in ca]),
             ]
             log_scale = quantity == "sigma"
 
@@ -1925,20 +1955,27 @@ class PlotMixinSolver:
 
         stl_lines = []
         position = coords[axis][index]
-        if grid.stl_solids:
-            origin = np.zeros(3)
-            origin[axis] = position
-            for key in grid.stl_solids:
-                section = grid.read_stl(key).slice(
-                    normal=np.eye(3)[axis], origin=origin
-                )
-                for cell in range(section.n_cells):
-                    stl_lines.append(section.get_cell(cell).points[:, [ia, ib]])
+        origin = np.zeros(3)
+        origin[axis] = position
+        for surface in surfaces:
+            section = surface.slice(normal=np.eye(3)[axis], origin=origin)
+            for line in range(section.n_cells):
+                stl_lines.append(section.get_cell(line).points[:, [ia, ib]])
 
         return {
             "index": index,
-            "faces": faces,
-            "edges": edges,
+            "nodes": (ca, cb),
+            "values": values,
+            "pec": pec,
+            "floored": floored,
+            "unresolved": unresolved,
+            "material_polygons": material_polygons,
+            "polygon_values": polygon_values,
+            "pec_polygons": pec_polygons,
+            "edges": {
+                style: np.concatenate(parts) if parts else np.empty((0, 2, 2))
+                for style, parts in segments.items()
+            },
             "stl_lines": stl_lines,
             "diagnostics": diagnostics,
             "label": label,
@@ -1960,44 +1997,47 @@ class PlotMixinSolver:
         midpoint). Staircase grids have no diagnostics.
         """
         empty = np.empty((0, 2))
-        result = {"thin_feature": [empty], "inconsistent": [empty]}
         grid = self.grid
         if not conformal or not grid.conformal_diagnostics:
-            return {key: empty for key in result}
+            return {"thin_feature": empty, "inconsistent": empty}
 
         axis = "xyz".index(normal)
         a, b = (d for d in "xyz" if d != normal)
-        coords = (
-            (grid.x, grid.y, grid.z)
-            if grid_type == "primal"
-            else (grid.tx, grid.ty, grid.tz)
-        )
+        ia, ib = "xyz".index(a), "xyz".index(b)
+        coords = grid._get_grid_coordinates(grid_type)
+        primal = grid._get_grid_coordinates("primal")
 
-        def collect(masks, mask_index, axes_a, axes_b):
-            # 2D slice in plane order (a, b); axes_* are the point coordinates.
-            for key, mask in zip(("thin_feature", "inconsistent"), masks):
-                i, j = np.nonzero(np.take(mask, mask_index, axis=axis))
-                result[key].append(np.column_stack((axes_a[i], axes_b[j])))
+        def points(edge, plane_index, coords, d):
+            # In-plane position of the edges (geometry indices) on the plane:
+            # their midpoint along d.
+            edge = edge[edge[:, axis] == plane_index]
+            point = []
+            for k in (ia, ib):
+                c = coords[k][edge[:, k]]
+                if "xyz"[k] == d:
+                    c = 0.5 * (c + coords[k][edge[:, k] + 1])
+                point.append(c)
+            return np.column_stack(point)
 
-        # In-plane edges of the shown grid: marker at the edge midpoint.
-        for d in (a, b):
-            c_a, c_b = coords["xyz".index(a)], coords["xyz".index(b)]
-            mid_a = c_a if d != a else 0.5 * (c_a[:-1] + c_a[1:])
-            mid_b = c_b if d != b else 0.5 * (c_b[:-1] + c_b[1:])
-            collect(edge_diagnostic_masks(grid, grid_type, d), index, mid_a, mid_b)
-
-        # Dual plane t[i] cuts the primal edges i-1 along the normal at their
-        # midpoints: these edges pierce the dual faces of the plane.
-        if grid_type == "dual":
-            primal = (grid.x, grid.y, grid.z)
-            collect(
-                edge_diagnostic_masks(grid, "primal", normal),
-                index - 1,
-                primal["xyz".index(a)],
-                primal["xyz".index(b)],
-            )
-
-        return {key: np.vstack(points) for key, points in result.items()}
+        result = {}
+        for key in ("thin_feature", "inconsistent"):
+            found = [
+                points(grid.conformal_diagnostics[grid_type][d][key], index, coords, d)
+                for d in (a, b)
+            ]
+            # Dual plane t[i] cuts the primal edges i-1 along the normal at
+            # their midpoints: these edges pierce the dual faces of the plane.
+            if grid_type == "dual":
+                found.append(
+                    points(
+                        grid.conformal_diagnostics["primal"][normal][key],
+                        index - 1,
+                        primal,
+                        normal,
+                    )
+                )
+            result[key] = np.vstack(found)
+        return result
 
     @staticmethod
     def _draw_mesh_slice(
@@ -2005,73 +2045,84 @@ class PlotMixinSolver:
     ):
         """Draw the output of _mesh_slice_data; return the face mappable."""
         from matplotlib.collections import LineCollection, PolyCollection
-        from matplotlib.colors import LogNorm, Normalize
+        from matplotlib.colors import ListedColormap, LogNorm, Normalize
         from matplotlib.lines import Line2D
         from matplotlib.patches import Patch
 
-        faces = data["faces"]
-        material = [f for f in faces if not f["pec"]]
-        values = np.array([f["value"] for f in material], dtype=float)
+        ca, cb = data["nodes"]
+        values = data["values"]
+        # The colour scale covers all faces outside PEC, cut ones included.
+        material = np.concatenate([values[~data["pec"]], data["polygon_values"]])
+        polygon_values = data["polygon_values"]
 
         colormap = plt.get_cmap(cmap).copy()
         colormap.set_bad("white")
-        positive = values[values > 0]
-        if not np.isfinite(values).any():
+        positive = material[material > 0]
+        if not np.isfinite(material).any():
             norm = Normalize(0.0, 1.0)  # plane entirely inside PEC
         elif data["log_scale"] and positive.size:
             norm = LogNorm(positive.min(), positive.max())
             values = np.where(values > 0, values, np.nan)
+            polygon_values = np.where(polygon_values > 0, polygon_values, np.nan)
         else:
-            low, high = np.nanmin(values), np.nanmax(values)
+            low, high = np.nanmin(material), np.nanmax(material)
             if high - low < 1e-9 * max(abs(high), 1.0):
                 low, high = low - 0.5, high + 0.5
             norm = Normalize(low, high)
 
-        mappable = PolyCollection(
-            [f["vertices"] for f in material],
-            array=values,
-            cmap=colormap,
-            norm=norm,
-            edgecolors="none",
+        def rectangles(mask):
+            i, j = np.nonzero(mask)
+            return np.stack(
+                [
+                    np.column_stack((ca[i], cb[j])),
+                    np.column_stack((ca[i + 1], cb[j])),
+                    np.column_stack((ca[i + 1], cb[j + 1])),
+                    np.column_stack((ca[i], cb[j + 1])),
+                ],
+                axis=1,
+            )
+
+        # One mesh for the uncut faces (cut ones are NaN), the cut faces as
+        # polygons on top in the same colour scale.
+        mappable = ax.pcolormesh(
+            ca, cb, np.ma.masked_invalid(values).T, cmap=colormap, norm=norm
         )
-        ax.add_collection(mappable)
         ax.add_collection(
             PolyCollection(
-                [f["vertices"] for f in faces if f["pec"]]
-                + [f["pec_part"] for f in faces if f.get("pec_part") is not None],
-                facecolors="0.6",
+                data["material_polygons"],
+                array=polygon_values,
+                cmap=colormap,
+                norm=norm,
                 edgecolors="none",
             )
         )
+        ax.pcolormesh(
+            ca,
+            cb,
+            np.ma.masked_where(~data["pec"], np.zeros(data["pec"].shape)).T,
+            cmap=ListedColormap(["0.6"]),
+        )
+        ax.add_collection(
+            PolyCollection(data["pec_polygons"], facecolors="0.6", edgecolors="none")
+        )
         ax.add_collection(
             PolyCollection(
-                [f["vertices"] for f in faces if f["unresolved"]],
+                rectangles(data["unresolved"]),
                 facecolors="none",
                 edgecolors="0.3",
                 hatch="//",
                 linewidths=0.0,
             )
         )
-        ax.add_collection(
-            LineCollection(
-                [e["segment"] for e in data["edges"] if e["style"] == "pec"],
-                colors="0.45",
-                linewidths=0.6,
-            )
-        )
-        ax.add_collection(
-            LineCollection(
-                [e["segment"] for e in data["edges"] if e["style"] == "mesh"],
-                colors="0.25",
-                linewidths=0.6,
-            )
-        )
+        edges = data["edges"]
+        ax.add_collection(LineCollection(edges["pec"], colors="0.45", linewidths=0.6))
+        ax.add_collection(LineCollection(edges["mesh"], colors="0.25", linewidths=0.6))
 
         handles = [Patch(facecolor="0.6", label="PEC")]
         if show_stabilization:
             ax.add_collection(
                 PolyCollection(
-                    [f["cell"] for f in faces if f["floored"]],
+                    rectangles(data["floored"]),
                     facecolors="none",
                     edgecolors="red",
                     linewidths=1.2,
@@ -2080,19 +2131,14 @@ class PlotMixinSolver:
             )
             ax.add_collection(
                 LineCollection(
-                    [e["segment"] for e in data["edges"] if e["style"] == "eliminated"],
-                    colors="red",
-                    linewidths=1.2,
-                    linestyles="--",
+                    edges["eliminated"], colors="red", linewidths=1.2, linestyles="--"
                 )
             )
-            if any(f["floored"] for f in faces) or any(
-                e["style"] == "eliminated" for e in data["edges"]
-            ):
+            if data["floored"].any() or len(edges["eliminated"]):
                 handles.append(
                     Patch(facecolor="none", edgecolor="red", label="stabilized")
                 )
-        if any(f["unresolved"] for f in faces):
+        if data["unresolved"].any():
             handles.append(
                 Patch(facecolor="none", edgecolor="0.3", hatch="//", label="unresolved")
             )
@@ -2157,7 +2203,14 @@ class PlotMixinSolver:
 
         def on_index(value):
             state["index"] = int(value)
-            draw()
+            # While the slider is dragged, every index passed would trigger
+            # a full redraw; redraw once it is released instead.
+            if not slider.drag_active:
+                draw()
+
+        def on_release(event):
+            if state["index"] != state["shown_index"]:
+                draw()
 
         def on_normal(label):
             state["normal"] = label
@@ -2180,6 +2233,7 @@ class PlotMixinSolver:
             update_slider()
 
         slider.on_changed(on_index)
+        fig.canvas.mpl_connect("button_release_event", on_release)
         normal_axes = fig.add_axes([0.02, 0.38, 0.12, 0.18])
         normal_axes.set_title("normal", fontsize=9)
         normal_buttons = RadioButtons(

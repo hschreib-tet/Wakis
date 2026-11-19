@@ -12,9 +12,8 @@ sparse lists per grid, one record per cut edge (``EdgeIntersections``) and
 per cut face (``FaceIntersections``). This module holds that contract and
 everything computed from it alone, so the backends are interchangeable:
 
-- the geometric split of a face along its cut points (``face_cut_groups``,
-  ``face_polygons``, ``contract_polygons``) and the geometry diagnostics
-  shared by the backends (``edge_diagnostic_masks``, ``warn_diagnostics``);
+- the geometric split of faces along their cut points (``split_faces``,
+  ``face_polygons``) and the geometry diagnostics shared by the backends (``edge_diagnostic_masks``, ``warn_diagnostics``);
 - the cut primal metrics (``conformal_metrics``, ``eliminate_small_edges``)
   and the effective materials (``conformal_materials``), used by
   ``SolverFIT3D``.
@@ -131,154 +130,209 @@ def normal_normal_edge_mask(grid, grid_type, direction):
     return (start != end) & is_normal[start] & is_normal[end]
 
 
-def _polygon_area(points_2d):
-    """Area of a simple polygon from its vertices in order (shoelace)."""
-    u, v = points_2d[:, 0], points_2d[:, 1]
-    return float(abs(0.5 * (np.dot(u, np.roll(v, -1)) - np.dot(v, np.roll(u, -1)))))
-
-
-def face_cut_groups(grid, grid_type, face_direction, index, lookup):
+def face_polygons(grid, grid_type, face_direction, face, edges):
     """
-    Corners and grouped cut points of one grid face.
+    Split faces of one grid along the straight line between their cut points.
 
-    ``lookup(axis, edge_index)`` returns ``(alpha, data)`` for a cut edge
-    (geometry index along ``axis``) or None. Corners run
-    counter-clockwise about the face normal (e_a x e_b = e_n); boundary
-    edge m runs from corner m to corner m + 1, so a point at boundary
-    parameter m + t lies on it at fraction t. Cut points of two edges at
-    their shared corner form one group.
+    A face with exactly two distinct cut points is split when each side
+    holds corners of a single region and the two regions differ. The
+    interface normal of a face is the mean normal at its cut points.
+    ``split_faces`` uses this for all faces of a grid, the mesh plot for
+    the faces of one plane.
+
+    Parameters
+    ----------
+    grid : GridFIT3D
+    grid_type : {"primal", "dual"}
+    face_direction : {"x", "y", "z"}
+        Normal direction of the faces.
+    face : ndarray of int, shape (n, 3)
+        Geometry indices of the faces (index of their lowest corner).
+    edges : dict
+        ``EdgeIntersections`` of this grid per direction.
 
     Returns
     -------
-    corner_indices, corners, (a, b), groups
-        ``groups`` is sorted by boundary parameter; each holds the
-        ``point``, its ``parameter`` and the ``cuts`` with their ``data``.
+    dict
+        For the split faces only: ``position`` (n_split,) into ``face``;
+        ``regions`` (n_split, 2), the region IDs of both sides in
+        increasing order; ``fractions`` (n_split, 2), their area fractions;
+        ``vertices`` (n_split, 2, 6, 3), the polygon of each side, padded by
+        repeating vertices; ``normal`` (n_split, 3), NaN where no cut edge
+        carries a normal.
     """
+    shape = np.array(grid.region_ids[grid_type].shape)
+    coordinates = grid._get_grid_coordinates(grid_type)
+    region_ids = grid.region_ids[grid_type]
+    unit = np.eye(3, dtype=np.int64)
     normal_axis = "xyz".index(face_direction)
     a, b = (normal_axis + 1) % 3, (normal_axis + 2) % 3
-    coordinates = grid._get_grid_coordinates(grid_type)
+    face = np.asarray(face, dtype=np.int64).reshape(-1, 3)
 
-    corner_indices = []
-    for da, db in ((0, 0), (1, 0), (1, 1), (0, 1)):
-        corner = list(index)
-        corner[a] += da
-        corner[b] += db
-        corner_indices.append(tuple(corner))
-    corners = np.array(
-        [[coordinates[d][c[d]] for d in range(3)] for c in corner_indices],
-        dtype=float,
+    # Cut edges per direction, sorted by their raveled geometry index.
+    keys = {}
+    for axis, direction in enumerate("xyz"):
+        edge_shape = shape - unit[axis]
+        key = np.ravel_multi_index(edges[direction].index.T, edge_shape)
+        order = np.argsort(key)
+        keys[axis] = (edge_shape, key[order], order)
+
+    # Corners counter-clockwise about the face normal (e_a x e_b = e_n);
+    # boundary edge m runs from corner m to corner m + 1.
+    corner_index = np.stack(
+        [face, face + unit[a], face + unit[a] + unit[b], face + unit[b]], axis=1
     )
+    corners = np.stack(
+        [coordinates[d][corner_index[:, :, d]] for d in range(3)], axis=-1
+    )
+    corner_regions = region_ids[
+        corner_index[:, :, 0], corner_index[:, :, 1], corner_index[:, :, 2]
+    ]
 
-    cut_points = []
-    for m in range(4):
-        c0, c1 = corner_indices[m], corner_indices[(m + 1) % 4]
-        axis = next(d for d in range(3) if c0[d] != c1[d])
-        forward = c1[axis] > c0[axis]
-        found = lookup(axis, c0 if forward else c1)
-        if found is None:
-            continue
-        alpha, data = found
+    # The four boundary edges: their axis, geometry index, and whether
+    # they run along the boundary direction (forward) or against it.
+    boundary = ((a, face, True), (b, face + unit[a], True),
+                (a, face + unit[b], False), (b, face, False))  # fmt: skip
+    alpha = np.full((len(face), 4), np.nan)
+    normals = np.full((len(face), 4, 3), np.nan)
+    for m, (axis, index, _) in enumerate(boundary):
+        edge_shape, sorted_keys, order = keys[axis]
+        position = _sparse_lookup(
+            sorted_keys, np.ravel_multi_index(index.T, edge_shape)
+        )
+        found = position >= 0
+        row = order[position[found]]
+        alpha[found, m] = edges["xyz"[axis]].alpha[row]
+        normals[found, m] = edges["xyz"[axis]].normal[row]
+
+    # Cut points: Cartesian position and boundary parameter m + t.
+    points = np.full((len(face), 4, 3), np.nan)
+    parameter = np.full((len(face), 4), np.inf)
+    for m, (_, _, forward) in enumerate(boundary):
         start, end = (m, (m + 1) % 4) if forward else ((m + 1) % 4, m)
-        cut_points.append(
-            {
-                "point": corners[start] + alpha * (corners[end] - corners[start]),
-                "parameter": m + (alpha if forward else 1.0 - alpha),
-                "data": data,
-            }
+        points[:, m] = corners[:, start] + alpha[:, m, None] * (
+            corners[:, end] - corners[:, start]
+        )
+        t = alpha[:, m] if forward else 1.0 - alpha[:, m]
+        parameter[:, m] = np.where(np.isfinite(alpha[:, m]), m + t, np.inf)
+
+    # Cut points of two edges at their shared corner are one point:
+    # going along the boundary, a point joins the first earlier group
+    # whose first point lies within the tolerance.
+    length = np.linalg.norm(np.roll(corners, -1, axis=1) - corners, axis=2)
+    tolerance = 1e-8 * np.max(length, axis=1)
+    order = np.argsort(parameter, axis=1, kind="stable")
+    rows = np.arange(len(face))[:, None]
+    sorted_points = points[rows, order]
+    sorted_parameter = parameter[rows, order]
+    group_point = np.full((len(face), 4, 3), np.nan)
+    group_parameter = np.full((len(face), 4), np.inf)
+    n_groups = np.zeros(len(face), dtype=np.int64)
+    for k in range(4):
+        valid = np.isfinite(sorted_parameter[:, k])
+        distance = np.linalg.norm(group_point - sorted_points[:, k, None], axis=2)
+        matches = (distance <= tolerance[:, None]) & (
+            np.arange(4)[None, :] < n_groups[:, None]
+        )
+        new_group = valid & ~matches.any(axis=1)
+        target = n_groups[new_group]
+        group_point[new_group, target] = sorted_points[new_group, k]
+        group_parameter[new_group, target] = sorted_parameter[new_group, k]
+        n_groups += new_group
+
+    # Exactly two distinct cut points.
+    two = np.flatnonzero(n_groups == 2)
+    corners, corner_regions = corners[two], corner_regions[two]
+    normals = normals[two]
+    start, end = group_parameter[two, 0], group_parameter[two, 1]
+    p_start, p_end = group_point[two, 0], group_point[two, 1]
+
+    # Side A runs from the first cut point to the second through the
+    # corners between them, side B on through the remaining corners.
+    corner_number = np.arange(4)[None, :]
+    side_a = (corner_number > start[:, None]) & (corner_number < end[:, None])
+    side_b = (corner_number > end[:, None]) | (corner_number < start[:, None])
+
+    def single_region(side):
+        # Region of the first corner on the side; all its corners must
+        # share it.
+        first_corner = np.argmax(side, axis=1)[:, None]
+        first = np.take_along_axis(corner_regions, first_corner, axis=1)[:, 0]
+        uniform = np.all(~side | (corner_regions == first[:, None]), axis=1)
+        return side.any(axis=1) & uniform, first
+
+    uniform_a, region_side_a = single_region(side_a)
+    uniform_b, region_side_b = single_region(side_b)
+
+    def area(vertices):
+        # Polygon area in the face plane (shoelace); repeated vertices add
+        # nothing.
+        u, v = vertices[:, :, a], vertices[:, :, b]
+        return np.abs(
+            0.5
+            * (
+                np.sum(u * np.roll(v, -1, axis=1), axis=1)
+                - np.sum(v * np.roll(u, -1, axis=1), axis=1)
+            )
         )
 
-    tolerance = 1e-8 * np.max(np.linalg.norm(np.roll(corners, -1, 0) - corners, axis=1))
-    groups = []
-    for cut in sorted(cut_points, key=lambda cut: cut["parameter"]):
-        for group in groups:
-            if np.linalg.norm(cut["point"] - group["point"]) <= tolerance:
-                group["cuts"].append(cut)
-                group["parameter"] = min(group["parameter"], cut["parameter"])
-                break
-        else:
-            groups.append(
-                {
-                    "point": cut["point"],
-                    "parameter": cut["parameter"],
-                    "cuts": [cut],
-                }
-            )
-    groups.sort(key=lambda group: group["parameter"])
-    return corner_indices, corners, (a, b), groups
+    def side_vertices(side, key, first, last):
+        # Polygon of a side: the cut point ``first``, its corners in
+        # boundary order (by ``key``) and the cut point ``last``. Unused
+        # corner slots repeat the previous vertex and add no area.
+        order = np.argsort(np.where(side, key, np.inf), axis=1, kind="stable")
+        chosen = np.take_along_axis(side, order, axis=1)
+        middle = np.take_along_axis(corners, order[:, :, None], axis=1)
+        vertices = np.empty_like(middle)
+        previous = first
+        for k in range(4):
+            vertices[:, k] = np.where(chosen[:, k, None], middle[:, k], previous)
+            previous = vertices[:, k]
+        return np.concatenate([first[:, None], vertices, last[:, None]], axis=1)
 
+    face_area = area(corners)
+    # Side B runs on through the corners after the second cut point and
+    # then, past the boundary start, through those before the first.
+    key_b = np.where(corner_number > end[:, None], corner_number, corner_number + 4)
+    vertices_a = side_vertices(side_a, corner_number, p_start, p_end)
+    vertices_b = side_vertices(side_b, key_b, p_end, p_start)
+    area_a, area_b = area(vertices_a), area(vertices_b)
 
-def face_polygons(grid, grid_type, corner_indices, corners, plane_axes, groups):
-    """
-    Split a face with two cut-point groups into its two polygons.
-
-    Both sides run from one cut point along the boundary, through the
-    corners passed, to the other cut point. The split is valid when
-    each side holds corners of one region and the two regions differ.
-
-    Returns
-    -------
-    list of (region_id, vertices, area_fraction) or None
-    """
-    a, b = plane_axes
-    region_ids = grid.region_ids[grid_type]
-    face_area = _polygon_area(corners[:, [a, b]])
-    polygons = []
-    for p, q in ((groups[0], groups[1]), (groups[1], groups[0])):
-        start, end = p["parameter"], q["parameter"]
-        if end <= start:
-            end += 4.0
-        # Corner m lies at boundary parameter m, unwrapped past start.
-        unwrapped = sorted((m + 4.0 if m <= start else m, m) for m in range(4))
-        passed = [m for parameter, m in unwrapped if start < parameter < end]
-        regions = {int(region_ids[corner_indices[m]]) for m in passed}
-        if len(regions) != 1:
-            return None
-        vertices = np.array([p["point"], *corners[passed], q["point"]])
-        area = _polygon_area(vertices[:, [a, b]])
-        if area <= 1e-12 * face_area:
-            return None
-        polygons.append((regions.pop(), vertices, area / face_area))
-
-    if polygons[0][0] == polygons[1][0]:
-        return None
-    return polygons
-
-
-def _edge_lookup(grid, grid_type, edges):
-    """
-    Cut-edge lookup for ``face_cut_groups``: ``lookup(axis, edge_index)``
-    returns ``(alpha, normal)`` of a cut edge, or None.
-    """
-    shape = grid.region_ids[grid_type].shape
-    rows = {}
-    for axis, direction in enumerate("xyz"):
-        edge_shape = list(shape)
-        edge_shape[axis] -= 1
-        keys = np.ravel_multi_index(edges[direction].index.T, edge_shape)
-        rows[axis] = (edge_shape, dict(zip(keys.tolist(), range(len(keys)))))
-
-    def lookup(axis, edge_index):
-        edge_shape, row_of = rows[axis]
-        row = row_of.get(int(np.ravel_multi_index(edge_index, edge_shape)))
-        if row is None:
-            return None
-        cuts = edges["xyz"[axis]]
-        return float(cuts.alpha[row]), cuts.normal[row]
-
-    return lookup
+    valid = (
+        uniform_a
+        & uniform_b
+        & (region_side_a != region_side_b)
+        & (area_a > 1e-12 * face_area)
+        & (area_b > 1e-12 * face_area)
+    )
+    # Order the two sides by region ID.
+    swap = (region_side_a > region_side_b)[valid]
+    regions = np.stack([region_side_a, region_side_b], axis=1)[valid]
+    fractions = np.stack([area_a, area_b], axis=1)[valid] / face_area[valid, None]
+    vertices = np.stack([vertices_a, vertices_b], axis=1)[valid]
+    regions[swap] = regions[swap, ::-1]
+    fractions[swap] = fractions[swap, ::-1]
+    vertices[swap] = vertices[swap, ::-1]
+    mean_normal = np.nanmean(normals[valid], axis=1)
+    norm = np.linalg.norm(mean_normal, axis=1, keepdims=True)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        normal = np.where(norm > 0.0, mean_normal / norm, np.nan)
+    return {
+        "position": two[valid],
+        "regions": regions,
+        "fractions": fractions,
+        "vertices": vertices,
+        "normal": normal,
+    }
 
 
 def split_faces(grid, grid_type, edges):
     """
     Split the faces of one grid along the cut points of their edges.
 
-    A face with exactly two distinct cut points is split by the straight
-    line between them when each side holds corners of a single region and
-    the two regions differ. This is the same for every backend: the cut
-    lengths and the cut areas then describe the same geometry. The interface
-    normal of the face is the mean normal at its cut points. All faces are
-    processed at once; ``face_cut_groups`` and ``face_polygons`` do the same
-    for a single face (for plotting).
+    Every face next to a cut edge is split with ``face_polygons``. This is
+    the same for every backend: the cut lengths and the cut areas then
+    describe the same geometry.
 
     Parameters
     ----------
@@ -292,19 +346,7 @@ def split_faces(grid, grid_type, edges):
     FaceIntersections
     """
     shape = np.array(grid.region_ids[grid_type].shape)
-    coordinates = grid._get_grid_coordinates(grid_type)
-    region_ids = grid.region_ids[grid_type]
-    unit = np.eye(3, dtype=np.int64)
-
-    # Cut edges per direction, sorted by their raveled geometry index.
-    keys = {}
-    for axis, direction in enumerate("xyz"):
-        edge_shape = shape - unit[axis]
-        key = np.ravel_multi_index(edges[direction].index.T, edge_shape)
-        order = np.argsort(key)
-        keys[axis] = (edge_shape, key[order], order)
-
-    records = {"face": [], "a": [], "b": [], "fraction_a": [], "normal": []}
+    records = {"face": [], "regions": [], "fraction_a": [], "normal": []}
     for normal_axis, face_direction in enumerate("xyz"):
         a, b = (normal_axis + 1) % 3, (normal_axis + 2) % 3
         face_shape = shape - 1
@@ -319,182 +361,29 @@ def split_faces(grid, grid_type, edges):
                 inside = np.all((face >= 0) & (face < face_shape), axis=1)
                 candidates.append(face[inside])
         face = np.unique(np.concatenate(candidates), axis=0)
-        if len(face) == 0:
-            continue
-
-        # Corners counter-clockwise about the face normal (e_a x e_b = e_n);
-        # boundary edge m runs from corner m to corner m + 1.
-        corner_index = np.stack(
-            [face, face + unit[a], face + unit[a] + unit[b], face + unit[b]], axis=1
-        )
-        corners = np.stack(
-            [coordinates[d][corner_index[:, :, d]] for d in range(3)], axis=-1
-        )
-        corner_regions = region_ids[
-            corner_index[:, :, 0], corner_index[:, :, 1], corner_index[:, :, 2]
-        ]
-
-        # The four boundary edges: their axis, geometry index, and whether
-        # they run along the boundary direction (forward) or against it.
-        boundary = ((a, face, True), (b, face + unit[a], True),
-                    (a, face + unit[b], False), (b, face, False))  # fmt: skip
-        alpha = np.full((len(face), 4), np.nan)
-        normals = np.full((len(face), 4, 3), np.nan)
-        for m, (axis, index, _) in enumerate(boundary):
-            edge_shape, sorted_keys, order = keys[axis]
-            position = _sparse_lookup(
-                sorted_keys, np.ravel_multi_index(index.T, edge_shape)
-            )
-            found = position >= 0
-            row = order[position[found]]
-            alpha[found, m] = edges["xyz"[axis]].alpha[row]
-            normals[found, m] = edges["xyz"[axis]].normal[row]
-
-        # Cut points: Cartesian position and boundary parameter m + t.
-        points = np.full((len(face), 4, 3), np.nan)
-        parameter = np.full((len(face), 4), np.inf)
-        for m, (_, _, forward) in enumerate(boundary):
-            start, end = (m, (m + 1) % 4) if forward else ((m + 1) % 4, m)
-            points[:, m] = corners[:, start] + alpha[:, m, None] * (
-                corners[:, end] - corners[:, start]
-            )
-            t = alpha[:, m] if forward else 1.0 - alpha[:, m]
-            parameter[:, m] = np.where(np.isfinite(alpha[:, m]), m + t, np.inf)
-
-        # Cut points of two edges at their shared corner are one point:
-        # going along the boundary, a point joins the first earlier group
-        # whose first point lies within the tolerance.
-        length = np.linalg.norm(np.roll(corners, -1, axis=1) - corners, axis=2)
-        tolerance = 1e-8 * np.max(length, axis=1)
-        order = np.argsort(parameter, axis=1, kind="stable")
-        rows = np.arange(len(face))[:, None]
-        sorted_points = points[rows, order]
-        sorted_parameter = parameter[rows, order]
-        group_point = np.full((len(face), 4, 3), np.nan)
-        group_parameter = np.full((len(face), 4), np.inf)
-        n_groups = np.zeros(len(face), dtype=np.int64)
-        for k in range(4):
-            valid = np.isfinite(sorted_parameter[:, k])
-            distance = np.linalg.norm(group_point - sorted_points[:, k, None], axis=2)
-            matches = (distance <= tolerance[:, None]) & (
-                np.arange(4)[None, :] < n_groups[:, None]
-            )
-            new_group = valid & ~matches.any(axis=1)
-            target = n_groups[new_group]
-            group_point[new_group, target] = sorted_points[new_group, k]
-            group_parameter[new_group, target] = sorted_parameter[new_group, k]
-            n_groups += new_group
-
-        # Exactly two distinct cut points.
-        two = n_groups == 2
-        face, corners, corner_regions = face[two], corners[two], corner_regions[two]
-        normals = normals[two]
-        start, end = group_parameter[two, 0], group_parameter[two, 1]
-        p_start, p_end = group_point[two, 0], group_point[two, 1]
-
-        # Side A runs from the first cut point to the second through the
-        # corners between them, side B on through the remaining corners.
-        corner_number = np.arange(4)[None, :]
-        side_a = (corner_number > start[:, None]) & (corner_number < end[:, None])
-        side_b = (corner_number > end[:, None]) | (corner_number < start[:, None])
-
-        def single_region(side):
-            # Region of the first corner on the side; all its corners must
-            # share it.
-            first_corner = np.argmax(side, axis=1)[:, None]
-            first = np.take_along_axis(corner_regions, first_corner, axis=1)[:, 0]
-            uniform = np.all(~side | (corner_regions == first[:, None]), axis=1)
-            return side.any(axis=1) & uniform, first
-
-        uniform_a, region_side_a = single_region(side_a)
-        uniform_b, region_side_b = single_region(side_b)
-
-        def area(first, middle, last):
-            # Polygon area in the face plane (shoelace); unused middle
-            # vertices repeat the previous one and add nothing.
-            vertices = np.concatenate([first[:, None], middle, last[:, None]], axis=1)
-            u, v = vertices[:, :, a], vertices[:, :, b]
-            return np.abs(
-                0.5
-                * (
-                    np.sum(u * np.roll(v, -1, axis=1), axis=1)
-                    - np.sum(v * np.roll(u, -1, axis=1), axis=1)
-                )
-            )
-
-        def side_vertices(side, key, first):
-            # Corners of a side in boundary order (by ``key``); unused slots
-            # repeat the previous vertex, or ``first``, and add no area.
-            order = np.argsort(np.where(side, key, np.inf), axis=1, kind="stable")
-            chosen = np.take_along_axis(side, order, axis=1)
-            middle = np.take_along_axis(corners, order[:, :, None], axis=1)
-            vertices = np.empty_like(middle)
-            previous = first
-            for k in range(4):
-                vertices[:, k] = np.where(chosen[:, k, None], middle[:, k], previous)
-                previous = vertices[:, k]
-            return vertices
-
-        face_area = area(corners[:, 0], corners[:, 1:3], corners[:, 3])
-        # Side B runs on through the corners after the second cut point and
-        # then, past the boundary start, through those before the first.
-        key_b = np.where(corner_number > end[:, None], corner_number, corner_number + 4)
-        area_a = area(p_start, side_vertices(side_a, corner_number, p_start), p_end)
-        area_b = area(p_end, side_vertices(side_b, key_b, p_end), p_start)
-
-        valid = (
-            uniform_a
-            & uniform_b
-            & (region_side_a != region_side_b)
-            & (area_a > 1e-12 * face_area)
-            & (area_b > 1e-12 * face_area)
-        )
-        fraction_side_a = area_a / face_area
-        a_first = region_side_a < region_side_b
+        split = face_polygons(grid, grid_type, face_direction, face, edges)
         records["face"].append(
-            grid._flat_field_index(grid_type, "face", face_direction, face[valid])
+            grid._flat_field_index(
+                grid_type, "face", face_direction, face[split["position"]]
+            )
         )
-        records["a"].append(np.where(a_first, region_side_a, region_side_b)[valid])
-        records["b"].append(np.where(a_first, region_side_b, region_side_a)[valid])
-        records["fraction_a"].append(
-            np.where(a_first, fraction_side_a, area_b / face_area)[valid]
-        )
-        mean_normal = np.nanmean(normals[valid], axis=1)
-        norm = np.linalg.norm(mean_normal, axis=1, keepdims=True)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            records["normal"].append(np.where(norm > 0.0, mean_normal / norm, np.nan))
-
-    def joined(name, dtype, shape=(-1,)):
-        if not records[name]:
-            return np.zeros((0,) + shape[1:], dtype=dtype)
-        return np.concatenate(records[name]).astype(dtype).reshape(shape)
+        records["regions"].append(split["regions"])
+        records["fraction_a"].append(split["fractions"][:, 0])
+        records["normal"].append(split["normal"])
 
     # Faces without a field DOF (dual faces on the low domain boundary) are
     # not listed.
-    face = joined("face", np.int64)
+    face = np.concatenate(records["face"]).astype(np.int64)
     keep = face >= 0
-    dtype = region_ids.dtype
+    regions = np.concatenate(records["regions"])[keep]
+    dtype = grid.region_ids[grid_type].dtype
     return FaceIntersections(
         face=face[keep],
-        region_a=joined("a", dtype)[keep],
-        region_b=joined("b", dtype)[keep],
-        fraction_a=joined("fraction_a", float)[keep],
-        normal=joined("normal", float, (-1, 3))[keep],
+        region_a=regions[:, 0].astype(dtype),
+        region_b=regions[:, 1].astype(dtype),
+        fraction_a=np.concatenate(records["fraction_a"])[keep],
+        normal=np.concatenate(records["normal"])[keep],
     )
-
-
-def contract_polygons(grid, grid_type, face_direction, index):
-    """
-    Polygons of one face, rebuilt from the cut edges of the contract by the
-    straight line between its cut points (for plotting).
-    """
-    lookup = _edge_lookup(grid, grid_type, grid.edge_intersections[grid_type])
-    corner_indices, corners, plane_axes, groups = face_cut_groups(
-        grid, grid_type, face_direction, index, lookup
-    )
-    if len(groups) != 2:
-        return None
-    return face_polygons(grid, grid_type, corner_indices, corners, plane_axes, groups)
 
 
 def edge_diagnostic_masks(grid, grid_type, direction):

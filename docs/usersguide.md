@@ -342,7 +342,8 @@ The plane normal selects the tensor component (an $x$-normal plane shows the $x$
 # static view of the dual z-plane with index 10
 fig, ax = solver.plot_mesh_materials(grid_type="dual", normal="z", index=10, quantity="eps")
 
-# interactive: buttons for the normal (and quantity), slider for the plane
+# interactive: buttons for the material (mu: primal grid, eps/sigma: dual
+# grid) and the normal, slider for the plane (redraws when released)
 # (in Jupyter, enable an interactive backend first: %matplotlib widget)
 fig, ax = solver.plot_mesh_materials(grid_type="primal", interactive=True)
 ```
