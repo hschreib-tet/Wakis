@@ -14,6 +14,7 @@ from scipy.special import j0, j1, jn_zeros, y0, y1
 
 from wakis import GridFIT3D, SolverFIT3D, WakeSolver
 from wakis.intersection import (
+    contract_polygons,
     edge_diagnostic_masks,
     geometry_array_to_field_component,
 )
@@ -448,6 +449,31 @@ def test_flat_field_index():
             local = flat[valid] - axis * solver.N
             assert np.array_equal(expected[local], geometry_id.ravel()[valid])
             assert np.array_equal(np.sort(local), np.flatnonzero(expected >= 0))
+
+
+def test_face_split_matches_single_face(pillbox_stls):
+    """The vectorized face split gives every listed face the same two
+    regions and area fraction as the single-face split used for plotting,
+    on both grids of the pillbox with a dielectric rod (PEC and dielectric
+    interfaces)."""
+    grid = _pillbox_grid(pillbox_stls, "conformal", rod=True, n_cells=10)
+    for grid_type in ("primal", "dual"):
+        faces = grid.face_intersections[grid_type]
+        assert len(faces.face) > 0
+        N = grid.Nx * grid.Ny * grid.Nz
+        offset = np.zeros((len(faces.face), 3), dtype=int)
+        if grid_type == "dual":
+            offset[np.arange(len(faces.face)), faces.face // N] = 1
+        index = np.column_stack(
+            np.unravel_index(faces.face % N, (grid.Nx, grid.Ny, grid.Nz), order="F")
+        )
+        for k, (axis, face) in enumerate(zip(faces.face // N, index + offset)):
+            polygons = contract_polygons(grid, grid_type, "xyz"[axis], tuple(face))
+            (region_a, _, fraction_a), (region_b, _, _) = sorted(
+                polygons, key=lambda polygon: polygon[0]
+            )
+            assert (region_a, region_b) == (faces.region_a[k], faces.region_b[k])
+            assert fraction_a == pytest.approx(faces.fraction_a[k], abs=1e-12)
 
 
 def test_conductor_background_type():
