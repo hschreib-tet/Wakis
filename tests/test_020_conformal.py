@@ -507,8 +507,9 @@ def test_conformal_grid_h5_roundtrip(pillbox_stls, tmp_path):
 @pytest.mark.parametrize("grid_type, quantity", [("primal", "eps"), ("dual", "sigma")])
 def test_plot_mesh_materials(pillbox_stls, geometry_mode, grid_type, quantity):
     """Smoke test of the mesh/material plane view: every normal direction,
-    and the interactive widgets switching normal and plane index (the last
-    plane lies entirely in PEC)."""
+    and the interactive widgets switching normal, plane index (the last
+    plane lies entirely in PEC) and material, which also switches between
+    the primal and the dual grid."""
     from matplotlib.figure import Figure
 
     grid = _pillbox_grid(pillbox_stls, geometry_mode, rod=True, n_cells=8)
@@ -525,9 +526,12 @@ def test_plot_mesh_materials(pillbox_stls, geometry_mode, grid_type, quantity):
     fig, _ = solver.plot_mesh_materials(
         grid_type=grid_type, interactive=True, ax=Figure().add_subplot()
     )
-    slider, normal_buttons = fig._wakis_mesh_widgets[:2]
+    slider, normal_buttons, material_buttons = fig._wakis_mesh_widgets
     normal_buttons.set_active(0)
     slider.set_val(slider.valmax)
+    for material in (0, 2, 1):  # mu (primal), sigma and eps (dual)
+        material_buttons.set_active(material)
+        slider.set_val(slider.valmin)
 
 
 def test_plot_mesh_materials_diagnostics(tmp_path):

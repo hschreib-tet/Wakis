@@ -1625,10 +1625,12 @@ class PlotMixinSolver:
             Material shown on the dual grid. Ignored on the primal grid,
             which only carries ``mu``. Default 'eps'.
         interactive : bool, optional
-            Add matplotlib widgets to choose the normal (and the quantity on
-            the dual grid) and a slider for the plane index. Requires an
-            interactive backend, e.g. ``%matplotlib widget`` in Jupyter.
-            Default False.
+            Add matplotlib widgets: buttons to choose the material (mu on the
+            primal grid, eps or sigma on the dual grid, so the buttons also
+            switch the grid) and the plane normal, and a slider for the plane
+            index. ``grid_type``, ``normal``, ``index`` and ``quantity`` set
+            the starting view. Requires an interactive backend, e.g.
+            ``%matplotlib widget`` in Jupyter (``ipympl``). Default False.
         show_stl : bool, optional
             Draw the intersection of the STL surfaces with the plane as black
             lines (the exact geometry). Default True.
@@ -1678,6 +1680,7 @@ class PlotMixinSolver:
             fig = ax.figure
 
         state = {
+            "grid_type": grid_type,
             "normal": normal,
             "index": index,
             "quantity": quantity,
@@ -1687,7 +1690,7 @@ class PlotMixinSolver:
         def draw():
             ax.clear()
             data = self._mesh_slice_data(
-                grid_type, state["normal"], state["index"], state["quantity"]
+                state["grid_type"], state["normal"], state["index"], state["quantity"]
             )
             state["index"] = data["index"]
             mappable = self._draw_mesh_slice(
@@ -1706,7 +1709,7 @@ class PlotMixinSolver:
         draw()
 
         if interactive:
-            self._add_mesh_slice_widgets(fig, state, draw, grid_type)
+            self._add_mesh_slice_widgets(fig, state, draw)
 
         return fig, ax
 
@@ -2127,12 +2130,13 @@ class PlotMixinSolver:
         )
         return mappable
 
-    def _add_mesh_slice_widgets(self, fig, state, draw, grid_type):
-        """Normal/quantity buttons and an index slider for plot_mesh_materials."""
+    def _add_mesh_slice_widgets(self, fig, state, draw):
+        """Material and normal buttons and an index slider for
+        plot_mesh_materials."""
         from matplotlib.widgets import RadioButtons, Slider
 
         fig.subplots_adjust(left=0.22, bottom=0.16)
-        low, high = self._mesh_slice_range(grid_type, state["normal"])
+        low, high = self._mesh_slice_range(state["grid_type"], state["normal"])
         slider = Slider(
             fig.add_axes([0.22, 0.04, 0.5, 0.03]),
             "index",
@@ -2142,6 +2146,15 @@ class PlotMixinSolver:
             valstep=1,
         )
 
+        def update_slider():
+            # Primal planes run 0 ... N-1, dual planes 1 ... N-1.
+            low, high = self._mesh_slice_range(state["grid_type"], state["normal"])
+            slider.valmin, slider.valmax = low, high
+            slider.ax.set_xlim(low, high)
+            slider.eventson = False
+            slider.set_val(state["index"])
+            slider.eventson = True
+
         def on_index(value):
             state["index"] = int(value)
             draw()
@@ -2150,38 +2163,42 @@ class PlotMixinSolver:
             state["normal"] = label
             state["index"] = None
             draw()
-            low, high = self._mesh_slice_range(grid_type, label)
-            slider.valmin, slider.valmax = low, high
-            slider.ax.set_xlim(low, high)
-            slider.eventson = False
-            slider.set_val(state["index"])
-            slider.eventson = True
+            update_slider()
+
+        # mu lives on the primal grid, eps and sigma on the dual grid.
+        materials = {r"$\mu_r$": "mu", r"$\varepsilon_r$": "eps", r"$\sigma$": "sigma"}
+
+        def on_material(label):
+            material = materials[label]
+            state["grid_type"] = "primal" if material == "mu" else "dual"
+            if material != "mu":
+                state["quantity"] = material
+            # Stay at the nearest plane of the new grid.
+            low, high = self._mesh_slice_range(state["grid_type"], state["normal"])
+            state["index"] = int(np.clip(state["index"], low, high))
+            draw()
+            update_slider()
 
         slider.on_changed(on_index)
+        normal_axes = fig.add_axes([0.02, 0.38, 0.12, 0.18])
+        normal_axes.set_title("normal", fontsize=9)
         normal_buttons = RadioButtons(
-            fig.add_axes([0.02, 0.62, 0.1, 0.18]),
-            ("x", "y", "z"),
-            active="xyz".index(state["normal"]),
+            normal_axes, ("x", "y", "z"), active="xyz".index(state["normal"])
         )
         normal_buttons.on_clicked(on_normal)
-        widgets = [slider, normal_buttons]
 
-        if grid_type == "dual":
-
-            def on_quantity(label):
-                state["quantity"] = label
-                draw()
-
-            quantity_buttons = RadioButtons(
-                fig.add_axes([0.02, 0.38, 0.1, 0.14]),
-                ("eps", "sigma"),
-                active=("eps", "sigma").index(state["quantity"]),
-            )
-            quantity_buttons.on_clicked(on_quantity)
-            widgets.append(quantity_buttons)
+        current = "mu" if state["grid_type"] == "primal" else state["quantity"]
+        material_axes = fig.add_axes([0.02, 0.62, 0.12, 0.18])
+        material_axes.set_title("material", fontsize=9)
+        material_buttons = RadioButtons(
+            material_axes,
+            tuple(materials),
+            active=list(materials.values()).index(current),
+        )
+        material_buttons.on_clicked(on_material)
 
         # Widgets stop responding once garbage collected; keep a reference.
-        fig._wakis_mesh_widgets = widgets
+        fig._wakis_mesh_widgets = [slider, normal_buttons, material_buttons]
 
 
 class PlotMixinGrid:
