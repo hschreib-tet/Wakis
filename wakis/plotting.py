@@ -1596,8 +1596,9 @@ class PlotMixinSolver:
           permeability ``mu_r`` of the magnetic DOF through the face. In
           conformal mode, faces cut by a PEC/SIBC wall are coloured only in
           their part in the normal material (the conductor part is grey),
-          and the primal edges are drawn only up to the wall. Faces without
-          any active edge are grey (inside PEC).
+          and the primal edges are drawn dark only up to the wall. Faces
+          without any active edge are grey (inside PEC); edges and edge parts
+          inside PEC are drawn in a lighter grey.
         - ``"dual"``: dual faces in the plane, coloured by ``eps_r`` or
           ``sigma`` of the electric DOF piercing the face. Dual metrics are
           never cut, so all faces are drawn in full; faces whose electric
@@ -1823,7 +1824,8 @@ class PlotMixinSolver:
                                 record["unresolved"] = True
                     faces.append(record)
 
-            # In-plane primal edges: E DOFs, drawn only in the normal material.
+            # In-plane primal edges: E DOFs. The active part (in the normal
+            # material) is drawn dark, edges and edge parts in PEC lighter.
             for d in (a, b):
                 c_d, c_other = (ca, cb) if d == a else (cb, ca)
                 for j_d in range(len(c_d) - 1):
@@ -1837,18 +1839,26 @@ class PlotMixinSolver:
                             end = is_conductor[data["end_region"][edge]]
                             alpha = data["alpha"][edge]
                             if start and end:
-                                continue
-                            if not live:
+                                style = "pec"
+                            elif not live:
                                 style = "eliminated"  # removed entirely
                             elif start != end and np.isfinite(alpha):
                                 t0, t1 = (alpha, 1.0) if start else (0.0, alpha)
                         elif not live:
-                            continue
-                        p0 = c_d[j_d] + t0 * (c_d[j_d + 1] - c_d[j_d])
-                        p1 = c_d[j_d] + t1 * (c_d[j_d + 1] - c_d[j_d])
-                        q = c_other[j_o]
-                        segment = [(p0, q), (p1, q)] if d == a else [(q, p0), (q, p1)]
-                        edges.append({"segment": segment, "style": style})
+                            style = "pec"
+
+                        def segment(s0, s1):
+                            p0 = c_d[j_d] + s0 * (c_d[j_d + 1] - c_d[j_d])
+                            p1 = c_d[j_d] + s1 * (c_d[j_d + 1] - c_d[j_d])
+                            q = c_other[j_o]
+                            return [(p0, q), (p1, q)] if d == a else [(q, p0), (q, p1)]
+
+                        edges.append({"segment": segment(t0, t1), "style": style})
+                        # The part of a cut edge inside the conductor.
+                        if t0 > 0.0:
+                            edges.append({"segment": segment(0.0, t0), "style": "pec"})
+                        elif t1 < 1.0:
+                            edges.append({"segment": segment(t1, 1.0), "style": "pec"})
 
             label = rf"$\mu_{{r,{normal}}}$"
             log_scale = False
@@ -2028,6 +2038,13 @@ class PlotMixinSolver:
         )
         ax.add_collection(
             LineCollection(
+                [e["segment"] for e in data["edges"] if e["style"] == "pec"],
+                colors="0.45",
+                linewidths=0.6,
+            )
+        )
+        ax.add_collection(
+            LineCollection(
                 [e["segment"] for e in data["edges"] if e["style"] == "mesh"],
                 colors="0.25",
                 linewidths=0.6,
@@ -2042,6 +2059,7 @@ class PlotMixinSolver:
                     facecolors="none",
                     edgecolors="red",
                     linewidths=1.2,
+                    zorder=2,  # above the mesh lines, below the STL
                 )
             )
             ax.add_collection(
