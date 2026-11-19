@@ -330,10 +330,9 @@ def split_faces(grid, grid_type, edges):
         corners = np.stack(
             [coordinates[d][corner_index[:, :, d]] for d in range(3)], axis=-1
         )
-        # Signed, so that -1 can mark corners outside a side.
         corner_regions = region_ids[
             corner_index[:, :, 0], corner_index[:, :, 1], corner_index[:, :, 2]
-        ].astype(np.int64)
+        ]
 
         # The four boundary edges: their axis, geometry index, and whether
         # they run along the boundary direction (forward) or against it.
@@ -400,8 +399,10 @@ def split_faces(grid, grid_type, edges):
         side_b = (corner_number > end[:, None]) | (corner_number < start[:, None])
 
         def single_region(side):
-            regions = np.where(side, corner_regions, -1)
-            first = np.max(regions, axis=1)
+            # Region of the first corner on the side; all its corners must
+            # share it.
+            first_corner = np.argmax(side, axis=1)[:, None]
+            first = np.take_along_axis(corner_regions, first_corner, axis=1)[:, 0]
             uniform = np.all(~side | (corner_regions == first[:, None]), axis=1)
             return side.any(axis=1) & uniform, first
 
