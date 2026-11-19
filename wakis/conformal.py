@@ -212,20 +212,28 @@ class ConformalGridMixin:
             )
 
             for n in np.nonzero(inside)[0]:
-                edge_index = list(transverse_index)
-                edge_index.insert(axis, int(edge[n]))
-                hit = {
-                    "alpha": float(np.clip(alpha[n], 0.0, 1.0)),
-                    "surface_id": int(surface_id),
-                    "cell_id": int(cell_ids[n]),
-                    "normal": normals[cell_ids[n]],
-                }
-                edge_hits.setdefault(tuple(edge_index), []).append(hit)
+                edge_alphas = [(int(edge[n]), float(np.clip(alpha[n], 0.0, 1.0)))]
+                # A hit on a grid node (within the STL tolerance) belongs to
+                # both edges at that node.
+                if edge_alphas[0][1] <= self.stl_tol and edge[n] > 0:
+                    edge_alphas.append((int(edge[n]) - 1, 1.0))
+                elif edge_alphas[0][1] >= 1.0 - self.stl_tol and edge[n] < n_edges - 1:
+                    edge_alphas.append((int(edge[n]) + 1, 0.0))
+                for edge_axis_index, edge_alpha in edge_alphas:
+                    edge_index = list(transverse_index)
+                    edge_index.insert(axis, edge_axis_index)
+                    hit = {
+                        "alpha": edge_alpha,
+                        "surface_id": int(surface_id),
+                        "cell_id": int(cell_ids[n]),
+                        "normal": normals[cell_ids[n]],
+                    }
+                    edge_hits.setdefault(tuple(edge_index), []).append(hit)
 
         return edge_hits
 
     @staticmethod
-    def _group_crossings(hits, axis, alpha_tolerance=1e-8):
+    def _group_crossings(hits, axis, node_tolerance, alpha_tolerance=1e-8):
         """
         Group the STL hits of one edge by position and keep the crossings.
 
@@ -235,16 +243,25 @@ class ConformalGridMixin:
         its facet normals have a component along the edge, all with the same
         sign. Hits of a surface lying in the line (no component) or touching
         it (both signs: the line enters and leaves at the same point, e.g.
-        tangent to a cylinder) are dropped, and so are groups left empty.
+        tangent to a cylinder) are dropped, and so are groups left empty. A
+        touch on a grid node (within ``node_tolerance`` of an edge end) is
+        kept; the caller drops it if it contradicts the node classification.
         """
-        hits = sorted(hits, key=lambda hit: hit["alpha"])
+
+        def position(hit):
+            # Hits within the node tolerance of an edge end are on that node.
+            if hit["alpha"] <= node_tolerance:
+                return 0.0
+            if hit["alpha"] >= 1.0 - node_tolerance:
+                return 1.0
+            return hit["alpha"]
+
+        hits = sorted(hits, key=position)
         groups = [[hits[0]]]
 
         for hit in hits[1:]:
-            reference_alpha = np.mean(
-                [grouped_hit["alpha"] for grouped_hit in groups[-1]]
-            )
-            if abs(hit["alpha"] - reference_alpha) <= alpha_tolerance:
+            reference = np.mean([position(grouped) for grouped in groups[-1]])
+            if abs(position(hit) - reference) <= alpha_tolerance:
                 groups[-1].append(hit)
             else:
                 groups.append([hit])
@@ -263,8 +280,14 @@ class ConformalGridMixin:
                     signs.setdefault(hit["surface_id"], set()).add(
                         hit["normal"][axis] > 0
                     )
+            # A touch on a grid node is kept: the node classification may
+            # put the node inside, and the consistency check drops it if not.
+            at_node = not (node_tolerance < group[0]["alpha"] < 1.0 - node_tolerance)
             crossing = [
-                hit for hit in group if len(signs.get(hit["surface_id"], ())) == 1
+                hit
+                for hit in group
+                if len(signs.get(hit["surface_id"], ())) == 1
+                or (at_node and hit["surface_id"] in signs)
             ]
             if crossing:
                 crossings.append(crossing)
@@ -416,6 +439,7 @@ class ConformalGridMixin:
         # One static cell locator and the unit facet normals per solid,
         # reused for all grid lines. STL facets are triangles.
         surfaces = {}
+        facet_planes = {}
         for key, region_id in self.region_key_to_id.items():
             surface = self.read_stl(key)
             locator = vtkStaticCellLocator()
@@ -428,12 +452,24 @@ class ConformalGridMixin:
             )
             normals /= np.linalg.norm(normals, axis=1, keepdims=True)
             surfaces[region_id] = (locator, normals)
+            # Coordinates of the axis-aligned planes holding facets, e.g. a
+            # flat end cap: a grid line in such a plane runs along the solid.
+            aligned = np.abs(normals) > 1.0 - 1e-8
+            facet_planes[region_id] = [
+                np.unique(triangles[aligned[:, k], 0, k]) for k in range(3)
+            ]
+        # A plane closer to a grid line than the STL tolerance contains it.
+        plane_tolerance = self.stl_tol * min(
+            np.min(np.diff(c)) for c in self._get_grid_coordinates("primal")
+        )
 
         self.interface_intersections = {"primal": {}, "dual": {}}
 
         for grid_type in ("primal", "dual"):
             for direction in ("x", "y", "z"):
                 axis = "xyz".index(direction)
+                coordinates = self._get_grid_coordinates(grid_type)
+                transverse_axes = [k for k in range(3) if k != axis]
                 start_regions, end_regions = self._get_edge_region_ids(
                     grid_type, direction
                 )
@@ -481,8 +517,21 @@ class ConformalGridMixin:
 
                     # Surfaces with a facet in the plane of this line: the
                     # line runs along them, and its crossings of them are at
-                    # the rim of that planar part.
+                    # the rim of that planar part. Axis-aligned facet planes
+                    # are matched by coordinate; VTK also reports coplanar
+                    # hits for other planes.
+                    line_coordinates = [
+                        (k, coordinates[k][index])
+                        for k, index in zip(transverse_axes, transverse_index)
+                    ]
                     planar_surfaces[transverse_index] = {
+                        surface_id
+                        for surface_id, planes in facet_planes.items()
+                        if any(
+                            np.any(np.abs(planes[k] - value) <= plane_tolerance)
+                            for k, value in line_coordinates
+                        )
+                    } | {
                         hit["surface_id"]
                         for hits in line_hits.values()
                         for hit in hits
@@ -502,7 +551,7 @@ class ConformalGridMixin:
 
                 for edge_index, hits in raw_hits.items():
                     crossing_groups = self._group_crossings(
-                        hits, axis, alpha_tolerance=alpha_tolerance
+                        hits, axis, self.stl_tol, alpha_tolerance=alpha_tolerance
                     )
                     if not crossing_groups:
                         continue
@@ -528,9 +577,9 @@ class ConformalGridMixin:
                         clean = [
                             group
                             for group in crossing_groups
-                            if alpha_tolerance
+                            if self.stl_tol
                             < np.mean([hit["alpha"] for hit in group])
-                            < 1.0 - alpha_tolerance
+                            < 1.0 - self.stl_tol
                             and not {hit["surface_id"] for hit in group} <= planar
                         ]
                         retry = self._resolve_edge_interfaces(clean, start_inside)

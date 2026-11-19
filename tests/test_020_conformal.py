@@ -334,23 +334,27 @@ def test_coincident_wall(tmp_path):
 
 
 def test_surface_on_grid_planes(tmp_path):
-    """A cylinder spanning exactly the domain, as when the domain is set to
-    the STL bounds: its end caps lie in the boundary grid planes and its
-    side touches the side planes along four lines. Grid lines there touch
-    the surface instead of crossing it, and the node classification decides
-    the side, so no edge is reported as inconsistent."""
-    pv.Cylinder(radius=0.4, height=1.0, direction=(0, 0, 1), resolution=64).save(
-        tmp_path / "cyl.stl"
+    """A coated pillbox with beam pipes, the domain set to the STL bounds and
+    the end walls on node planes. Many grid lines then touch surfaces instead
+    of crossing them: they run along the end caps, graze the outer cylinder
+    at the domain boundary, or meet the surfaces at grid nodes. The node
+    classification decides the side there, so no edge is reported as
+    inconsistent."""
+    pipe = pv.Cylinder(radius=0.025, height=0.3, direction=(0, 0, 1), resolution=100)
+    inner = pv.Cylinder(radius=0.0925, height=0.1, direction=(0, 0, 1), resolution=200)
+    (pipe.triangulate() | inner.triangulate()).save(tmp_path / "vacuum.stl")
+    pv.Cylinder(radius=0.1, height=0.1, direction=(0, 0, 1), resolution=200).save(
+        tmp_path / "coating.stl"
     )
     grid = GridFIT3D(
-        *(-0.4, 0.4) * 2,
-        -0.5,
-        0.5,
-        11,
-        11,
-        11,
-        stl_solids={"cyl": str(tmp_path / "cyl.stl")},
-        stl_materials={"cyl": "vacuum"},
+        *(-0.1, 0.1) * 2,
+        -0.15,
+        0.15,
+        41,
+        41,
+        61,
+        stl_solids={key: str(tmp_path / f"{key}.stl") for key in ("coating", "vacuum")},
+        stl_materials={"coating": [3.0, 1.0, 0.0], "vacuum": "vacuum"},
         bg_material_type="pec",
         geometry_mode="conformal",
         stl_method="voxelize_rectilinear",
