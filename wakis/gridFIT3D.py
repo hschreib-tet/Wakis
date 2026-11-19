@@ -12,9 +12,9 @@ import pyvista as pv
 from scipy.optimize import least_squares
 from vtkmodules.vtkFiltersModeling import vtkSelectEnclosedPoints
 
-from .conformal import ConformalGridMixin
+from .conformal import trace_intersections
 from .field import Field
-from .intersection import IntersectionGridMixin
+from .intersection import warn_diagnostics
 from .logger import Logger
 from .materials import (
     VALID_MATERIAL_TYPES,
@@ -23,8 +23,10 @@ from .materials import (
 )
 from .plotting import PlotMixinGrid as PlotMixin
 
-# Backends computing the STL intersections in conformal mode.
-CONFORMAL_METHODS = ("raytracing",)
+# Backends computing the STL intersections in conformal mode: each takes the
+# grid and returns its edge intersections, face intersections and geometry
+# diagnostics (see intersection.py).
+CONFORMAL_BACKENDS = {"raytracing": trace_intersections}
 
 try:
     from mpi4py import MPI
@@ -34,7 +36,7 @@ except ImportError:
     imported_mpi = False
 
 
-class GridFIT3D(PlotMixin, IntersectionGridMixin, ConformalGridMixin):
+class GridFIT3D(PlotMixin):
     """
     Store symmetric FIT grid geometry and handle STL solids using PyVista.
 
@@ -900,12 +902,100 @@ class GridFIT3D(PlotMixin, IntersectionGridMixin, ConformalGridMixin):
         if self.geometry_mode == "conformal":
             self._build_intersections()
 
+    def _set_conformal_stabilization(self, method, fraction, min_edge_fraction):
+        """
+        Validate and store the small-cut-cell treatment.
+
+        Sets ``conformal_stabilization`` ("none" or "area_floor"),
+        ``conformal_area_floor`` and ``conformal_min_edge_fraction`` (used
+        by the solver for the area floor). Unused values are 0.
+        """
+        method = "none" if method is None else str(method).lower()
+
+        if method not in ("none", "area_floor"):
+            raise ValueError("conformal_stabilization must be None or 'area_floor'.")
+
+        fraction = 0.1 if fraction is None else float(fraction)
+        min_edge_fraction = (
+            min(fraction, 0.49)
+            if min_edge_fraction is None
+            else float(min_edge_fraction)
+        )
+
+        self.conformal_stabilization = method
+        self.conformal_area_floor = 0.0
+        self.conformal_min_edge_fraction = 0.0
+
+        if method == "area_floor":
+            if not (0.0 < fraction <= 1.0):
+                raise ValueError(
+                    "Area floor requires 0 < conformal_stabilization_fraction <= 1."
+                )
+
+            if not (0.0 <= min_edge_fraction < 0.5):
+                raise ValueError(
+                    "conformal_min_edge_fraction must satisfy 0 <= value < 0.5."
+                )
+
+            self.conformal_area_floor = fraction
+            self.conformal_min_edge_fraction = min_edge_fraction
+
+    def _get_grid_coordinates(self, grid_type):
+        """Node coordinates of the primal or dual grid."""
+        if grid_type == "primal":
+            return self.x, self.y, self.z
+        return self.tx, self.ty, self.tz
+
+    def _region_type_flags(self):
+        """
+        Boolean arrays indexed by region ID: normal material, and
+        conductor (PEC or SIBC).
+        """
+        types = np.array(
+            [self.region_material_types[r] for r in range(len(self.region_id_to_key))]
+        )
+        return types == "normal", (types == "pec") | (types == "sibc")
+
+    def _is_conductor_region(self, region_id):
+        return self.region_material_types[region_id] in ("pec", "sibc")
+
+    def _get_edge_region_ids(self, grid_type, direction):
+        """Start and end region IDs of all edges in one direction (views)."""
+        region_ids = self.region_ids[grid_type]
+        if direction == "x":
+            return (region_ids[:-1, :, :], region_ids[1:, :, :])
+        if direction == "y":
+            return (region_ids[:, :-1, :], region_ids[:, 1:, :])
+        return (region_ids[:, :, :-1], region_ids[:, :, 1:])
+
+    def _flat_index_to_geometry(self, grid_type, kind, flat):
+        """
+        Inverse of ``_flat_field_index``: direction axis and geometry
+        indices (n, 3) of the edges or faces with the given flat indices.
+        """
+        flat = np.asarray(flat, dtype=np.int64)
+        N = self.Nx * self.Ny * self.Nz
+        axis = flat // N
+        index = np.column_stack(
+            np.unravel_index(flat % N, (self.Nx, self.Ny, self.Nz), order="F")
+        )
+        if grid_type == "dual":
+            offset = np.zeros_like(index)
+            for k in range(3):
+                if kind == "edge":
+                    offset[:, k] = axis != k
+                else:
+                    offset[:, k] = axis == k
+            index = index + offset
+        return axis, index
+
     def _set_conformal_method(self, method):
         """Validate and store the conformal intersection backend."""
         method = str(method).lower()
-        if method not in CONFORMAL_METHODS:
+        if method not in CONFORMAL_BACKENDS:
             raise ValueError(
-                f"conformal_method must be one of {CONFORMAL_METHODS}, got {method!r}."
+                f"conformal_method must be one of {tuple(CONFORMAL_BACKENDS)}, "
+                f"got {method!r}."
             )
         self.conformal_method = method
 
@@ -950,8 +1040,11 @@ class GridFIT3D(PlotMixin, IntersectionGridMixin, ConformalGridMixin):
     def _build_intersections(self):
         """Classify the nodes and run the selected conformal backend."""
         self._build_region_ids()
-        if self.conformal_method == "raytracing":
-            self._build_conformal_interfaces()
+        backend = CONFORMAL_BACKENDS[self.conformal_method]
+        self.edge_intersections, self.face_intersections, self.conformal_diagnostics = (
+            backend(self)
+        )
+        warn_diagnostics(self.conformal_diagnostics)
 
     def _flat_field_index(self, grid_type, kind, direction, index):
         """

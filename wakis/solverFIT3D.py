@@ -15,7 +15,12 @@ from scipy.sparse import diags, hstack, vstack
 
 from .boundaries import BCsMixin
 from .field import Field
-from .intersection import IntersectionSolverMixin
+from .intersection import (
+    conformal_materials,
+    conformal_metrics,
+    eliminate_small_edges,
+    region_material_table,
+)
 from .logger import Logger
 from .materials import VALID_MATERIAL_TYPES, material_lib
 from .plotting import PlotMixinSolver as PlotMixin
@@ -38,7 +43,7 @@ except ImportError:
     imported_mkl = False
 
 
-class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, IntersectionSolverMixin):
+class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin):
     def __init__(
         self,
         grid,
@@ -257,7 +262,16 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, IntersectionSolverMixin):
         )
         if use_stl and conformal:
             # From here on, self.L and self.iA are the cut primal metrics.
-            self._build_conformal_metrics()
+            self.L, self.iA, self.area_floored_faces, self._small_cut_edges = (
+                conformal_metrics(
+                    self.grid,
+                    self.L,
+                    self.iA,
+                    self.conformal_area_floor,
+                    self.conformal_min_edge_fraction,
+                )
+            )
+            self.n_area_floored = len(self.area_floored_faces)
 
         self.update_logger(["grid", "background"])
 
@@ -961,6 +975,51 @@ class SolverFIT3D(PlotMixin, RoutinesMixin, BCsMixin, IntersectionSolverMixin):
 
         elif self.grid.geometry_mode == "conformal":
             self._apply_stl_materials_conformal()
+
+    def _apply_stl_materials_conformal(self):
+        """
+        Assign STL materials from the conformal geometry
+        (``intersection.conformal_materials``), then remove nearly covered
+        conductor-cut edges of the area floor.
+        """
+        self.stl_solids = self.grid.stl_solids
+        self.stl_materials = self.grid.stl_materials
+        self.stl_colors = self.grid.stl_colors
+
+        for key in self.stl_solids.keys():
+            eps = self.stl_materials[key][0] * eps_0
+            sigma = self.stl_materials[key][2]
+
+            if sigma > 0.0:
+                self.use_conductivity = True
+
+                if sigma > 10 * eps / eps_0:
+                    print(
+                        f"[!] Warning: High conductivity sigma={sigma} S/m "
+                        f"for solid '{key}' with low permittivity "
+                        f"epsilon_r={eps / eps_0} will considerably reduce "
+                        f"the maximal stable timestep."
+                    )
+
+        self.region_material_properties = region_material_table(
+            self.grid, self.eps_bg / eps_0, self.mu_bg / mu_0, self.sigma_bg
+        )
+        materials = conformal_materials(self.grid, self.region_material_properties)
+        for direction in ("x", "y", "z"):
+            setattr(
+                self.ieps,
+                f"field_{direction}",
+                1.0 / (materials["eps_r"][direction] * eps_0),
+            )
+            setattr(
+                self.imu,
+                f"field_{direction}",
+                1.0 / (materials["mu_r"][direction] * mu_0),
+            )
+            setattr(self.sigma, f"field_{direction}", materials["sigma"][direction])
+
+        self.eliminated_edges = eliminate_small_edges(self.ieps, self._small_cut_edges)
+        self.n_edges_eliminated = len(self.eliminated_edges)
 
     def _apply_stl_materials_staircase(self):
         """Assign material coefficients from primal and dual staggered masks.

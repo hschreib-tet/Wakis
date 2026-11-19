@@ -13,6 +13,10 @@ from scipy.optimize import brentq
 from scipy.special import j0, j1, jn_zeros, y0, y1
 
 from wakis import GridFIT3D, SolverFIT3D, WakeSolver
+from wakis.intersection import (
+    edge_diagnostic_masks,
+    geometry_array_to_field_component,
+)
 
 # PEC pillbox: radius R, length L (closed by the PEC domain boundaries in z).
 R = 0.1
@@ -400,7 +404,7 @@ def test_surface_on_grid_planes(tmp_path):
     )
     for grid_type in ("primal", "dual"):
         for direction in "xyz":
-            _, inconsistent = grid._get_edge_diagnostic_masks(grid_type, direction)
+            _, inconsistent = edge_diagnostic_masks(grid, grid_type, direction)
             assert not inconsistent.any(), (grid_type, direction)
 
 
@@ -422,8 +426,8 @@ def test_flat_field_index():
             shape = nodes + shift[1]
             shape[axis] = nodes[axis] + shift[0]
             geometry_id = np.arange(np.prod(shape)).reshape(shape)
-            expected = solver._geometry_array_to_field_component(
-                geometry_id, f"{grid_type}_{kind}", direction, fill_value=-1
+            expected = geometry_array_to_field_component(
+                geometry_id, f"{grid_type}_{kind}", direction, nodes, fill_value=-1
             ).ravel(order="F")
 
             index = np.indices(shape).reshape(3, -1).T

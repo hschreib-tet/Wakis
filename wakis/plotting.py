@@ -9,6 +9,8 @@ import pyvista as pv
 from scipy.constants import epsilon_0 as eps_0
 from scipy.constants import mu_0
 
+from .intersection import contract_polygons, edge_diagnostic_masks
+
 
 class PlotMixinSolver:
     """Plotting mixin providing 1D/2D/3D visualization helpers for SolverFIT3D."""
@@ -1822,7 +1824,7 @@ class PlotMixinSolver:
                                 grid._flat_field_index("primal", "face", normal, face)
                             )
                             polygons = (
-                                grid._contract_polygons("primal", normal, face)
+                                contract_polygons(grid, "primal", normal, face)
                                 if flat in split_faces
                                 else None
                             )
@@ -1979,14 +1981,14 @@ class PlotMixinSolver:
             c_a, c_b = coords["xyz".index(a)], coords["xyz".index(b)]
             mid_a = c_a if d != a else 0.5 * (c_a[:-1] + c_a[1:])
             mid_b = c_b if d != b else 0.5 * (c_b[:-1] + c_b[1:])
-            collect(grid._get_edge_diagnostic_masks(grid_type, d), index, mid_a, mid_b)
+            collect(edge_diagnostic_masks(grid, grid_type, d), index, mid_a, mid_b)
 
         # Dual plane t[i] cuts the primal edges i-1 along the normal at their
         # midpoints: these edges pierce the dual faces of the plane.
         if grid_type == "dual":
             primal = (grid.x, grid.y, grid.z)
             collect(
-                grid._get_edge_diagnostic_masks("primal", normal),
+                edge_diagnostic_masks(grid, "primal", normal),
                 index - 1,
                 primal["xyz".index(a)],
                 primal["xyz".index(b)],
